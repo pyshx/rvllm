@@ -1,7 +1,104 @@
 //! Newtype wrappers, vocabulary types, sampling parameters, and marker traits.
 
+use std::fmt;
+use std::str::FromStr;
+
 use derive_more::{Display, From, Into};
 use serde::{Deserialize, Serialize};
+
+/// Data type for model weights and compute precision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Dtype {
+    /// Automatic selection: float16 on SM >= 7.0 GPUs, float32 otherwise.
+    Auto,
+    /// 32-bit floating point.
+    Float32,
+    /// 16-bit floating point (IEEE 754 half).
+    Float16,
+    /// 16-bit brain floating point.
+    BFloat16,
+}
+
+impl Dtype {
+    /// Size in bytes of a single element of this dtype.
+    /// Returns 4 for Auto (conservative default; caller should resolve first).
+    pub fn size_bytes(self) -> usize {
+        match self {
+            Dtype::Auto | Dtype::Float32 => 4,
+            Dtype::Float16 | Dtype::BFloat16 => 2,
+        }
+    }
+
+    /// True if this is a half-precision type (f16 or bf16).
+    pub fn is_half(self) -> bool {
+        matches!(self, Dtype::Float16 | Dtype::BFloat16)
+    }
+
+    /// True if this is Auto (needs resolution based on GPU capability).
+    pub fn is_auto(self) -> bool {
+        matches!(self, Dtype::Auto)
+    }
+
+    /// Resolve Auto to a concrete dtype based on GPU compute capability.
+    /// SM >= 7.0 (Volta+) -> Float16, otherwise Float32.
+    pub fn resolve(self, sm_major: u32) -> Dtype {
+        match self {
+            Dtype::Auto => {
+                if sm_major >= 7 {
+                    Dtype::Float16
+                } else {
+                    Dtype::Float32
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// String suitable for kernel dispatch ("float32", "float16", "bfloat16").
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Dtype::Auto => "auto",
+            Dtype::Float32 => "float32",
+            Dtype::Float16 => "float16",
+            Dtype::BFloat16 => "bfloat16",
+        }
+    }
+
+    /// Whether this dtype should use hgemm (half GEMM) vs sgemm (single GEMM).
+    pub fn use_hgemm(self) -> bool {
+        matches!(self, Dtype::Float16 | Dtype::BFloat16)
+    }
+}
+
+impl Default for Dtype {
+    fn default() -> Self {
+        Dtype::Auto
+    }
+}
+
+impl fmt::Display for Dtype {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Dtype {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "auto" => Ok(Dtype::Auto),
+            "float32" | "fp32" | "f32" => Ok(Dtype::Float32),
+            "float16" | "fp16" | "f16" | "half" => Ok(Dtype::Float16),
+            "bfloat16" | "bf16" => Ok(Dtype::BFloat16),
+            _ => Err(format!(
+                "unknown dtype '{}': expected auto, float32, float16, or bfloat16",
+                s
+            )),
+        }
+    }
+}
 
 /// Unique identifier for a sequence within a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, From, Into, Serialize, Deserialize)]
@@ -192,5 +289,56 @@ mod tests {
         assert_send_sync::<BlockId>();
         assert_send_sync::<SamplingParams>();
         assert_send_sync::<FinishReason>();
+        assert_send_sync::<Dtype>();
+    }
+
+    #[test]
+    fn dtype_from_str() {
+        assert_eq!("auto".parse::<Dtype>().unwrap(), Dtype::Auto);
+        assert_eq!("float32".parse::<Dtype>().unwrap(), Dtype::Float32);
+        assert_eq!("fp16".parse::<Dtype>().unwrap(), Dtype::Float16);
+        assert_eq!("bfloat16".parse::<Dtype>().unwrap(), Dtype::BFloat16);
+        assert_eq!("bf16".parse::<Dtype>().unwrap(), Dtype::BFloat16);
+        assert!("invalid".parse::<Dtype>().is_err());
+    }
+
+    #[test]
+    fn dtype_resolve() {
+        assert_eq!(Dtype::Auto.resolve(7), Dtype::Float16);
+        assert_eq!(Dtype::Auto.resolve(8), Dtype::Float16);
+        assert_eq!(Dtype::Auto.resolve(6), Dtype::Float32);
+        assert_eq!(Dtype::Float32.resolve(8), Dtype::Float32);
+    }
+
+    #[test]
+    fn dtype_size_and_half() {
+        assert_eq!(Dtype::Float32.size_bytes(), 4);
+        assert_eq!(Dtype::Float16.size_bytes(), 2);
+        assert_eq!(Dtype::BFloat16.size_bytes(), 2);
+        assert!(Dtype::Float16.is_half());
+        assert!(Dtype::BFloat16.is_half());
+        assert!(!Dtype::Float32.is_half());
+    }
+
+    #[test]
+    fn dtype_display() {
+        assert_eq!(Dtype::Auto.to_string(), "auto");
+        assert_eq!(Dtype::Float16.to_string(), "float16");
+    }
+
+    #[test]
+    fn dtype_serde_roundtrip() {
+        let d = Dtype::Float16;
+        let json = serde_json::to_string(&d).unwrap();
+        let d2: Dtype = serde_json::from_str(&json).unwrap();
+        assert_eq!(d, d2);
+    }
+
+    #[test]
+    fn dtype_hgemm() {
+        assert!(Dtype::Float16.use_hgemm());
+        assert!(Dtype::BFloat16.use_hgemm());
+        assert!(!Dtype::Float32.use_hgemm());
+        assert!(!Dtype::Auto.use_hgemm());
     }
 }

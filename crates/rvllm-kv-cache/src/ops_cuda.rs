@@ -56,14 +56,16 @@ mod inner {
 
     /// Copy cache blocks on the GPU using the copy_blocks CUDA kernel.
     ///
-    /// `key_cache` and `value_cache` are flat GPU buffers shaped
+    /// `key_cache` and `value_cache` are flat f16 GPU buffers shaped
     /// [num_blocks, block_size, num_heads, head_dim].
     /// `block_mapping` contains (src_block, dst_block) pairs.
     ///
     /// Launches the copy_blocks_kernel with one CUDA block per mapping pair.
+    /// Note: the copy_blocks_kernel operates on raw bytes via element count,
+    /// so it works with f16 buffers -- each "element" is 2 bytes.
     pub fn copy_blocks_cuda(
-        key_cache: &mut CudaSlice<f32>,
-        value_cache: &mut CudaSlice<f32>,
+        key_cache: &mut CudaSlice<f16>,
+        value_cache: &mut CudaSlice<f16>,
         block_mapping: &[(i64, i64)],
         block_size: usize,
         num_heads: usize,
@@ -104,7 +106,7 @@ mod inner {
                 LLMError::GpuError("copy_blocks_kernel not found after module load".into())
             })?;
 
-        // SAFETY: kernel signature matches copy_blocks_kernel(float*, float*, long*, int, int, int, int).
+        // SAFETY: kernel signature matches copy_blocks_kernel(half*, half*, long*, int, int, int, int).
         // All device pointers come from valid CudaSlice allocations on the same device.
         unsafe {
             func.launch_on_stream(
@@ -372,8 +374,8 @@ mod inner {
         /// Copy blocks within GPU cache using the CUDA copy_blocks kernel.
         pub fn copy_blocks(
             &self,
-            key_cache: &mut CudaSlice<f32>,
-            value_cache: &mut CudaSlice<f32>,
+            key_cache: &mut CudaSlice<f16>,
+            value_cache: &mut CudaSlice<f16>,
             block_mapping: &[(i64, i64)],
             stream: &CudaStream,
         ) -> Result<()> {

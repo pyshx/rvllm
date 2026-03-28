@@ -83,7 +83,7 @@ fn apply_cli_overrides(config: &mut EngineConfig, args: &CliArgs) {
     if let Some(ref tok) = args.tokenizer {
         config.model.tokenizer_path = Some(tok.clone());
     }
-    config.model.dtype = args.dtype.clone();
+    config.model.dtype = args.dtype;
     config.model.max_model_len = args.max_model_len;
     config.model.trust_remote_code = args.trust_remote_code;
 
@@ -124,10 +124,11 @@ mod tests {
 
     #[test]
     fn load_from_cli_args() {
+        use rvllm_core::types::Dtype;
         let args = CliArgs {
             model: "test/model".into(),
             tokenizer: None,
-            dtype: "float16".into(),
+            dtype: Dtype::Float16,
             max_model_len: 4096,
             trust_remote_code: false,
             block_size: 16,
@@ -153,7 +154,7 @@ mod tests {
 
         let cfg = load_config(&args).unwrap();
         assert_eq!(cfg.model.model_path, "test/model");
-        assert_eq!(cfg.model.dtype, "float16");
+        assert_eq!(cfg.model.dtype, Dtype::Float16);
         assert_eq!(cfg.model.max_model_len, 4096);
         assert_eq!(cfg.telemetry.prometheus_port, Some(9090));
         assert_eq!(cfg.telemetry.log_level, "debug");
@@ -161,6 +162,7 @@ mod tests {
 
     #[test]
     fn load_from_toml_file() {
+        use rvllm_core::types::Dtype;
         let toml_content = r#"
 [model]
 model_path = "bigscience/bloom-560m"
@@ -197,7 +199,7 @@ log_level = "warn"
         let args = CliArgs {
             model: "bigscience/bloom-560m".into(),
             tokenizer: None,
-            dtype: "bfloat16".into(),
+            dtype: Dtype::BFloat16,
             max_model_len: 1024,
             trust_remote_code: false,
             block_size: 8,
@@ -229,10 +231,11 @@ log_level = "warn"
 
     #[test]
     fn load_rejects_invalid() {
+        use rvllm_core::types::Dtype;
         let args = CliArgs {
             model: "".into(), // empty = invalid
             tokenizer: None,
-            dtype: "auto".into(),
+            dtype: Dtype::Auto,
             max_model_len: 2048,
             trust_remote_code: false,
             block_size: 16,
@@ -261,11 +264,12 @@ log_level = "warn"
 
     #[test]
     fn serde_round_trip() {
+        use rvllm_core::types::Dtype;
         let cfg = EngineConfig::builder()
             .model(
                 ModelConfigImpl::builder()
                     .model_path("test/model")
-                    .dtype("float16")
+                    .dtype(Dtype::Float16)
                     .max_model_len(8192)
                     .build(),
             )

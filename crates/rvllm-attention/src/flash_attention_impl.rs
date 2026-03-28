@@ -102,6 +102,8 @@ impl FlashAttention2 {
                 &[
                     "flash_attention_2_kernel",
                     "flash_attention_2_decode_kernel",
+                    "flash_attention_2_f16kv_kernel",
+                    "flash_attention_2_decode_f16kv_kernel",
                 ],
             )
             .map_err(|e| LLMError::GpuError(format!("failed to load flash_attention PTX: {e}")))?;

@@ -8,8 +8,12 @@
 //
 // Each thread block handles one query head for one sequence.
 // Uses online softmax for numerical stability over arbitrary context lengths.
+//
+// Provides both f32 and f16-KV variants. The f16 variant reads __half from
+// the paged cache and promotes to f32 for all computation.
 
 #include <float.h>
+#include <cuda_fp16.h>
 
 extern "C"
 __global__ void paged_attention_v2_kernel(
@@ -126,6 +130,114 @@ __global__ void paged_attention_v2_kernel(
     if (dim_idx < head_dim) {
         float inv_sum = (global_sum > 0.0f) ? (1.0f / global_sum) : 0.0f;
         // Broadcast inv_sum from thread 0
+        inv_sum = __shfl_sync(0xffffffff, inv_sum, 0);
+        const int out_offset = (seq_idx * num_heads + head_idx) * head_dim + dim_idx;
+        output[out_offset] = acc[dim_idx] * inv_sum;
+    }
+}
+
+// ============================================================================
+// F16 KV cache variant of PagedAttention V2.
+// Reads __half K/V from paged cache, promotes to f32 for all computation.
+// Q and output remain f32.
+// ============================================================================
+
+extern "C"
+__global__ void paged_attention_v2_f16kv_kernel(
+    float* __restrict__ output,            // [num_seqs, num_heads, head_dim]
+    const float* __restrict__ query,       // [num_seqs, num_heads, head_dim]
+    const __half* __restrict__ key_cache,  // [num_blocks, block_size, num_heads, head_dim] f16
+    const __half* __restrict__ value_cache,// [num_blocks, block_size, num_heads, head_dim] f16
+    const int* __restrict__ block_tables,  // [num_seqs, max_blocks]
+    const int* __restrict__ context_lens,  // [num_seqs]
+    float scale,
+    int num_heads,
+    int head_dim,
+    int block_size,
+    int max_context_len,
+    int max_blocks
+) {
+    const int seq_idx  = blockIdx.x;
+    const int head_idx = blockIdx.y;
+    const int dim_idx  = threadIdx.x;
+
+    const int context_len = context_lens[seq_idx];
+    if (context_len == 0) return;
+
+    const int num_blocks = (context_len + block_size - 1) / block_size;
+
+    extern __shared__ float smem[];
+    float* logits        = smem;
+    float* acc           = smem + block_size;
+    const int num_warps  = (head_dim + warpSize - 1) / warpSize;
+    float* warp_partials = smem + block_size + head_dim;
+    const int warp_id    = dim_idx / warpSize;
+    const int lane_id    = dim_idx % warpSize;
+
+    const int q_offset = (seq_idx * num_heads + head_idx) * head_dim + dim_idx;
+    float q_val = (dim_idx < head_dim) ? query[q_offset] * scale : 0.0f;
+
+    if (dim_idx < head_dim) {
+        acc[dim_idx] = 0.0f;
+    }
+
+    float global_max = -FLT_MAX;
+    float global_sum = 0.0f;
+
+    for (int b = 0; b < num_blocks; b++) {
+        const int physical_block = block_tables[seq_idx * max_blocks + b];
+        const int tokens_in_block = min(block_size, context_len - b * block_size);
+
+        for (int t = 0; t < tokens_in_block; t++) {
+            const int k_offset = ((physical_block * block_size + t) * num_heads + head_idx) * head_dim + dim_idx;
+            float k_val = (dim_idx < head_dim) ? __half2float(key_cache[k_offset]) : 0.0f;
+            float partial = q_val * k_val;
+
+            for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+                partial += __shfl_down_sync(0xffffffff, partial, offset);
+            }
+
+            if (lane_id == 0) {
+                warp_partials[warp_id] = partial;
+            }
+            __syncthreads();
+
+            if (dim_idx == 0) {
+                float dot = 0.0f;
+                for (int w = 0; w < num_warps; w++) {
+                    dot += warp_partials[w];
+                }
+                logits[t] = dot;
+            }
+            __syncthreads();
+        }
+        __syncthreads();
+
+        if (dim_idx == 0) {
+            for (int t = 0; t < tokens_in_block; t++) {
+                float val = logits[t];
+                if (val > global_max) {
+                    float correction = expf(global_max - val);
+                    global_sum = global_sum * correction;
+                    global_max = val;
+                }
+                logits[t] = expf(val - global_max);
+                global_sum += logits[t];
+            }
+        }
+        __syncthreads();
+
+        if (dim_idx < head_dim) {
+            for (int t = 0; t < tokens_in_block; t++) {
+                const int v_offset = ((physical_block * block_size + t) * num_heads + head_idx) * head_dim + dim_idx;
+                acc[dim_idx] += logits[t] * __half2float(value_cache[v_offset]);
+            }
+        }
+        __syncthreads();
+    }
+
+    if (dim_idx < head_dim) {
+        float inv_sum = (global_sum > 0.0f) ? (1.0f / global_sum) : 0.0f;
         inv_sum = __shfl_sync(0xffffffff, inv_sum, 0);
         const int out_offset = (seq_idx * num_heads + head_idx) * head_dim + dim_idx;
         output[out_offset] = acc[dim_idx] * inv_sum;

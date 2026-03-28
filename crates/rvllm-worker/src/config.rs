@@ -1,5 +1,7 @@
 //! Worker configuration.
 
+use rvllm_core::types::Dtype;
+
 /// Configuration for a single GPU worker instance.
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -33,8 +35,8 @@ pub struct WorkerConfig {
     pub pipeline_parallel_size: usize,
     /// Model architecture name (e.g. "llama").
     pub architecture: String,
-    /// Data type string (e.g. "float16").
-    pub dtype: String,
+    /// Data type for model weights and compute.
+    pub dtype: Dtype,
     /// RoPE theta parameter.
     pub rope_theta: f32,
     /// Fraction of head_dim that gets RoPE (Phi: 0.5, others: 1.0).
@@ -63,7 +65,7 @@ impl WorkerConfig {
             intermediate_size: self.intermediate_size,
             vocab_size: self.vocab_size,
             max_position: self.max_model_len,
-            dtype: self.dtype.clone(),
+            dtype: self.dtype,
             architecture: self.architecture.clone(),
             rope_theta: self.rope_theta,
         }

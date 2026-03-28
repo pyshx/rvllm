@@ -637,11 +637,9 @@ impl GpuWorker {
         let cache_cfg = self.config.cache_config();
         let total_block_bytes = cache_cfg.total_block_bytes();
 
-        // CudaCacheEngine allocates f32, but CacheConfig::block_bytes assumes f16.
-        // Multiply by 2 to account for the f32/f16 mismatch until cache dtype is unified.
-        let effective_block_bytes = total_block_bytes * 2;
-        let num_gpu_blocks = if effective_block_bytes > 0 {
-            available / effective_block_bytes
+        // CudaCacheEngine now stores f16, matching CacheConfig::block_bytes.
+        let num_gpu_blocks = if total_block_bytes > 0 {
+            available / total_block_bytes
         } else {
             0
         };

@@ -7,6 +7,7 @@
 use cudarc::cublas::sys::cublasOperation_t;
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
 use cudarc::driver::{CudaDevice, CudaSlice};
+use half::f16;
 use std::sync::Arc;
 
 use crate::{LLMError, Result};
@@ -127,6 +128,42 @@ impl CublasOps {
             self.cublas
                 .gemm(cfg, b, a, c)
                 .map_err(|e| LLMError::GpuError(format!("cuBLAS sgemm failed: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Row-major HGEMM: `C[m,n] = alpha * A[m,k] @ B^T[k,n] + beta * C[m,n]`
+    ///
+    /// Half-precision variant of [`sgemm_a_bt`]. All matrices are f16.
+    /// Uses f32 accumulation internally for numerical stability.
+    pub fn hgemm_a_bt(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        alpha: f16,
+        a: &CudaSlice<f16>,
+        b: &CudaSlice<f16>,
+        beta: f16,
+        c: &mut CudaSlice<f16>,
+    ) -> Result<()> {
+        let cfg = GemmConfig {
+            transa: cublasOperation_t::CUBLAS_OP_T,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            m: n as i32,
+            n: m as i32,
+            k: k as i32,
+            alpha,
+            lda: k as i32,
+            ldb: k as i32,
+            beta,
+            ldc: n as i32,
+        };
+
+        unsafe {
+            self.cublas
+                .gemm(cfg, b, a, c)
+                .map_err(|e| LLMError::GpuError(format!("cuBLAS hgemm_a_bt failed: {e}")))?;
         }
         Ok(())
     }

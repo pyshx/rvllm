@@ -412,7 +412,7 @@ mod inner {
                 tensor_parallel_size: config.parallel.tensor_parallel_size,
                 pipeline_parallel_size: config.parallel.pipeline_parallel_size,
                 architecture: hf_config.architecture.clone(),
-                dtype: config.model.dtype.clone(),
+                dtype: config.model.dtype,
                 rope_theta: hf_config.rope_theta,
                 partial_rotary_factor: hf_config.partial_rotary_factor,
                 attn_logit_softcapping: hf_config.attn_logit_softcapping,

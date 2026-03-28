@@ -4,6 +4,7 @@
 //! the standard `VLLM_*` prefix convention, not through clap's `env` feature.
 
 use clap::Parser;
+use rvllm_core::types::Dtype;
 
 /// Command-line arguments for the vLLM engine.
 #[derive(Debug, Clone, Parser)]
@@ -18,9 +19,10 @@ pub struct CliArgs {
     #[arg(long)]
     pub tokenizer: Option<String>,
 
-    /// Data type for model weights.
+    /// Data type for model weights: auto, float32, float16, bfloat16.
+    /// "auto" selects float16 on SM >= 7.0 GPUs, float32 otherwise.
     #[arg(long, default_value = "auto")]
-    pub dtype: String,
+    pub dtype: Dtype,
 
     /// Maximum model context length.
     #[arg(long, default_value_t = 2048)]

@@ -1,5 +1,6 @@
 //! Model configuration.
 
+use rvllm_core::types::Dtype;
 use serde::{Deserialize, Serialize};
 
 /// Configuration for the model itself: paths, dtype, length limits.
@@ -9,8 +10,8 @@ pub struct ModelConfigImpl {
     pub model_path: String,
     /// Optional override for tokenizer path (defaults to model_path).
     pub tokenizer_path: Option<String>,
-    /// Data type for model weights (e.g. "float16", "bfloat16", "auto").
-    pub dtype: String,
+    /// Data type for model weights and compute.
+    pub dtype: Dtype,
     /// Maximum sequence length the model supports.
     pub max_model_len: usize,
     /// Whether to trust remote code when loading the model.
@@ -22,7 +23,7 @@ impl Default for ModelConfigImpl {
         Self {
             model_path: String::new(),
             tokenizer_path: None,
-            dtype: "auto".into(),
+            dtype: Dtype::Auto,
             max_model_len: 2048,
             trust_remote_code: false,
         }
@@ -54,8 +55,8 @@ impl ModelConfigBuilder {
     }
 
     /// Set the dtype.
-    pub fn dtype(mut self, v: impl Into<String>) -> Self {
-        self.0.dtype = v.into();
+    pub fn dtype(mut self, v: Dtype) -> Self {
+        self.0.dtype = v;
         self
     }
 

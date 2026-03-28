@@ -9,15 +9,18 @@ mod inner {
     use std::sync::Arc;
 
     use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice as _};
+    use half::f16;
     use rvllm_core::error::{LLMError, Result};
     use tracing::debug;
 
     /// Container holding all model weights as typed CUDA device buffers.
     ///
     /// Each weight is stored as a `CudaSlice<f32>` alongside its shape.
-    /// Layers look up weights by name (e.g. "layers.0.attn.q.weight").
+    /// When `use_fp16` is enabled, projection weights are also stored as
+    /// `CudaSlice<f16>` in `weights_f16` for half-precision GEMM.
     pub struct GpuModelWeights {
         weights: HashMap<String, CudaSlice<f32>>,
+        weights_f16: HashMap<String, CudaSlice<f16>>,
         shapes: HashMap<String, Vec<usize>>,
     }
 
@@ -28,13 +31,18 @@ mod inner {
             shapes: HashMap<String, Vec<usize>>,
         ) -> Self {
             debug!(num_weights = weights.len(), "GpuModelWeights created");
-            Self { weights, shapes }
+            Self {
+                weights,
+                weights_f16: HashMap::new(),
+                shapes,
+            }
         }
 
         /// Build an empty container, useful for tests or incremental loading.
         pub fn empty() -> Self {
             Self {
                 weights: HashMap::new(),
+                weights_f16: HashMap::new(),
                 shapes: HashMap::new(),
             }
         }
@@ -45,9 +53,20 @@ mod inner {
             self.weights.insert(name, data);
         }
 
+        /// Insert a single f16 weight tensor with its shape.
+        pub fn insert_f16(&mut self, name: String, data: CudaSlice<f16>, shape: Vec<usize>) {
+            self.shapes.insert(name.clone(), shape);
+            self.weights_f16.insert(name, data);
+        }
+
         /// Look up a weight by name.
         pub fn get(&self, name: &str) -> Option<&CudaSlice<f32>> {
             self.weights.get(name)
+        }
+
+        /// Look up an f16 weight by name.
+        pub fn get_f16(&self, name: &str) -> Option<&CudaSlice<f16>> {
+            self.weights_f16.get(name)
         }
 
         /// Look up a weight by name, returning an error if missing.
@@ -115,6 +134,7 @@ mod inner {
             );
             Ok(Self {
                 weights: gpu_weights,
+                weights_f16: HashMap::new(),
                 shapes,
             })
         }

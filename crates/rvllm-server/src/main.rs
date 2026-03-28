@@ -5,6 +5,7 @@
 //! Compatible with OpenAI API at http://localhost:8000/v1/
 
 use clap::{Parser, Subcommand};
+use rvllm_core::types::Dtype;
 use tracing::info;
 
 #[derive(Parser)]
@@ -25,7 +26,7 @@ enum Commands {
         #[arg(long, default_value_t = 8000)]
         port: u16,
         #[arg(long, default_value = "auto")]
-        dtype: String,
+        dtype: Dtype,
         #[arg(long, default_value_t = 2048)]
         max_model_len: usize,
         #[arg(long, default_value_t = 0.90)]
@@ -128,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
                     .model({
                         let mut m = ModelConfigImpl::builder()
                             .model_path(&model)
-                            .dtype(&dtype)
+                            .dtype(dtype)
                             .max_model_len(max_model_len);
                         if let Some(ref tok) = tokenizer {
                             m = m.tokenizer_path(tok);

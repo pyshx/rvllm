@@ -19,6 +19,7 @@ mod inner {
     use std::sync::Arc;
 
     use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice, LaunchAsync, LaunchConfig};
+    use half::f16;
     use tracing::{info, trace};
 
     use rvllm_core::error::{LLMError, Result};
@@ -67,10 +68,10 @@ mod inner {
         pub hidden_states: &'a CudaSlice<f32>,
         /// Position ids for RoPE, shape [num_tokens]. Kernels expect int*.
         pub positions: &'a CudaSlice<i32>,
-        /// KV cache key block for this layer, shape [num_blocks, num_kv_heads, head_dim, block_size].
-        pub key_cache: &'a CudaSlice<f32>,
-        /// KV cache value block for this layer, shape [num_blocks, num_kv_heads, head_dim, block_size].
-        pub value_cache: &'a CudaSlice<f32>,
+        /// KV cache key block for this layer (f16), shape [num_blocks, block_size, num_kv_heads, head_dim].
+        pub key_cache: &'a CudaSlice<f16>,
+        /// KV cache value block for this layer (f16), shape [num_blocks, block_size, num_kv_heads, head_dim].
+        pub value_cache: &'a CudaSlice<f16>,
         /// Block table mapping sequence positions to cache blocks, shape [num_seqs, max_blocks_per_seq].
         pub block_tables: &'a CudaSlice<i32>,
         /// Context length for each sequence, shape [num_seqs].
@@ -522,25 +523,24 @@ mod inner {
 
         /// Paged attention forward pass.
         ///
-        /// Writes new K,V into the cache at slot_mapping positions,
-        /// then runs the paged_attention kernel for the actual attention computation.
+        /// Writes new K,V into the f16 cache at slot_mapping positions.
+        /// Input k/v are f32 (from projection); the kernel converts to f16 on write.
+        /// Uses reshape_and_cache_f16_kernel: 1 launch per layer.
         #[allow(clippy::too_many_arguments)]
-        /// Write per-token K/V into paged cache using slot_mapping.
-        /// Uses reshape_and_cache_kernel: 1 launch per layer.
         fn cache_write(
             device: &Arc<CudaDevice>,
             k: &CudaSlice<f32>,
             v: &CudaSlice<f32>,
-            key_cache: &CudaSlice<f32>,
-            value_cache: &CudaSlice<f32>,
+            key_cache: &CudaSlice<f16>,
+            value_cache: &CudaSlice<f16>,
             slot_mapping: &CudaSlice<i32>,
             num_tokens: usize,
             num_kv_heads: usize,
             head_dim: usize,
         ) -> Result<()> {
             let kernel = device
-                .get_func("reshape_and_cache", "reshape_and_cache_kernel")
-                .ok_or_else(|| LLMError::GpuError("reshape_and_cache_kernel not loaded".into()))?;
+                .get_func("reshape_and_cache", "reshape_and_cache_f16_kernel")
+                .ok_or_else(|| LLMError::GpuError("reshape_and_cache_f16_kernel not loaded".into()))?;
 
             let kv_dim = num_kv_heads * head_dim;
             let cfg = LaunchConfig {
@@ -549,8 +549,7 @@ mod inner {
                 shared_mem_bytes: 0,
             };
 
-            // Kernel signature: (key_cache, value_cache, key, value, slot_mapping, num_tokens, num_kv_heads, head_dim)
-            // All int args are i32.
+            // Kernel: (f16* key_cache, f16* value_cache, f32* key, f32* value, int* slot_mapping, int, int, int)
             unsafe {
                 kernel
                     .launch(
@@ -566,7 +565,7 @@ mod inner {
                             head_dim as i32,
                         ),
                     )
-                    .map_err(|e| LLMError::GpuError(format!("reshape_and_cache launch: {e}")))?;
+                    .map_err(|e| LLMError::GpuError(format!("reshape_and_cache_f16 launch: {e}")))?;
             }
             Ok(())
         }
@@ -687,12 +686,13 @@ mod inner {
             Ok(output)
         }
 
-        /// FA2 prefill attention reading from paged cache with real block_tables.
+        /// FA2 prefill attention reading from f16 paged cache with real block_tables.
+        /// Q is f32, cache is f16; the kernel loads f16 and promotes to f32 internally.
         fn prefill_attention(
             device: &Arc<CudaDevice>,
             q: &CudaSlice<f32>,
-            key_cache: &CudaSlice<f32>,
-            value_cache: &CudaSlice<f32>,
+            key_cache: &CudaSlice<f16>,
+            value_cache: &CudaSlice<f16>,
             block_tables: &CudaSlice<i32>,
             context_lens: &CudaSlice<i32>,
             seq_start_pos: &CudaSlice<i32>,
@@ -717,8 +717,8 @@ mod inner {
                 * std::mem::size_of::<f32>()) as u32;
 
             let kernel = device
-                .get_func("flash_attention", "flash_attention_2_kernel")
-                .ok_or_else(|| LLMError::GpuError("flash_attention_2_kernel not loaded".into()))?;
+                .get_func("flash_attention", "flash_attention_2_f16kv_kernel")
+                .ok_or_else(|| LLMError::GpuError("flash_attention_2_f16kv_kernel not loaded".into()))?;
 
             let bt_len = DeviceSlice::len(block_tables);
             info!(
@@ -809,12 +809,13 @@ mod inner {
             Ok(output)
         }
 
-        /// Decode attention: read K/V from paged cache, one FA2 decode kernel per layer.
+        /// Decode attention: read f16 K/V from paged cache, one FA2 decode kernel per layer.
+        /// Q is f32, cache is f16; kernel promotes f16 to f32 on load.
         fn decode_attention(
             device: &Arc<CudaDevice>,
             q: &CudaSlice<f32>,
-            key_cache: &CudaSlice<f32>,
-            value_cache: &CudaSlice<f32>,
+            key_cache: &CudaSlice<f16>,
+            value_cache: &CudaSlice<f16>,
             block_tables: &CudaSlice<i32>,
             context_lens: &CudaSlice<i32>,
             num_tokens: usize,
@@ -841,7 +842,7 @@ mod inner {
                 * std::mem::size_of::<f32>()) as u32;
 
             let module_name = "flash_attention";
-            let func_name = "flash_attention_2_decode_kernel";
+            let func_name = "flash_attention_2_decode_f16kv_kernel";
 
             let cfg = LaunchConfig {
                 grid_dim: (num_seqs as u32, num_heads as u32, 1),

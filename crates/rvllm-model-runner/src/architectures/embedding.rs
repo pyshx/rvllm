@@ -464,7 +464,7 @@ mod tests {
             intermediate_size: hidden_size * 4,
             vocab_size: 32,
             max_position: 512,
-            dtype: "float16".into(),
+            dtype: rvllm_core::types::Dtype::Float16,
             rope_theta: 10000.0,
             architecture: "EmbeddingModel".into(),
         }

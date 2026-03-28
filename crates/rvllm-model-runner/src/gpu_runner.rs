@@ -24,12 +24,15 @@ mod cuda_impl {
     use std::sync::Arc;
 
     use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync};
+    use half::f16;
     use tracing::{debug, info, trace};
 
     use crate::bridge::{LLMError, Result};
     use crate::runner::ModelRunnerConfig;
 
-    use crate::gpu_layer::{GpuLayerConfig, GpuLayerInput, GpuLayerWeights, GpuTransformerLayer};
+    use crate::gpu_layer::{
+        GpuLayerConfig, GpuLayerInput, GpuLayerWeights, GpuLayerWeightsF16, GpuTransformerLayer,
+    };
     use crate::layers::linear_cuda::CudaLinearLayer;
     use crate::layers::norm_cuda::CudaRMSNorm;
     use rvllm_gpu::kernel_loader::KernelLoader;
@@ -55,6 +58,8 @@ mod cuda_impl {
         rope_cos: CudaSlice<f32>,
         /// Precomputed RoPE sin table on GPU: [max_position, head_dim/2]
         rope_sin: CudaSlice<f32>,
+        /// When true, use hgemm with f16 projection weights instead of sgemm.
+        use_fp16: bool,
     }
 
     impl GpuModelRunner {
@@ -144,6 +149,7 @@ mod cuda_impl {
                 rms_norm_eps: 1e-5_f32,
                 rope_cos,
                 rope_sin,
+                use_fp16: false,
             })
         }
 
@@ -248,10 +254,9 @@ mod cuda_impl {
             let num_layers = self.layers.len();
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 if layer_idx == 0 || layer_idx == num_layers - 1 {
-                    info!(layer = layer_idx, "gpu_runner: layer start");
+                    info!(layer = layer_idx, use_fp16 = self.use_fp16, "gpu_runner: layer start");
                 }
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
-                let weights = self.layer_weights(layer_idx)?;
                 let input = GpuLayerInput {
                     hidden_states: &hidden_states,
                     positions: &positions_gpu,
@@ -269,7 +274,13 @@ mod cuda_impl {
                     rope_cos: &self.rope_cos,
                     rope_sin: &self.rope_sin,
                 };
-                hidden_states = layer.forward(&input, &weights, &self.blas)?;
+                hidden_states = if self.use_fp16 {
+                    let weights = self.layer_weights_f16(layer_idx)?;
+                    layer.forward_f16(&input, &weights, &self.blas)?
+                } else {
+                    let weights = self.layer_weights(layer_idx)?;
+                    layer.forward(&input, &weights, &self.blas)?
+                };
                 if layer_idx == 0 || layer_idx == num_layers - 1 {
                     info!(layer = layer_idx, "gpu_runner: layer done");
                 }
@@ -285,15 +296,28 @@ mod cuda_impl {
             )?;
 
             // Step 4: LM head  normed [num_tokens, hidden] @ lm_head^T [hidden, vocab]
-            let logits_gpu = CudaLinearLayer::forward_once(
-                &normed,
-                &self.lm_head_weight,
-                None,
-                num_tokens,
-                vocab_size,
-                hidden_size,
-                &self.blas,
-            )?;
+            let logits_gpu = if self.use_fp16 {
+                let lm_f16 = self
+                    .weights
+                    .get_f16("lm_head.weight")
+                    .or_else(|| self.weights.get_f16("model.embed_tokens.weight"));
+                if let Some(lm_w) = lm_f16 {
+                    CudaLinearLayer::forward_once_f16(
+                        &normed, lm_w, num_tokens, vocab_size, hidden_size, &self.blas,
+                    )?
+                } else {
+                    // Fallback: lm_head not available as f16, use f32
+                    CudaLinearLayer::forward_once(
+                        &normed, &self.lm_head_weight, None,
+                        num_tokens, vocab_size, hidden_size, &self.blas,
+                    )?
+                }
+            } else {
+                CudaLinearLayer::forward_once(
+                    &normed, &self.lm_head_weight, None,
+                    num_tokens, vocab_size, hidden_size, &self.blas,
+                )?
+            };
 
             // Step 5: greedy fast path -- argmax on GPU, copy only token IDs
             if greedy_only {
@@ -451,6 +475,56 @@ mod cuda_impl {
         pub fn cache_mut(&mut self) -> &mut CudaCacheEngine {
             &mut self.cache
         }
+
+        /// Enable f16 inference mode.
+        ///
+        /// After calling this, `forward_ex` will use hgemm with f16 projection
+        /// weights for all linear layers. The `GpuModelWeights` must already
+        /// have f16 weights populated via `insert_f16` / the f16 loader.
+        pub fn enable_fp16(&mut self) {
+            self.use_fp16 = true;
+            info!(use_fp16 = true, "GpuModelRunner: fp16 mode enabled");
+        }
+
+        pub fn use_fp16(&self) -> bool {
+            self.use_fp16
+        }
+
+        /// Per-layer f16 weight references into the GPU weight map.
+        fn layer_weights_f16(&self, i: usize) -> Result<GpuLayerWeightsF16<'_>> {
+            let g_f16 = |name: &str| -> Result<&CudaSlice<f16>> {
+                self.weights
+                    .get_f16(name)
+                    .ok_or_else(|| LLMError::GpuError(format!("missing f16 weight: {name}")))
+            };
+            let g_f32 = |name: &str| -> Result<&CudaSlice<f32>> {
+                self.weights
+                    .get(name)
+                    .ok_or_else(|| LLMError::GpuError(format!("missing weight: {name}")))
+            };
+            Ok(GpuLayerWeightsF16 {
+                input_layernorm: g_f32(&format!("model.layers.{i}.input_layernorm.weight"))?,
+                q_proj: g_f16(&format!("model.layers.{i}.self_attn.q_proj.weight"))?,
+                k_proj: g_f16(&format!("model.layers.{i}.self_attn.k_proj.weight"))?,
+                v_proj: g_f16(&format!("model.layers.{i}.self_attn.v_proj.weight"))?,
+                o_proj: g_f16(&format!("model.layers.{i}.self_attn.o_proj.weight"))?,
+                q_proj_bias: self
+                    .weights
+                    .get(&format!("model.layers.{i}.self_attn.q_proj.bias")),
+                k_proj_bias: self
+                    .weights
+                    .get(&format!("model.layers.{i}.self_attn.k_proj.bias")),
+                v_proj_bias: self
+                    .weights
+                    .get(&format!("model.layers.{i}.self_attn.v_proj.bias")),
+                post_attention_layernorm: g_f32(&format!(
+                    "model.layers.{i}.post_attention_layernorm.weight"
+                ))?,
+                gate_proj: g_f16(&format!("model.layers.{i}.mlp.gate_proj.weight"))?,
+                up_proj: g_f16(&format!("model.layers.{i}.mlp.up_proj.weight"))?,
+                down_proj: g_f16(&format!("model.layers.{i}.mlp.down_proj.weight"))?,
+            })
+        }
     }
 }
 
@@ -504,6 +578,12 @@ mod mock_impl {
 
         pub fn config(&self) -> &ModelRunnerConfig {
             &self.config
+        }
+
+        pub fn enable_fp16(&mut self) {}
+
+        pub fn use_fp16(&self) -> bool {
+            false
         }
     }
 }

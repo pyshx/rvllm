@@ -2,19 +2,25 @@
 //!
 //! This is the CUDA-backed counterpart to [`CacheEngine`](super::CacheEngine),
 //! which uses the abstract `GpuAllocator` trait. `CudaCacheEngine` works
-//! directly with `cudarc::driver::CudaSlice<f32>` for zero-copy kernel
+//! directly with `cudarc::driver::CudaSlice<half::f16>` for zero-copy kernel
 //! interop and avoids the overhead of the mock-gpu abstraction.
+//!
+//! The KV cache stores values in f16, halving VRAM usage compared to f32 and
+//! doubling the number of blocks we can allocate for a given memory budget.
+//! CUDA kernels that read/write the cache accept f16 pointers directly;
+//! computation (attention scores, softmax) still happens in f32 for precision.
 
 use std::sync::Arc;
 
 use cudarc::driver::{CudaDevice, CudaSlice};
+use half::f16;
 use tracing::{debug, info};
 
 use rvllm_core::prelude::{BlockId, LLMError, Result};
 
 /// Per-layer paged KV cache engine backed by real CUDA device memory.
 ///
-/// Each transformer layer owns a `(key, value)` pair of `CudaSlice<f32>`
+/// Each transformer layer owns a `(key, value)` pair of `CudaSlice<f16>`
 /// buffers. The buffers are logically divided into fixed-size blocks:
 ///
 ///   `[num_blocks, block_size, num_heads, head_dim]`  (flattened)
@@ -22,10 +28,10 @@ use rvllm_core::prelude::{BlockId, LLMError, Result};
 /// Block-level operations (copy, swap-in, swap-out) transfer data between
 /// GPU and host without going through the `GpuBuffer` abstraction.
 pub struct CudaCacheEngine {
-    /// Per-layer (key_cache, value_cache) on GPU.
-    gpu_cache: Vec<(CudaSlice<f32>, CudaSlice<f32>)>,
-    /// CPU-side staging buffers for swap operations, per layer (key, value).
-    cpu_cache: Vec<(Vec<f32>, Vec<f32>)>,
+    /// Per-layer (key_cache, value_cache) on GPU in f16.
+    gpu_cache: Vec<(CudaSlice<f16>, CudaSlice<f16>)>,
+    /// CPU-side staging buffers for swap operations, per layer (key, value) in f16.
+    cpu_cache: Vec<(Vec<f16>, Vec<f16>)>,
     num_layers: usize,
     num_heads: usize,
     head_dim: usize,
@@ -60,29 +66,27 @@ impl CudaCacheEngine {
             block_size,
             num_gpu_blocks,
             num_cpu_blocks,
-            gpu_bytes = gpu_total * std::mem::size_of::<f32>() * 2,
-            "CudaCacheEngine: allocating KV cache"
+            gpu_bytes = gpu_total * std::mem::size_of::<f16>() * 2,
+            "CudaCacheEngine: allocating f16 KV cache"
         );
 
         let mut gpu_cache = Vec::with_capacity(num_layers);
         let mut cpu_cache = Vec::with_capacity(num_layers);
 
         for layer in 0..num_layers {
-            debug!(layer, gpu_total, "allocating CUDA KV cache");
+            debug!(layer, gpu_total, "allocating f16 CUDA KV cache");
 
-            // SAFETY: cudarc alloc_zeros returns zero-initialized device memory.
-            // No unsafe needed -- cudarc's safe API handles allocation.
-            let key_gpu: CudaSlice<f32> = device.alloc_zeros(gpu_total).map_err(|e| {
+            let key_gpu: CudaSlice<f16> = device.alloc_zeros(gpu_total).map_err(|e| {
                 LLMError::GpuError(format!("CUDA key cache alloc failed layer {layer}: {e}"))
             })?;
-            let val_gpu: CudaSlice<f32> = device.alloc_zeros(gpu_total).map_err(|e| {
+            let val_gpu: CudaSlice<f16> = device.alloc_zeros(gpu_total).map_err(|e| {
                 LLMError::GpuError(format!("CUDA value cache alloc failed layer {layer}: {e}"))
             })?;
             gpu_cache.push((key_gpu, val_gpu));
 
-            debug!(layer, cpu_total, "allocating CPU staging cache");
-            let key_cpu = vec![0.0f32; cpu_total];
-            let val_cpu = vec![0.0f32; cpu_total];
+            debug!(layer, cpu_total, "allocating f16 CPU staging cache");
+            let key_cpu = vec![f16::ZERO; cpu_total];
+            let val_cpu = vec![f16::ZERO; cpu_total];
             cpu_cache.push((key_cpu, val_cpu));
         }
 
@@ -99,7 +103,7 @@ impl CudaCacheEngine {
         })
     }
 
-    /// Number of f32 elements per cache block.
+    /// Number of elements per cache block (dtype-independent count).
     pub fn elements_per_block(&self) -> usize {
         self.block_size * self.num_heads * self.head_dim
     }
@@ -139,13 +143,13 @@ impl CudaCacheEngine {
         self.num_cpu_blocks
     }
 
-    /// Access the per-layer GPU cache slices.
-    pub fn gpu_cache(&self) -> &[(CudaSlice<f32>, CudaSlice<f32>)] {
+    /// Access the per-layer GPU cache slices (f16).
+    pub fn gpu_cache(&self) -> &[(CudaSlice<f16>, CudaSlice<f16>)] {
         &self.gpu_cache
     }
 
-    /// Mutable access to the per-layer GPU cache slices.
-    pub fn gpu_cache_mut(&mut self) -> &mut [(CudaSlice<f32>, CudaSlice<f32>)] {
+    /// Mutable access to the per-layer GPU cache slices (f16).
+    pub fn gpu_cache_mut(&mut self) -> &mut [(CudaSlice<f16>, CudaSlice<f16>)] {
         &mut self.gpu_cache
     }
 
@@ -172,13 +176,11 @@ impl CudaCacheEngine {
             let dst_off = dst * epb;
 
             for (key_buf, val_buf) in &mut self.gpu_cache {
-                // Round-trip through host: dtoh full buffer, copy block, htod back.
-                // This is correct but slow; Agent 9 provides the kernel-based path.
                 let mut key_host = self
                     .device
                     .dtoh_sync_copy(key_buf)
                     .map_err(|e| LLMError::GpuError(format!("copy_blocks dtoh key: {e}")))?;
-                let src_slice: Vec<f32> = key_host[src_off..src_off + epb].to_vec();
+                let src_slice: Vec<f16> = key_host[src_off..src_off + epb].to_vec();
                 key_host[dst_off..dst_off + epb].copy_from_slice(&src_slice);
                 self.device
                     .htod_sync_copy_into(&key_host, key_buf)
@@ -188,7 +190,7 @@ impl CudaCacheEngine {
                     .device
                     .dtoh_sync_copy(val_buf)
                     .map_err(|e| LLMError::GpuError(format!("copy_blocks dtoh val: {e}")))?;
-                let src_slice: Vec<f32> = val_host[src_off..src_off + epb].to_vec();
+                let src_slice: Vec<f16> = val_host[src_off..src_off + epb].to_vec();
                 val_host[dst_off..dst_off + epb].copy_from_slice(&src_slice);
                 self.device
                     .htod_sync_copy_into(&val_host, val_buf)
@@ -234,7 +236,6 @@ impl CudaCacheEngine {
                 .zip(self.cpu_cache.iter())
                 .enumerate()
             {
-                // Read full GPU buffer, overwrite the target block from CPU, write back.
                 let mut key_host = self.device.dtoh_sync_copy(key_gpu).map_err(|e| {
                     LLMError::GpuError(format!("swap_in dtoh key layer {layer_idx}: {e}"))
                 })?;
@@ -311,7 +312,7 @@ impl CudaCacheEngine {
     }
 
     /// Compute the maximum number of GPU blocks that fit in `available_bytes`
-    /// given the current cache configuration.
+    /// given the current cache configuration. Cache is stored in f16.
     pub fn max_blocks_for_memory(
         num_layers: usize,
         num_heads: usize,
@@ -320,8 +321,8 @@ impl CudaCacheEngine {
         available_bytes: usize,
     ) -> usize {
         let elements_per_block = block_size * num_heads * head_dim;
-        // key + value, each f32, across all layers
-        let bytes_per_block = 2 * num_layers * elements_per_block * std::mem::size_of::<f32>();
+        // key + value, each f16, across all layers
+        let bytes_per_block = 2 * num_layers * elements_per_block * std::mem::size_of::<f16>();
         if bytes_per_block == 0 {
             return 0;
         }

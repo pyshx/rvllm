@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use rvllm_core::types::Dtype;
 use tracing::debug;
 
 use crate::architectures::{create_model, Architecture};
@@ -22,7 +23,7 @@ pub struct ModelRunnerConfig {
     pub vocab_size: usize,
     pub max_position: usize,
     pub rope_theta: f32,
-    pub dtype: String,
+    pub dtype: Dtype,
     pub architecture: String,
 }
 

@@ -1,0 +1,29 @@
+rvLLM: I rewrote vLLM in Rust. 3,946 tok/s. 16x faster. 22 hours. $1,780.
+
+One developer. 23 Rust crates. 15 hand-written CUDA kernels. 16 MB binary. Zero errors across 14,620 verified requests.
+
+The key insight: Python vLLM transfers the entire logit matrix (74 MB) from GPU to host every decode step for sampling. rvLLM runs argmax directly on GPU and transfers 512 bytes. That's a 150,000x reduction in PCIe traffic per step.
+
+B200 (single card): 3,946 tok/s at N=768, sustained through N=4,096
+A100 (single card): 3,191 tok/s at N=512 -- 16x Python vLLM
+Startup: 6-9s vs 121s
+Binary: 16 MB vs ~500 MB
+CPU RSS: 348 MB vs 1,033 MB
+
+Where the speed comes from:
+- GPU-resident argmax (no logit transfer for greedy decoding)
+- CUDA graph replay (entire forward pass = one driver call)
+- Mixed prefill+decode batching (no pipeline bubbles)
+- No GIL, no GC, no PyTorch tensor overhead
+- Single cudaMalloc slab for KV cache -- zero per-request allocation
+- Prefix caching for shared system prompts
+
+Total cost: $1,500 in vast.ai GPU rentals + $280 Claude Code overage. Built with Claude Opus doing architecture, CUDA kernels, and debugging.
+
+Drop-in replacement for the OpenAI API. Same endpoints, same request format. Just point your client at the Rust server.
+
+GitHub: https://github.com/m0at/rvllm
+Paper: https://m0at.github.io/rvllm/paper/rvllm.pdf
+Site: https://m0at.github.io/rvllm/
+
+Apache-2.0. Open source.

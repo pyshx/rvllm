@@ -51,7 +51,7 @@ impl CudaPagedAttention {
             .load_ptx(
                 cudarc::nvrtc::Ptx::from_src(ptx_str),
                 MODULE_NAME,
-                &[KERNEL_NAME],
+                &[KERNEL_NAME, "paged_attention_v2_f16kv_kernel"],
             )
             .map_err(|e| LLMError::GpuError(format!("failed to load paged_attention PTX: {e}")))?;
 

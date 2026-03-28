@@ -34,6 +34,8 @@ static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
         &[
             "flash_attention_2_kernel",
             "flash_attention_2_decode_kernel",
+            "flash_attention_2_f16kv_kernel",
+            "flash_attention_2_decode_f16kv_kernel",
         ],
     ),
     (
@@ -46,8 +48,18 @@ static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
         ],
     ),
     ("fused_residual_rmsnorm", &["fused_residual_rmsnorm_kernel"]),
-    ("paged_attention", &["paged_attention_v2_kernel"]),
-    ("reshape_and_cache", &["reshape_and_cache_kernel"]),
+    (
+        "paged_attention",
+        &["paged_attention_v2_kernel", "paged_attention_v2_f16kv_kernel"],
+    ),
+    (
+        "reshape_and_cache",
+        &["reshape_and_cache_kernel", "reshape_and_cache_f16_kernel"],
+    ),
+    (
+        "cast_fp",
+        &["cast_f32_to_f16_kernel", "cast_f16_to_f32_kernel"],
+    ),
     ("rms_norm", &["rms_norm_kernel"]),
     ("rms_norm_f16", &["rms_norm_f16_kernel"]),
     ("rotary_embedding", &["rotary_embedding_kernel"]),

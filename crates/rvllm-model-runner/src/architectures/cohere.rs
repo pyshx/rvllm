@@ -401,7 +401,7 @@ mod tests {
             intermediate_size: 8,
             vocab_size: 8,
             max_position: 32,
-            dtype: "float16".into(),
+            dtype: rvllm_core::types::Dtype::Float16,
             rope_theta: 10000.0,
             architecture: "CohereForCausalLM".into(),
         }
