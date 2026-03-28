@@ -14,7 +14,7 @@ mod inner {
     use std::path::Path;
     use std::sync::Arc;
 
-    use cudarc::driver::{CudaDevice, CudaSlice};
+    use cudarc::driver::{CudaSlice, CudaStream};
     use memmap2::Mmap;
     use rvllm_core::error::{LLMError, Result};
     use tracing::{debug, info, warn};
@@ -35,12 +35,12 @@ mod inner {
     /// Load all safetensors weights as f32 (legacy API, unchanged signature).
     pub fn load_weights_to_gpu(
         path: &Path,
-        device: &Arc<CudaDevice>,
+        stream: &Arc<CudaStream>,
     ) -> Result<HashMap<String, CudaSlice<f32>>> {
         if path.is_dir() {
-            load_sharded_to_gpu(path, device)
+            load_sharded_to_gpu(path, stream)
         } else {
-            load_single_to_gpu(path, device)
+            load_single_to_gpu(path, stream)
         }
     }
 
@@ -51,12 +51,12 @@ mod inner {
     /// usage and enables the hgemm (half-precision GEMM) path.
     pub fn load_weights_to_gpu_f16(
         path: &Path,
-        device: &Arc<CudaDevice>,
+        stream: &Arc<CudaStream>,
     ) -> Result<HashMap<String, CudaSlice<half::f16>>> {
         if path.is_dir() {
-            load_sharded_to_gpu_f16(path, device)
+            load_sharded_to_gpu_f16(path, stream)
         } else {
-            load_single_to_gpu_f16(path, device)
+            load_single_to_gpu_f16(path, stream)
         }
     }
 
@@ -66,7 +66,7 @@ mod inner {
 
     fn load_single_to_gpu(
         path: &Path,
-        device: &Arc<CudaDevice>,
+        stream: &Arc<CudaStream>,
     ) -> Result<HashMap<String, CudaSlice<f32>>> {
         info!("gpu_loader: memory-mapping {}", path.display());
 
@@ -91,9 +91,9 @@ mod inner {
 
             let f32_host = convert_to_f32(tensor_bytes, dtype_str, numel, name)?;
 
-            let gpu_slice = device.htod_sync_copy(&f32_host).map_err(|e| {
+            let gpu_slice = stream.clone_htod(&f32_host).map_err(|e| {
                 LLMError::GpuError(format!(
-                    "htod_sync_copy failed for tensor {} ({} floats): {}",
+                    "clone_htod failed for tensor {} ({} floats): {}",
                     name,
                     f32_host.len(),
                     e
@@ -121,7 +121,7 @@ mod inner {
 
     fn load_sharded_to_gpu(
         dir: &Path,
-        device: &Arc<CudaDevice>,
+        stream: &Arc<CudaStream>,
     ) -> Result<HashMap<String, CudaSlice<f32>>> {
         let shard_files = collect_shards(dir)?;
 
@@ -133,7 +133,7 @@ mod inner {
 
         let mut all_weights: HashMap<String, CudaSlice<f32>> = HashMap::new();
         for shard_path in &shard_files {
-            let shard = load_single_to_gpu(shard_path, device)?;
+            let shard = load_single_to_gpu(shard_path, stream)?;
             all_weights.extend(shard);
         }
 
@@ -151,7 +151,7 @@ mod inner {
 
     fn load_single_to_gpu_f16(
         path: &Path,
-        device: &Arc<CudaDevice>,
+        stream: &Arc<CudaStream>,
     ) -> Result<HashMap<String, CudaSlice<half::f16>>> {
         info!("gpu_loader: memory-mapping {} (f16 mode)", path.display());
 
@@ -176,9 +176,9 @@ mod inner {
 
             let f16_host = convert_to_f16(tensor_bytes, dtype_str, numel, name)?;
 
-            let gpu_slice = device.htod_sync_copy(&f16_host).map_err(|e| {
+            let gpu_slice = stream.clone_htod(&f16_host).map_err(|e| {
                 LLMError::GpuError(format!(
-                    "htod_sync_copy failed for tensor {} ({} f16 elems): {}",
+                    "clone_htod failed for tensor {} ({} f16 elems): {}",
                     name,
                     f16_host.len(),
                     e
@@ -206,7 +206,7 @@ mod inner {
 
     fn load_sharded_to_gpu_f16(
         dir: &Path,
-        device: &Arc<CudaDevice>,
+        stream: &Arc<CudaStream>,
     ) -> Result<HashMap<String, CudaSlice<half::f16>>> {
         let shard_files = collect_shards(dir)?;
 
@@ -218,7 +218,7 @@ mod inner {
 
         let mut all_weights: HashMap<String, CudaSlice<half::f16>> = HashMap::new();
         for shard_path in &shard_files {
-            let shard = load_single_to_gpu_f16(shard_path, device)?;
+            let shard = load_single_to_gpu_f16(shard_path, stream)?;
             all_weights.extend(shard);
         }
 

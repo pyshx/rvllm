@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use cudarc::driver::{CudaDevice, CudaFunction, CudaStream, LaunchAsync, LaunchConfig};
+use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, LaunchConfig};
 use cudarc::nvrtc::Ptx;
 use tracing::{debug, info, trace};
 
@@ -68,11 +68,13 @@ static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
 
 /// Loads and manages CUDA PTX modules, providing kernel launch capabilities.
 ///
-/// Wraps `cudarc::driver::CudaDevice` module management with a higher-level
+/// Wraps `cudarc::driver::CudaContext` module management with a higher-level
 /// API that understands the vllm-rs kernel naming conventions.
 pub struct KernelLoader {
-    device: Arc<CudaDevice>,
-    loaded_modules: HashMap<String, Vec<&'static str>>,
+    context: Arc<CudaContext>,
+    stream: Arc<CudaStream>,
+    modules: HashMap<String, Arc<CudaModule>>,
+    loaded_func_names: HashMap<String, Vec<&'static str>>,
 }
 
 impl KernelLoader {
@@ -80,10 +82,16 @@ impl KernelLoader {
     ///
     /// Falls back to the `RVLLM_KERNEL_DIR` environment variable if `kernel_dir`
     /// does not contain any .ptx files.
-    pub fn new(device: Arc<CudaDevice>, kernel_dir: &Path) -> Result<Self> {
+    pub fn new(
+        context: Arc<CudaContext>,
+        stream: Arc<CudaStream>,
+        kernel_dir: &Path,
+    ) -> Result<Self> {
         let mut loader = Self {
-            device,
-            loaded_modules: HashMap::new(),
+            context,
+            stream,
+            modules: HashMap::new(),
+            loaded_func_names: HashMap::new(),
         };
 
         let dir = if kernel_dir.exists() && kernel_dir.is_dir() {
@@ -114,10 +122,12 @@ impl KernelLoader {
 
     /// Create a KernelLoader with no pre-loaded kernels.
     /// Kernels can be loaded later via `load_ptx`.
-    pub fn empty(device: Arc<CudaDevice>) -> Self {
+    pub fn empty(context: Arc<CudaContext>, stream: Arc<CudaStream>) -> Self {
         Self {
-            device,
-            loaded_modules: HashMap::new(),
+            context,
+            stream,
+            modules: HashMap::new(),
+            loaded_func_names: HashMap::new(),
         }
     }
 
@@ -144,12 +154,13 @@ impl KernelLoader {
 
         let ptx = Ptx::from_src(ptx_src);
 
-        self.device.load_ptx(ptx, name, func_names).map_err(|e| {
+        let module = self.context.load_module(ptx).map_err(|e| {
             crate::LLMError::GpuError(format!("failed to load PTX module '{name}': {e}"))
         })?;
 
         debug!(module = name, functions = ?func_names, "loaded PTX module");
-        self.loaded_modules
+        self.modules.insert(name.to_string(), module);
+        self.loaded_func_names
             .insert(name.to_string(), func_names.to_vec());
         Ok(())
     }
@@ -159,41 +170,47 @@ impl KernelLoader {
         let func_names = self.resolve_function_names(name);
         let ptx = Ptx::from_file(path);
 
-        self.device.load_ptx(ptx, name, &func_names).map_err(|e| {
+        let module = self.context.load_module(ptx).map_err(|e| {
             crate::LLMError::GpuError(format!("failed to load PTX file '{}': {e}", path.display()))
         })?;
 
         debug!(module = name, path = %path.display(), "loaded PTX file");
-        self.loaded_modules
+        self.modules.insert(name.to_string(), module);
+        self.loaded_func_names
             .insert(name.to_string(), func_names.to_vec());
         Ok(())
     }
 
     /// Retrieve a loaded CUDA function by module and function name.
     pub fn get_func(&self, module: &str, function: &str) -> Result<CudaFunction> {
-        self.device.get_func(module, function).ok_or_else(|| {
+        let m = self.modules.get(module).ok_or_else(|| {
+            crate::LLMError::GpuError(format!("module '{module}' not loaded"))
+        })?;
+        m.load_function(function).map_err(|e| {
             crate::LLMError::GpuError(format!(
-                "function '{function}' not found in module '{module}'"
+                "function '{function}' not found in module '{module}': {e}"
             ))
         })
     }
 
     /// Check if a module has been loaded.
     pub fn has_module(&self, module: &str) -> bool {
-        self.loaded_modules.contains_key(module)
+        self.modules.contains_key(module)
     }
 
-    /// Check if a specific function is available.
+    /// Check if a specific function is available in a loaded module.
     pub fn has_func(&self, module: &str, function: &str) -> bool {
-        self.device.has_func(module, function)
+        self.modules
+            .get(module)
+            .and_then(|m| m.load_function(function).ok())
+            .is_some()
     }
 
-    /// Launch a kernel on the device's default stream.
+    /// Launch a kernel on the loader's stream.
     ///
     /// # Safety
     /// The caller must ensure that the kernel arguments match the kernel signature
     /// exactly: correct types, correct count, correct mutability for output buffers.
-    /// See `cudarc::driver::LaunchAsync` for full safety requirements.
     pub unsafe fn launch_raw(
         &self,
         module: &str,
@@ -203,7 +220,11 @@ impl KernelLoader {
     ) -> Result<()> {
         let func = self.get_func(module, function)?;
         // SAFETY: caller guarantees args match the kernel signature
-        func.launch(cfg, args).map_err(|e| {
+        let mut builder = self.stream.launch_builder(&func);
+        for arg in args.iter() {
+            builder = builder.arg(arg);
+        }
+        builder.launch(cfg).map_err(|e| {
             crate::LLMError::GpuError(format!("kernel launch {module}::{function} failed: {e}"))
         })
     }
@@ -224,21 +245,36 @@ impl KernelLoader {
         let func = self.get_func(module, function)?;
         // SAFETY: caller guarantees args match the kernel signature and
         // there are no data races on this stream
-        func.launch_on_stream(stream, cfg, args).map_err(|e| {
+        let mut builder = stream.launch_builder(&func);
+        for arg in args.iter() {
+            builder = builder.arg(arg);
+        }
+        builder.launch(cfg).map_err(|e| {
             crate::LLMError::GpuError(format!(
                 "kernel launch {module}::{function} on stream failed: {e}"
             ))
         })
     }
 
-    /// Returns a reference to the underlying CUDA device.
-    pub fn device(&self) -> &Arc<CudaDevice> {
-        &self.device
+    /// Returns a reference to the underlying CUDA context.
+    pub fn context(&self) -> &Arc<CudaContext> {
+        &self.context
+    }
+
+    /// Returns a reference to the underlying CUDA stream.
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+
+    /// Returns a reference to the underlying CUDA device (context alias).
+    /// Kept for backward compatibility during migration.
+    pub fn device(&self) -> &Arc<CudaContext> {
+        &self.context
     }
 
     /// List all loaded module names.
     pub fn loaded_modules(&self) -> Vec<&str> {
-        self.loaded_modules.keys().map(|s| s.as_str()).collect()
+        self.modules.keys().map(|s| s.as_str()).collect()
     }
 
     // --- private helpers ---
@@ -308,8 +344,9 @@ mod tests {
 
     #[test]
     fn resolve_known_kernel_names() {
-        let device = CudaDevice::new(0).unwrap();
-        let loader = KernelLoader::empty(device);
+        let context = CudaContext::new(0).unwrap();
+        let stream = context.new_stream().unwrap();
+        let loader = KernelLoader::empty(context, stream);
 
         let names = loader.resolve_function_names("activation");
         assert_eq!(
@@ -323,8 +360,9 @@ mod tests {
 
     #[test]
     fn resolve_unknown_uses_convention() {
-        let device = CudaDevice::new(0).unwrap();
-        let loader = KernelLoader::empty(device);
+        let context = CudaContext::new(0).unwrap();
+        let stream = context.new_stream().unwrap();
+        let loader = KernelLoader::empty(context, stream);
 
         let names = loader.resolve_function_names("my_custom");
         assert_eq!(names, &["my_custom_kernel"]);
@@ -332,16 +370,18 @@ mod tests {
 
     #[test]
     fn empty_loader_has_no_modules() {
-        let device = CudaDevice::new(0).unwrap();
-        let loader = KernelLoader::empty(device);
+        let context = CudaContext::new(0).unwrap();
+        let stream = context.new_stream().unwrap();
+        let loader = KernelLoader::empty(context, stream);
         assert!(loader.loaded_modules().is_empty());
         assert!(!loader.has_module("anything"));
     }
 
     #[test]
     fn new_with_nonexistent_dir() {
-        let device = CudaDevice::new(0).unwrap();
-        let loader = KernelLoader::new(device, &PathBuf::from("/nonexistent/path")).unwrap();
+        let context = CudaContext::new(0).unwrap();
+        let stream = context.new_stream().unwrap();
+        let loader = KernelLoader::new(context, stream, &PathBuf::from("/nonexistent/path")).unwrap();
         assert!(loader.loaded_modules().is_empty());
     }
 }

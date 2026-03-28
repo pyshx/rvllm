@@ -23,7 +23,7 @@ pub enum ForwardOutput {
 mod cuda_impl {
     use std::sync::Arc;
 
-    use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync};
+    use cudarc::driver::{CudaContext, CudaSlice, CudaStream, LaunchConfig};
     use half::f16;
     use tracing::{debug, info, trace};
 
@@ -48,7 +48,8 @@ mod cuda_impl {
         blas: CublasHandle,
         loader: KernelLoader,
         config: ModelRunnerConfig,
-        device: Arc<CudaDevice>,
+        device: Arc<CudaContext>,
+        stream: Arc<CudaStream>,
         layers: Vec<GpuTransformerLayer>,
         embed_tokens: CudaSlice<f32>,
         final_norm_weight: CudaSlice<f32>,
@@ -69,7 +70,8 @@ mod cuda_impl {
             blas: CublasHandle,
             loader: KernelLoader,
             config: ModelRunnerConfig,
-            device: Arc<CudaDevice>,
+            device: Arc<CudaContext>,
+            stream: Arc<CudaStream>,
         ) -> Result<Self> {
             debug!(
                 num_layers = config.num_layers,
@@ -109,7 +111,7 @@ mod cuda_impl {
                     rms_norm_eps: 1e-5_f32,
                     layer_idx: i,
                 };
-                layers.push(GpuTransformerLayer::new(layer_cfg, Arc::clone(&device)));
+                layers.push(GpuTransformerLayer::new(layer_cfg, Arc::clone(&stream)));
             }
 
             // Precompute RoPE cos/sin tables
@@ -127,11 +129,11 @@ mod cuda_impl {
                     sin_table[pos * half_dim + i] = theta.sin();
                 }
             }
-            let rope_cos = device
-                .htod_sync_copy(&cos_table)
+            let rope_cos = stream
+                .clone_htod(&cos_table)
                 .map_err(|e| LLMError::GpuError(format!("rope cos HtoD: {e}")))?;
-            let rope_sin = device
-                .htod_sync_copy(&sin_table)
+            let rope_sin = stream
+                .clone_htod(&sin_table)
                 .map_err(|e| LLMError::GpuError(format!("rope sin HtoD: {e}")))?;
             info!(max_pos, half_dim, "RoPE tables uploaded to GPU");
 
@@ -142,6 +144,7 @@ mod cuda_impl {
                 loader,
                 config,
                 device,
+                stream,
                 layers,
                 embed_tokens,
                 final_norm_weight,
@@ -192,15 +195,15 @@ mod cuda_impl {
             // Upload positions to GPU as i32 (CUDA kernels expect int*)
             let pos_i32: Vec<i32> = positions.iter().map(|&p| p as i32).collect();
             let positions_gpu: CudaSlice<i32> = self
-                .device
-                .htod_sync_copy(&pos_i32)
+                .stream
+                .clone_htod(&pos_i32)
                 .map_err(|e| LLMError::GpuError(format!("positions HtoD: {e}")))?;
 
             // Upload context_lens as i32
             let cl_i32: Vec<i32> = attn_meta.context_lens.iter().map(|&c| c as i32).collect();
             let context_lens_gpu: CudaSlice<i32> = self
-                .device
-                .htod_sync_copy(&cl_i32)
+                .stream
+                .clone_htod(&cl_i32)
                 .map_err(|e| LLMError::GpuError(format!("context_lens HtoD: {e}")))?;
 
             // Flatten block_tables to [num_seqs, max_blocks_per_seq] row-major as i32
@@ -218,15 +221,15 @@ mod cuda_impl {
                 }
             }
             let block_tables_gpu: CudaSlice<i32> = self
-                .device
-                .htod_sync_copy(&flat_bt)
+                .stream
+                .clone_htod(&flat_bt)
                 .map_err(|e| LLMError::GpuError(format!("block_tables HtoD: {e}")))?;
 
             // Upload slot_mapping as i32
             let sm_i32: Vec<i32> = attn_meta.slot_mapping.iter().map(|&s| s as i32).collect();
             let slot_mapping_gpu: CudaSlice<i32> = self
-                .device
-                .htod_sync_copy(&sm_i32)
+                .stream
+                .clone_htod(&sm_i32)
                 .map_err(|e| LLMError::GpuError(format!("slot_mapping HtoD: {e}")))?;
 
             let max_context_len = attn_meta.max_context_len;
@@ -241,8 +244,8 @@ mod cuda_impl {
             }
             seq_starts_host.push(num_tokens as i32); // sentinel
             let seq_start_pos_gpu: CudaSlice<i32> = self
-                .device
-                .htod_sync_copy(&seq_starts_host)
+                .stream
+                .clone_htod(&seq_starts_host)
                 .map_err(|e| LLMError::GpuError(format!("seq_start_pos HtoD: {e}")))?;
 
             // Step 1: token embedding lookup
@@ -323,8 +326,8 @@ mod cuda_impl {
             if greedy_only {
                 let token_ids_gpu = self.gpu_argmax(&logits_gpu, num_tokens, vocab_size)?;
                 let token_ids_cpu = self
-                    .device
-                    .dtoh_sync_copy(&token_ids_gpu)
+                    .stream
+                    .clone_dtoh(&token_ids_gpu)
                     .map_err(|e| LLMError::GpuError(format!("argmax token_ids DtoH: {e}")))?;
                 debug!(
                     num_tokens,
@@ -336,8 +339,8 @@ mod cuda_impl {
 
             // Step 5 (fallback): full logits DtoH for temperature>0 sampling
             let logits_cpu = self
-                .device
-                .dtoh_sync_copy(&logits_gpu)
+                .stream
+                .clone_dtoh(&logits_gpu)
                 .map_err(|e| LLMError::GpuError(format!("logits DtoH: {e}")))?;
 
             debug!(
@@ -356,32 +359,28 @@ mod cuda_impl {
             vocab_size: usize,
         ) -> Result<CudaSlice<i32>> {
             let kernel = self
-                .device
-                .get_func("argmax", "argmax_kernel")
-                .ok_or_else(|| LLMError::GpuError("argmax_kernel not loaded".into()))?;
+                .loader
+                .get_func("argmax", "argmax_kernel")?;
 
             let output: CudaSlice<i32> = self
-                .device
+                .stream
                 .alloc_zeros::<i32>(num_tokens)
                 .map_err(|e| LLMError::GpuError(format!("argmax alloc: {e}")))?;
 
             let block_dim = vocab_size.min(1024) as u32;
-            let cfg = cudarc::driver::LaunchConfig {
+            let cfg = LaunchConfig {
                 grid_dim: (num_tokens as u32, 1, 1),
                 block_dim: (block_dim, 1, 1),
                 shared_mem_bytes: 0,
             };
 
             unsafe {
-                kernel
-                    .launch(
-                        cfg,
-                        (
-                            logits_gpu,
-                            &output,
-                            vocab_size as i32,
-                        ),
-                    )
+                self.stream
+                    .launch_builder(&kernel)
+                    .arg(logits_gpu)
+                    .arg(&output)
+                    .arg(&(vocab_size as i32))
+                    .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("argmax_kernel launch: {e}")))?;
             }
 
@@ -424,40 +423,36 @@ mod cuda_impl {
             let hidden_size = self.config.hidden_size;
 
             let kernel = self
-                .device
-                .get_func("embedding_gather", "embedding_gather_kernel")
-                .ok_or_else(|| LLMError::GpuError("embedding_gather_kernel not loaded".into()))?;
+                .loader
+                .get_func("embedding_gather", "embedding_gather_kernel")?;
 
             let output = self
-                .device
+                .stream
                 .alloc_zeros::<f32>(num_tokens * hidden_size)
                 .map_err(|e| LLMError::GpuError(format!("embed alloc: {e}")))?;
 
             let ids_i32: Vec<i32> = token_ids.iter().map(|&t| t as i32).collect();
             let ids_gpu = self
-                .device
-                .htod_sync_copy(&ids_i32)
+                .stream
+                .clone_htod(&ids_i32)
                 .map_err(|e| LLMError::GpuError(format!("token_ids HtoD: {e}")))?;
 
             let block_dim = hidden_size.min(1024) as u32;
-            let cfg = cudarc::driver::LaunchConfig {
+            let cfg = LaunchConfig {
                 grid_dim: (num_tokens as u32, 1, 1),
                 block_dim: (block_dim, 1, 1),
                 shared_mem_bytes: 0,
             };
 
             unsafe {
-                kernel
-                    .launch(
-                        cfg,
-                        (
-                            &output,
-                            &self.embed_tokens,
-                            &ids_gpu,
-                            hidden_size as i32,
-                            self.config.vocab_size as i32,
-                        ),
-                    )
+                self.stream
+                    .launch_builder(&kernel)
+                    .arg(&output)
+                    .arg(&self.embed_tokens)
+                    .arg(&ids_gpu)
+                    .arg(&(hidden_size as i32))
+                    .arg(&(self.config.vocab_size as i32))
+                    .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("embedding_gather launch: {e}")))?;
             }
 

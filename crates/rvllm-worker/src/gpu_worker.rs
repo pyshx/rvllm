@@ -12,7 +12,7 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 use tracing::{debug, info, warn};
 
-use cudarc::driver::{CudaDevice, CudaSlice, DevicePtr, DevicePtrMut, LaunchAsync};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 
 use rvllm_core::prelude::{BlockId, LLMError, Result, SamplingParams, TokenId};
 use rvllm_gpu::prelude::{CublasHandle, CudaGpuAllocator, GpuStream};
@@ -310,7 +310,8 @@ impl Fp8KVCache {
 /// Single-GPU worker that owns the model weights and cuBLAS handle for
 /// real inference on one CUDA device.
 pub struct GpuWorker {
-    device: Arc<CudaDevice>,
+    context: Arc<CudaContext>,
+    stream: Arc<CudaStream>,
     cublas: CublasHandle,
     cache_stream: GpuStream,
     compute_stream: GpuStream,
@@ -348,11 +349,13 @@ impl GpuWorker {
         let device_id = config.device_id;
         info!(device_id, "creating GpuWorker");
 
-        let device = CudaDevice::new(device_id).map_err(|e| {
+        let context = CudaContext::new(device_id).map_err(|e| {
             LLMError::GpuError(format!("failed to init CUDA device {}: {}", device_id, e))
         })?;
 
-        let cublas = CublasHandle::new(device.clone())
+        let stream = context.default_stream();
+
+        let cublas = CublasHandle::new(stream.clone())
             .map_err(|e| LLMError::GpuError(format!("failed to create CublasHandle: {}", e)))?;
 
         let cache_stream = GpuStream::new(device_id)
@@ -388,7 +391,8 @@ impl GpuWorker {
         });
 
         Ok(Self {
-            device,
+            context,
+            stream,
             cublas,
             cache_stream,
             compute_stream,
@@ -431,7 +435,7 @@ impl GpuWorker {
         info!(device_id = self.device_id, path = %model_path.display(), "loading weights to GPU");
 
         let all_weights_full =
-            rvllm_model_loader::gpu_loader::load_weights_to_gpu(model_path, &self.device)
+            rvllm_model_loader::gpu_loader::load_weights_to_gpu(model_path, &self.stream)
                 .map_err(|e| LLMError::GpuError(format!("weight loading failed: {e}")))?;
 
         info!("loaded {} weight tensors to GPU", all_weights_full.len());
@@ -446,7 +450,7 @@ impl GpuWorker {
                 info!("loading f16 weights for hgemm path");
                 let f16_weights = rvllm_model_loader::gpu_loader::load_weights_to_gpu_f16(
                     model_path,
-                    &self.device,
+                    &self.stream,
                 )
                 .map_err(|e| LLMError::GpuError(format!("f16 weight loading failed: {e}")))?;
                 info!("loaded {} f16 weight tensors", f16_weights.len());
@@ -596,17 +600,18 @@ impl GpuWorker {
                 block_size,
                 num_gpu_blocks,
                 num_cpu_blocks,
-                self.device.clone(),
+                self.context.clone(),
+                self.stream.clone(),
             )
             .map_err(|e| LLMError::GpuError(format!("CudaCacheEngine init: {e}")))?;
 
-            let runner_blas = CublasHandle::new(self.device.clone())
+            let runner_blas = CublasHandle::new(self.stream.clone())
                 .map_err(|e| LLMError::GpuError(format!("runner cublas: {e}")))?;
 
             // KernelLoader: try build output dir, fall back to empty (PTX loaded at runtime)
             let ptx_dir = Self::find_ptx_dir();
             let loader = rvllm_gpu::kernel_loader::KernelLoader::new(
-                self.device.clone(),
+                self.context.clone(),
                 &ptx_dir.unwrap_or_else(|| std::path::PathBuf::from("/nonexistent")),
             )
             .map_err(|e| LLMError::GpuError(format!("kernel loader: {e}")))?;
@@ -618,7 +623,8 @@ impl GpuWorker {
                 runner_blas,
                 loader,
                 mr_config,
-                self.device.clone(),
+                self.context.clone(),
+                self.stream.clone(),
             )?;
 
             if self.config.dtype.is_half() {
@@ -668,7 +674,7 @@ impl GpuWorker {
         &self,
         gpu_memory_utilization: f32,
     ) -> Result<(usize, usize)> {
-        let (free, _total) = cudarc::driver::result::mem_get_info()
+        let (free, _total) = self.context.mem_get_info()
             .map_err(|e| LLMError::GpuError(format!("mem_get_info failed: {e}")))?;
         let available = (free as f32 * gpu_memory_utilization) as usize;
 
@@ -1043,7 +1049,7 @@ impl GpuWorker {
         // 4. LM head
         let vocab_size = self.vocab_size;
         let mut logits_gpu = self
-            .device
+            .stream
             .alloc_zeros::<f32>(num_tokens * vocab_size)
             .map_err(gpu_err)?;
 
@@ -1069,7 +1075,7 @@ impl GpuWorker {
                 .map_err(|e| LLMError::GpuError(format!("lm_head sgemm: {e}")))?;
         }
 
-        let logits = self.device.dtoh_sync_copy(&logits_gpu).map_err(gpu_err)?;
+        let logits = self.stream.clone_dtoh(&logits_gpu).map_err(gpu_err)?;
 
         Ok(logits)
     }
@@ -1087,44 +1093,8 @@ impl GpuWorker {
         let num_tokens = token_ids.len();
         let output_len = num_tokens * hidden_size;
 
-        // Try GPU gather kernel first
-        if let Some(kernel) = self
-            .device
-            .get_func("embedding_gather", "embedding_gather_kernel")
-        {
-            let output = self
-                .device
-                .alloc_zeros::<f32>(output_len)
-                .map_err(gpu_err)?;
-            let ids_i32: Vec<i32> = token_ids.iter().map(|&t| t as i32).collect();
-            let ids_gpu = self.device.htod_sync_copy(&ids_i32).map_err(gpu_err)?;
-
-            let block_dim = hidden_size.min(1024) as u32;
-            let cfg = cudarc::driver::LaunchConfig {
-                grid_dim: (num_tokens as u32, 1, 1),
-                block_dim: (block_dim, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            let vocab_size = self.vocab_size as i32;
-            unsafe {
-                kernel
-                    .launch(
-                        cfg,
-                        (
-                            &output,
-                            embed_weight,
-                            &ids_gpu,
-                            hidden_size as i32,
-                            vocab_size,
-                        ),
-                    )
-                    .map_err(|e| LLMError::GpuError(format!("embedding_gather launch: {e}")))?;
-            }
-            return Ok(output);
-        }
-
-        // Fallback: CPU gather
-        let embed_host = self.device.dtoh_sync_copy(embed_weight).map_err(gpu_err)?;
+        // CPU gather (legacy path -- production uses GpuModelRunner)
+        let embed_host = self.stream.clone_dtoh(embed_weight).map_err(gpu_err)?;
         let mut result = vec![0.0f32; output_len];
         for (i, &tid) in token_ids.iter().enumerate() {
             let tid = tid as usize;
@@ -1133,7 +1103,7 @@ impl GpuWorker {
                 result[i * hidden_size..(i + 1) * hidden_size].copy_from_slice(src);
             }
         }
-        self.device.htod_sync_copy(&result).map_err(gpu_err)
+        self.stream.clone_htod(&result).map_err(gpu_err)
     }
 
     /// Transformer layer with RoPE and KV cache.
@@ -1166,15 +1136,15 @@ impl GpuWorker {
         let kv_dim = num_kv_heads * head_dim;
 
         let mut q_gpu = self
-            .device
+            .stream
             .alloc_zeros::<f32>(num_tokens * q_dim)
             .map_err(gpu_err)?;
         let mut k_gpu = self
-            .device
+            .stream
             .alloc_zeros::<f32>(num_tokens * kv_dim)
             .map_err(gpu_err)?;
         let mut v_gpu = self
-            .device
+            .stream
             .alloc_zeros::<f32>(num_tokens * kv_dim)
             .map_err(gpu_err)?;
 
@@ -1221,9 +1191,9 @@ impl GpuWorker {
         }
 
         // 3. Download Q, K, V to CPU for RoPE + attention
-        let mut q_host = self.device.dtoh_sync_copy(&q_gpu).map_err(gpu_err)?;
-        let mut k_host = self.device.dtoh_sync_copy(&k_gpu).map_err(gpu_err)?;
-        let v_host = self.device.dtoh_sync_copy(&v_gpu).map_err(gpu_err)?;
+        let mut q_host = self.stream.clone_dtoh(&q_gpu).map_err(gpu_err)?;
+        let mut k_host = self.stream.clone_dtoh(&k_gpu).map_err(gpu_err)?;
+        let v_host = self.stream.clone_dtoh(&v_gpu).map_err(gpu_err)?;
 
         // 4. Apply RoPE to Q and K
         if let Some(ref rope) = self.rope_table {
@@ -1267,7 +1237,7 @@ impl GpuWorker {
             is_prefill,
         );
 
-        let attn_out_gpu = self.device.htod_sync_copy(&attn_output).map_err(gpu_err)?;
+        let attn_out_gpu = self.stream.clone_htod(&attn_output).map_err(gpu_err)?;
 
         // Need to re-borrow weights after mutable kv_cache borrow is done
         let weights = self.model_weights.as_ref().unwrap();
@@ -1275,7 +1245,7 @@ impl GpuWorker {
 
         // 7. Output projection
         let mut attn_proj = self
-            .device
+            .stream
             .alloc_zeros::<f32>(num_tokens * hidden_size)
             .map_err(gpu_err)?;
         self.cublas.sgemm(
@@ -1300,11 +1270,11 @@ impl GpuWorker {
 
         // 10. MLP: SiLU-gated
         let mut gate = self
-            .device
+            .stream
             .alloc_zeros::<f32>(num_tokens * intermediate_size)
             .map_err(gpu_err)?;
         let mut up = self
-            .device
+            .stream
             .alloc_zeros::<f32>(num_tokens * intermediate_size)
             .map_err(gpu_err)?;
 
@@ -1332,7 +1302,7 @@ impl GpuWorker {
         let mlp_activated = self.fused_silu_mul_gpu(&gate, &up, num_tokens * intermediate_size)?;
 
         let mut down = self
-            .device
+            .stream
             .alloc_zeros::<f32>(num_tokens * hidden_size)
             .map_err(gpu_err)?;
         self.cublas.sgemm(
@@ -1447,26 +1417,9 @@ impl GpuWorker {
         let n = num_tokens * hidden_size;
         let eps = self.rms_norm_eps;
 
-        if let Some(kernel) = self.device.get_func("rms_norm", "rms_norm_kernel") {
-            let output = self.device.alloc_zeros::<f32>(n).map_err(gpu_err)?;
-            let block_dim = hidden_size.min(1024) as u32;
-            let shared_mem = block_dim * std::mem::size_of::<f32>() as u32;
-            let cfg = cudarc::driver::LaunchConfig {
-                grid_dim: (num_tokens as u32, 1, 1),
-                block_dim: (block_dim, 1, 1),
-                shared_mem_bytes: shared_mem,
-            };
-            unsafe {
-                kernel
-                    .launch(cfg, (&output, hidden, weight, eps, hidden_size as i32))
-                    .map_err(|e| LLMError::GpuError(format!("rms_norm launch: {e}")))?;
-            }
-            return Ok(output);
-        }
-
-        // Fallback: CPU RMS norm
-        let h = self.device.dtoh_sync_copy(hidden).map_err(gpu_err)?;
-        let w = self.device.dtoh_sync_copy(weight).map_err(gpu_err)?;
+        // CPU RMS norm (legacy path -- production uses GpuModelRunner)
+        let h = self.stream.clone_dtoh(hidden).map_err(gpu_err)?;
+        let w = self.stream.clone_dtoh(weight).map_err(gpu_err)?;
         let mut out = vec![0.0f32; n];
         for t in 0..num_tokens {
             let row = &h[t * hidden_size..(t + 1) * hidden_size];
@@ -1476,7 +1429,7 @@ impl GpuWorker {
                 out[t * hidden_size + d] = row[d] * inv_rms * w.get(d).copied().unwrap_or(1.0);
             }
         }
-        self.device.htod_sync_copy(&out).map_err(gpu_err)
+        self.stream.clone_htod(&out).map_err(gpu_err)
     }
 
     /// Add bias to a tensor via GPU kernel (no CPU round-trip when kernel is loaded).
@@ -1487,30 +1440,15 @@ impl GpuWorker {
         num_tokens: usize,
         dim: usize,
     ) -> Result<()> {
-        if let Some(kernel) = self.device.get_func("add_bias", "add_bias_kernel") {
-            let block_dim = dim.min(1024) as u32;
-            let cfg = cudarc::driver::LaunchConfig {
-                grid_dim: (num_tokens as u32, 1, 1),
-                block_dim: (block_dim, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe {
-                kernel
-                    .launch(cfg, (tensor, bias, dim as i32))
-                    .map_err(|e| LLMError::GpuError(format!("add_bias launch: {e}")))?;
-            }
-            return Ok(());
-        }
-
-        // Fallback: CPU bias add
-        let mut data = self.device.dtoh_sync_copy(tensor).map_err(gpu_err)?;
-        let b = self.device.dtoh_sync_copy(bias).map_err(gpu_err)?;
+        // CPU bias add (legacy path -- production uses GpuModelRunner)
+        let mut data = self.stream.clone_dtoh(tensor).map_err(gpu_err)?;
+        let b = self.stream.clone_dtoh(bias).map_err(gpu_err)?;
         for t in 0..num_tokens {
             for d in 0..dim.min(b.len()) {
                 data[t * dim + d] += b[d];
             }
         }
-        *tensor = self.device.htod_sync_copy(&data).map_err(gpu_err)?;
+        *tensor = self.stream.clone_htod(&data).map_err(gpu_err)?;
         Ok(())
     }
 
@@ -1521,28 +1459,11 @@ impl GpuWorker {
         b: &CudaSlice<f32>,
         len: usize,
     ) -> Result<CudaSlice<f32>> {
-        if let Some(kernel) = self.device.get_func("add_bias", "add_kernel") {
-            let output = self.device.alloc_zeros::<f32>(len).map_err(gpu_err)?;
-            let threads = 256u32;
-            let blocks = (len as u32 + threads - 1) / threads;
-            let cfg = cudarc::driver::LaunchConfig {
-                grid_dim: (blocks, 1, 1),
-                block_dim: (threads, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe {
-                kernel
-                    .launch(cfg, (&output, a, b, len as i32))
-                    .map_err(|e| LLMError::GpuError(format!("add_kernel launch: {e}")))?;
-            }
-            return Ok(output);
-        }
-
-        // Fallback: CPU add
-        let a_h = self.device.dtoh_sync_copy(a).map_err(gpu_err)?;
-        let b_h = self.device.dtoh_sync_copy(b).map_err(gpu_err)?;
+        // CPU add (legacy path -- production uses GpuModelRunner)
+        let a_h = self.stream.clone_dtoh(a).map_err(gpu_err)?;
+        let b_h = self.stream.clone_dtoh(b).map_err(gpu_err)?;
         let out: Vec<f32> = a_h.iter().zip(b_h.iter()).map(|(x, y)| x + y).collect();
-        self.device.htod_sync_copy(&out).map_err(gpu_err)
+        self.stream.clone_htod(&out).map_err(gpu_err)
     }
 
     /// Fused SiLU(gate) * up via GPU kernel (no CPU round-trip when kernel is loaded).
@@ -1552,32 +1473,15 @@ impl GpuWorker {
         up: &CudaSlice<f32>,
         len: usize,
     ) -> Result<CudaSlice<f32>> {
-        if let Some(kernel) = self.device.get_func("activation", "fused_silu_mul_kernel") {
-            let output = self.device.alloc_zeros::<f32>(len).map_err(gpu_err)?;
-            let threads = 256u32;
-            let blocks = (len as u32 + threads - 1) / threads;
-            let cfg = cudarc::driver::LaunchConfig {
-                grid_dim: (blocks, 1, 1),
-                block_dim: (threads, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe {
-                kernel
-                    .launch(cfg, (&output, gate, up, len as i32))
-                    .map_err(|e| LLMError::GpuError(format!("fused_silu_mul launch: {e}")))?;
-            }
-            return Ok(output);
-        }
-
-        // Fallback: CPU fused SiLU * mul
-        let g = self.device.dtoh_sync_copy(gate).map_err(gpu_err)?;
-        let u = self.device.dtoh_sync_copy(up).map_err(gpu_err)?;
+        // CPU fused SiLU * mul (legacy path -- production uses GpuModelRunner)
+        let g = self.stream.clone_dtoh(gate).map_err(gpu_err)?;
+        let u = self.stream.clone_dtoh(up).map_err(gpu_err)?;
         let out: Vec<f32> = g
             .iter()
             .zip(u.iter())
             .map(|(&gv, &uv)| (gv / (1.0 + (-gv).exp())) * uv)
             .collect();
-        self.device.htod_sync_copy(&out).map_err(gpu_err)
+        self.stream.clone_htod(&out).map_err(gpu_err)
     }
 
     /// Fused residual add + RMS norm. When the fused kernel is loaded, this
@@ -1592,42 +1496,7 @@ impl GpuWorker {
     ) -> Result<(CudaSlice<f32>, CudaSlice<f32>)> {
         let n = num_tokens * hidden_size;
 
-        if let Some(kernel) = self
-            .device
-            .get_func("fused_residual_rmsnorm", "fused_residual_rmsnorm_kernel")
-        {
-            let output = self.device.alloc_zeros::<f32>(n).map_err(gpu_err)?;
-            let residual = self.device.alloc_zeros::<f32>(n).map_err(gpu_err)?;
-            let block_dim = hidden_size.min(1024) as u32;
-            let shared_mem = block_dim * std::mem::size_of::<f32>() as u32;
-            let cfg = cudarc::driver::LaunchConfig {
-                grid_dim: (num_tokens as u32, 1, 1),
-                block_dim: (block_dim, 1, 1),
-                shared_mem_bytes: shared_mem,
-            };
-            let eps = self.rms_norm_eps;
-            unsafe {
-                kernel
-                    .launch(
-                        cfg,
-                        (
-                            &output,
-                            &residual,
-                            input,
-                            add,
-                            weight,
-                            eps,
-                            hidden_size as i32,
-                        ),
-                    )
-                    .map_err(|e| {
-                        LLMError::GpuError(format!("fused_residual_rmsnorm launch: {e}"))
-                    })?;
-            }
-            return Ok((output, residual));
-        }
-
-        // Fallback: separate add + norm
+        // Separate add + norm (legacy path -- production uses GpuModelRunner)
         let residual = self.add_tensors_gpu(input, add, n)?;
         let normed = self.rms_norm_gpu(&residual, weight, num_tokens, hidden_size)?;
         Ok((normed, residual))
@@ -1783,8 +1652,11 @@ impl GpuWorker {
     pub fn blas(&self) -> &CublasHandle {
         &self.cublas
     }
-    pub fn gpu(&self) -> &Arc<CudaDevice> {
-        &self.device
+    pub fn gpu(&self) -> &Arc<CudaContext> {
+        &self.context
+    }
+    pub fn gpu_stream(&self) -> &Arc<CudaStream> {
+        &self.stream
     }
 }
 

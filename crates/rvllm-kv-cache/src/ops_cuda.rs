@@ -10,29 +10,24 @@
 mod inner {
     use std::sync::Arc;
 
-    use cudarc::driver::{CudaDevice, CudaSlice, CudaStream, LaunchAsync, LaunchConfig};
+    use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig};
     use half::f16;
     use rvllm_core::prelude::{LLMError, Result};
     use tracing::debug;
 
-    const COPY_BLOCKS_MODULE: &str = "copy_blocks";
     const COPY_BLOCKS_FN: &str = "copy_blocks_kernel";
 
     fn map_cuda<E: std::fmt::Display>(context: &str) -> impl FnOnce(E) -> LLMError + '_ {
         move |e| LLMError::GpuError(format!("{context}: {e}"))
     }
 
-    /// Load the copy_blocks PTX module into the device if not already loaded.
+    /// Load the copy_blocks PTX module and return the kernel function.
     ///
     /// Reads pre-compiled PTX from the path specified by RVLLM_KERNEL_DIR
     /// env var (defaults to `kernels/` relative to the workspace root).
     /// Requires that `copy_blocks.ptx` has been compiled from `copy_blocks.cu`
     /// via `nvcc --ptx` or the build system (Agent 1 / Agent 20).
-    fn ensure_copy_blocks_module(device: &Arc<CudaDevice>) -> Result<()> {
-        if device.has_func(COPY_BLOCKS_MODULE, COPY_BLOCKS_FN) {
-            return Ok(());
-        }
-
+    fn load_copy_blocks_func(context: &Arc<CudaContext>) -> Result<CudaFunction> {
         let kernel_dir =
             std::env::var("RVLLM_KERNEL_DIR").unwrap_or_else(|_| "kernels".to_string());
         let ptx_path = std::path::Path::new(&kernel_dir).join("copy_blocks.ptx");
@@ -47,11 +42,15 @@ mod inner {
         let ptx = cudarc::nvrtc::compile_ptx(ptx_src)
             .map_err(|e| LLMError::GpuError(format!("failed to compile copy_blocks PTX: {e}")))?;
 
-        device
-            .load_ptx(ptx, COPY_BLOCKS_MODULE, &[COPY_BLOCKS_FN])
+        let module: Arc<CudaModule> = context
+            .load_module(ptx)
             .map_err(map_cuda("failed to load copy_blocks module"))?;
 
-        Ok(())
+        let func = module
+            .load_function(COPY_BLOCKS_FN)
+            .map_err(map_cuda("failed to load copy_blocks_kernel function"))?;
+
+        Ok(func)
     }
 
     /// Copy cache blocks on the GPU using the copy_blocks CUDA kernel.
@@ -70,14 +69,14 @@ mod inner {
         block_size: usize,
         num_heads: usize,
         head_dim: usize,
-        device: &Arc<CudaDevice>,
-        stream: &CudaStream,
+        context: &Arc<CudaContext>,
+        stream: &Arc<CudaStream>,
     ) -> Result<()> {
         if block_mapping.is_empty() {
             return Ok(());
         }
 
-        ensure_copy_blocks_module(device)?;
+        let func = load_copy_blocks_func(context)?;
 
         let num_pairs = block_mapping.len();
 
@@ -88,8 +87,8 @@ mod inner {
             flat_mapping.push(dst);
         }
 
-        let d_mapping = device
-            .htod_sync_copy(&flat_mapping)
+        let d_mapping = stream
+            .clone_htod(&flat_mapping)
             .map_err(map_cuda("copy_blocks: upload mapping"))?;
 
         let elems_per_block = block_size * num_heads * head_dim;
@@ -100,29 +99,20 @@ mod inner {
             shared_mem_bytes: 0,
         };
 
-        let func = device
-            .get_func(COPY_BLOCKS_MODULE, COPY_BLOCKS_FN)
-            .ok_or_else(|| {
-                LLMError::GpuError("copy_blocks_kernel not found after module load".into())
-            })?;
-
         // SAFETY: kernel signature matches copy_blocks_kernel(half*, half*, long*, int, int, int, int).
         // All device pointers come from valid CudaSlice allocations on the same device.
         unsafe {
-            func.launch_on_stream(
-                stream,
-                cfg,
-                (
-                    key_cache,
-                    value_cache,
-                    &d_mapping,
-                    num_pairs as i32,
-                    block_size as i32,
-                    num_heads as i32,
-                    head_dim as i32,
-                ),
-            )
-            .map_err(map_cuda("copy_blocks: kernel launch"))?;
+            stream
+                .launch_builder(&func)
+                .arg(key_cache)
+                .arg(value_cache)
+                .arg(&d_mapping)
+                .arg(&(num_pairs as i32))
+                .arg(&(block_size as i32))
+                .arg(&(num_heads as i32))
+                .arg(&(head_dim as i32))
+                .launch(cfg)
+                .map_err(map_cuda("copy_blocks: kernel launch"))?;
         }
 
         debug!(num_pairs, "copy_blocks_cuda complete");
@@ -143,7 +133,7 @@ mod inner {
         cpu_value: &[f16],
         mapping: &[(usize, usize)],
         elements_per_block: usize,
-        device: &Arc<CudaDevice>,
+        stream: &Arc<CudaStream>,
     ) -> Result<()> {
         if mapping.is_empty() {
             return Ok(());
@@ -151,11 +141,11 @@ mod inner {
 
         // Download current GPU state, patch mapped blocks from CPU, re-upload.
         // cudarc doesn't expose sub-slice async memcpy, so this is the safe path.
-        let mut key_host = device
-            .dtoh_sync_copy(gpu_key)
+        let mut key_host = stream
+            .clone_dtoh(gpu_key)
             .map_err(map_cuda("swap_in: dtoh key"))?;
-        let mut val_host = device
-            .dtoh_sync_copy(gpu_value)
+        let mut val_host = stream
+            .clone_dtoh(gpu_value)
             .map_err(map_cuda("swap_in: dtoh value"))?;
 
         for &(cpu_idx, gpu_idx) in mapping {
@@ -183,11 +173,11 @@ mod inner {
             val_host[gpu_off..gpu_end].copy_from_slice(&cpu_value[cpu_off..cpu_end]);
         }
 
-        device
-            .htod_sync_copy_into(&key_host, gpu_key)
+        stream
+            .memcpy_htod(&key_host, gpu_key)
             .map_err(map_cuda("swap_in: htod key"))?;
-        device
-            .htod_sync_copy_into(&val_host, gpu_value)
+        stream
+            .memcpy_htod(&val_host, gpu_value)
             .map_err(map_cuda("swap_in: htod value"))?;
 
         debug!(pairs = mapping.len(), "swap_in_cuda complete");
@@ -205,17 +195,17 @@ mod inner {
         cpu_value: &mut [f16],
         mapping: &[(usize, usize)],
         elements_per_block: usize,
-        device: &Arc<CudaDevice>,
+        stream: &Arc<CudaStream>,
     ) -> Result<()> {
         if mapping.is_empty() {
             return Ok(());
         }
 
-        let key_host = device
-            .dtoh_sync_copy(gpu_key)
+        let key_host = stream
+            .clone_dtoh(gpu_key)
             .map_err(map_cuda("swap_out: dtoh key"))?;
-        let val_host = device
-            .dtoh_sync_copy(gpu_value)
+        let val_host = stream
+            .clone_dtoh(gpu_value)
             .map_err(map_cuda("swap_out: dtoh value"))?;
 
         for &(gpu_idx, cpu_idx) in mapping {
@@ -268,7 +258,7 @@ mod inner {
         num_heads: usize,
         head_dim: usize,
         block_size: usize,
-        device: &Arc<CudaDevice>,
+        stream: &Arc<CudaStream>,
     ) -> Result<()> {
         let head_stride = num_heads * head_dim;
         let num_tokens = slot_mapping.len();
@@ -292,11 +282,11 @@ mod inner {
 
         let block_stride = block_size * head_stride;
 
-        let mut key_data = device
-            .dtoh_sync_copy(key_cache)
+        let mut key_data = stream
+            .clone_dtoh(key_cache)
             .map_err(map_cuda("reshape_and_cache: dtoh key"))?;
-        let mut val_data = device
-            .dtoh_sync_copy(value_cache)
+        let mut val_data = stream
+            .clone_dtoh(value_cache)
             .map_err(map_cuda("reshape_and_cache: dtoh value"))?;
 
         for (token_idx, &slot) in slot_mapping.iter().enumerate() {
@@ -325,11 +315,11 @@ mod inner {
                 .copy_from_slice(&value[src_offset..src_offset + head_stride]);
         }
 
-        device
-            .htod_sync_copy_into(&key_data, key_cache)
+        stream
+            .memcpy_htod(&key_data, key_cache)
             .map_err(map_cuda("reshape_and_cache: htod key"))?;
-        device
-            .htod_sync_copy_into(&val_data, value_cache)
+        stream
+            .memcpy_htod(&val_data, value_cache)
             .map_err(map_cuda("reshape_and_cache: htod value"))?;
 
         debug!(num_tokens, "reshape_and_cache_cuda complete");
@@ -342,7 +332,8 @@ mod inner {
     /// and engine layers to call cache operations without threading geometry
     /// parameters through every call.
     pub struct CudaCacheOps {
-        device: Arc<CudaDevice>,
+        context: Arc<CudaContext>,
+        stream: Arc<CudaStream>,
         num_heads: usize,
         head_dim: usize,
         block_size: usize,
@@ -350,13 +341,15 @@ mod inner {
 
     impl CudaCacheOps {
         pub fn new(
-            device: Arc<CudaDevice>,
+            context: Arc<CudaContext>,
+            stream: Arc<CudaStream>,
             num_heads: usize,
             head_dim: usize,
             block_size: usize,
         ) -> Self {
             Self {
-                device,
+                context,
+                stream,
                 num_heads,
                 head_dim,
                 block_size,
@@ -367,8 +360,12 @@ mod inner {
             self.block_size * self.num_heads * self.head_dim
         }
 
-        pub fn device(&self) -> &Arc<CudaDevice> {
-            &self.device
+        pub fn context(&self) -> &Arc<CudaContext> {
+            &self.context
+        }
+
+        pub fn stream(&self) -> &Arc<CudaStream> {
+            &self.stream
         }
 
         /// Copy blocks within GPU cache using the CUDA copy_blocks kernel.
@@ -377,7 +374,6 @@ mod inner {
             key_cache: &mut CudaSlice<f16>,
             value_cache: &mut CudaSlice<f16>,
             block_mapping: &[(i64, i64)],
-            stream: &CudaStream,
         ) -> Result<()> {
             copy_blocks_cuda(
                 key_cache,
@@ -386,8 +382,8 @@ mod inner {
                 self.block_size,
                 self.num_heads,
                 self.head_dim,
-                &self.device,
-                stream,
+                &self.context,
+                &self.stream,
             )
         }
 
@@ -407,7 +403,7 @@ mod inner {
                 cpu_value,
                 mapping,
                 self.elements_per_block(),
-                &self.device,
+                &self.stream,
             )
         }
 
@@ -427,7 +423,7 @@ mod inner {
                 cpu_value,
                 mapping,
                 self.elements_per_block(),
-                &self.device,
+                &self.stream,
             )
         }
 
@@ -449,7 +445,7 @@ mod inner {
                 self.num_heads,
                 self.head_dim,
                 self.block_size,
-                &self.device,
+                &self.stream,
             )
         }
     }

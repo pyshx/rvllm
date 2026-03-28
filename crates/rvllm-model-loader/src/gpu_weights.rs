@@ -8,7 +8,7 @@ mod inner {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice as _};
+    use cudarc::driver::{CudaSlice, CudaStream, DeviceSlice as _};
     use half::f16;
     use rvllm_core::error::{LLMError, Result};
     use tracing::debug;
@@ -115,15 +115,15 @@ mod inner {
         /// Build from a host-side weight map by uploading each tensor to GPU.
         ///
         /// Takes a `HashMap<String, Vec<f32>>` plus shapes, and copies every
-        /// tensor to the given CUDA device via `htod_sync_copy`.
+        /// tensor to the given CUDA stream via `clone_htod`.
         pub fn from_host(
             host_weights: HashMap<String, Vec<f32>>,
             shapes: HashMap<String, Vec<usize>>,
-            device: &Arc<CudaDevice>,
+            stream: &Arc<CudaStream>,
         ) -> Result<Self> {
             let mut gpu_weights = HashMap::with_capacity(host_weights.len());
             for (name, data) in host_weights {
-                let slice = device.htod_sync_copy(&data).map_err(|e| {
+                let slice = stream.clone_htod(&data).map_err(|e| {
                     LLMError::GpuError(format!("htod copy failed for {}: {}", name, e))
                 })?;
                 gpu_weights.insert(name, slice);

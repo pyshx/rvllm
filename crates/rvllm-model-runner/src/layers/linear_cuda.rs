@@ -8,7 +8,7 @@
 //! parent `mod.rs`. It delegates the unsafe cuBLAS call to `rvllm_gpu::cublas_ops`
 //! so this crate's `#![forbid(unsafe_code)]` is respected.
 
-use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice as _, LaunchAsync, LaunchConfig};
+use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DeviceSlice as _, LaunchConfig};
 use half::f16;
 use rvllm_core::prelude::{LLMError, Result};
 use rvllm_gpu::cublas::CublasHandle;
@@ -23,16 +23,16 @@ pub struct CudaLinearLayer {
 }
 
 impl CudaLinearLayer {
-    /// Create a new layer bound to the given CUDA device.
-    pub fn new(device: Arc<CudaDevice>) -> Result<Self> {
+    /// Create a new layer bound to the given CUDA stream.
+    pub fn new(stream: Arc<CudaStream>) -> Result<Self> {
         Ok(Self {
-            ops: CublasOps::new(device)?,
+            ops: CublasOps::new(stream)?,
         })
     }
 
-    /// Convenience constructor sharing the device from an existing `CublasHandle`.
+    /// Convenience constructor sharing the stream from an existing `CublasHandle`.
     pub fn from_handle(blas: &CublasHandle) -> Result<Self> {
-        Self::new(blas.device().clone())
+        Self::new(blas.stream().clone())
     }
 
     /// Compute `output[m,n] = input[m,k] @ weight^T[k,n] [+ bias]`.
@@ -77,23 +77,23 @@ impl CudaLinearLayer {
             }
         }
 
-        let device = self.ops.device();
+        let stream = self.ops.stream();
 
         // Allocate output [m, n]. If bias is present, tile it into every row so
         // sgemm accumulates on top with beta=1.
         let mut output: CudaSlice<f32> = if let Some(b) = bias {
-            let bias_host = device
-                .dtoh_sync_copy(b)
+            let bias_host = stream
+                .clone_dtoh(b)
                 .map_err(|e| LLMError::GpuError(format!("bias dtoh failed: {e}")))?;
             let mut tiled = Vec::with_capacity(m * n);
             for _ in 0..m {
                 tiled.extend_from_slice(&bias_host[..n]);
             }
-            device
-                .htod_sync_copy(&tiled)
+            stream
+                .clone_htod(&tiled)
                 .map_err(|e| LLMError::GpuError(format!("tiled bias htod failed: {e}")))?
         } else {
-            device
+            stream
                 .alloc_zeros::<f32>(m * n)
                 .map_err(|e| LLMError::GpuError(format!("output alloc failed: {e}")))?
         };
@@ -125,6 +125,10 @@ impl CudaLinearLayer {
     /// Static forward with f16 weights: cast f32 input -> f16, hgemm, cast f16 output -> f32.
     ///
     /// Used for the LM head projection when `use_fp16` is enabled.
+    ///
+    /// `cast_f32_f16` and `cast_f16_f32` are pre-loaded `CudaFunction` handles
+    /// for the `cast_f32_to_f16_kernel` and `cast_f16_to_f32_kernel` kernels
+    /// respectively (from the `cast_fp` PTX module).
     pub fn forward_once_f16(
         input: &CudaSlice<f32>,
         weight: &CudaSlice<f16>,
@@ -132,14 +136,16 @@ impl CudaLinearLayer {
         n: usize,
         k: usize,
         blas: &CublasHandle,
+        cast_f32_f16: &CudaFunction,
+        cast_f16_f32: &CudaFunction,
     ) -> Result<CudaSlice<f32>> {
-        let device = blas.device();
+        let stream = blas.stream();
 
         // Cast input f32 -> f16
-        let input_f16 = Self::gpu_cast_f32_to_f16(device, input, m * k)?;
+        let input_f16 = Self::gpu_cast_f32_to_f16(stream, input, m * k, cast_f32_f16)?;
 
         // Allocate f16 output
-        let mut output_f16 = device
+        let mut output_f16 = stream
             .alloc_zeros::<f16>(m * n)
             .map_err(|e| LLMError::GpuError(format!("forward_once_f16 alloc: {e}")))?;
 
@@ -154,21 +160,18 @@ impl CudaLinearLayer {
         )?;
 
         // Cast output f16 -> f32
-        Self::gpu_cast_f16_to_f32(device, &output_f16, m * n)
+        Self::gpu_cast_f16_to_f32(stream, &output_f16, m * n, cast_f16_f32)
     }
 
     fn gpu_cast_f32_to_f16(
-        device: &Arc<CudaDevice>,
+        stream: &Arc<CudaStream>,
         input: &CudaSlice<f32>,
         n: usize,
+        kernel: &CudaFunction,
     ) -> Result<CudaSlice<f16>> {
-        let mut output = device
+        let mut output = stream
             .alloc_zeros::<f16>(n)
             .map_err(|e| LLMError::GpuError(format!("cast_f32_to_f16 alloc: {e}")))?;
-
-        let kernel = device
-            .get_func("cast_fp", "cast_f32_to_f16_kernel")
-            .ok_or_else(|| LLMError::GpuError("cast_f32_to_f16_kernel not loaded".into()))?;
 
         let threads = 256u32;
         let blocks = ((n as u32) + threads - 1) / threads;
@@ -179,25 +182,26 @@ impl CudaLinearLayer {
         };
 
         unsafe {
-            kernel
-                .launch(cfg, (&mut output, input, n as i32))
+            stream
+                .launch_builder(kernel)
+                .arg(&mut output)
+                .arg(input)
+                .arg(&(n as i32))
+                .launch(cfg)
                 .map_err(|e| LLMError::GpuError(format!("cast_f32_to_f16 launch: {e}")))?;
         }
         Ok(output)
     }
 
     fn gpu_cast_f16_to_f32(
-        device: &Arc<CudaDevice>,
+        stream: &Arc<CudaStream>,
         input: &CudaSlice<f16>,
         n: usize,
+        kernel: &CudaFunction,
     ) -> Result<CudaSlice<f32>> {
-        let mut output = device
+        let mut output = stream
             .alloc_zeros::<f32>(n)
             .map_err(|e| LLMError::GpuError(format!("cast_f16_to_f32 alloc: {e}")))?;
-
-        let kernel = device
-            .get_func("cast_fp", "cast_f16_to_f32_kernel")
-            .ok_or_else(|| LLMError::GpuError("cast_f16_to_f32_kernel not loaded".into()))?;
 
         let threads = 256u32;
         let blocks = ((n as u32) + threads - 1) / threads;
@@ -208,8 +212,12 @@ impl CudaLinearLayer {
         };
 
         unsafe {
-            kernel
-                .launch(cfg, (&mut output, input, n as i32))
+            stream
+                .launch_builder(kernel)
+                .arg(&mut output)
+                .arg(input)
+                .arg(&(n as i32))
+                .launch(cfg)
                 .map_err(|e| LLMError::GpuError(format!("cast_f16_to_f32 launch: {e}")))?;
         }
         Ok(output)

@@ -18,13 +18,13 @@
 mod inner {
     use std::sync::Arc;
 
-    use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice, LaunchAsync, LaunchConfig};
+    use cudarc::driver::{CudaSlice, CudaStream, DeviceSlice, LaunchConfig};
     use half::f16;
     use tracing::{info, trace};
 
     use rvllm_core::error::{LLMError, Result};
     use rvllm_gpu::cublas::CublasHandle;
-    use rvllm_gpu::stream::GpuStream;
+    use rvllm_gpu::kernel_loader::KernelLoader;
 
     /// Configuration for a single transformer layer.
     #[derive(Debug, Clone)]
@@ -122,12 +122,13 @@ mod inner {
     /// weights are passed in per-call via `GpuLayerWeights`.
     pub struct GpuTransformerLayer {
         config: GpuLayerConfig,
-        device: Arc<CudaDevice>,
+        stream: Arc<CudaStream>,
+        loader: Arc<KernelLoader>,
     }
 
     impl GpuTransformerLayer {
-        pub fn new(config: GpuLayerConfig, device: Arc<CudaDevice>) -> Self {
-            Self { config, device }
+        pub fn new(config: GpuLayerConfig, stream: Arc<CudaStream>, loader: Arc<KernelLoader>) -> Self {
+            Self { config, stream, loader }
         }
 
         /// Execute a full transformer layer forward pass.
@@ -155,7 +156,8 @@ mod inner {
 
             // 1. Pre-attention RMSNorm (f32)
             let normed = Self::rms_norm(
-                &self.device,
+                &self.stream,
+                &self.loader,
                 input.hidden_states,
                 weights.input_layernorm,
                 cfg.rms_norm_eps,
@@ -179,18 +181,19 @@ mod inner {
 
             // QKV biases (f32)
             if let Some(bias) = weights.q_proj_bias {
-                Self::add_bias(&self.device, &mut q, bias, num_tokens, q_dim)?;
+                Self::add_bias(&self.stream, &self.loader, &mut q, bias, num_tokens, q_dim)?;
             }
             if let Some(bias) = weights.k_proj_bias {
-                Self::add_bias(&self.device, &mut k, bias, num_tokens, kv_dim)?;
+                Self::add_bias(&self.stream, &self.loader, &mut k, bias, num_tokens, kv_dim)?;
             }
             if let Some(bias) = weights.v_proj_bias {
-                Self::add_bias(&self.device, &mut v, bias, num_tokens, kv_dim)?;
+                Self::add_bias(&self.stream, &self.loader, &mut v, bias, num_tokens, kv_dim)?;
             }
 
             // 3. RoPE
             let (q_rot, k_rot) = Self::apply_rotary_embedding(
-                &self.device,
+                &self.stream,
+                &self.loader,
                 &q,
                 &k,
                 input.positions,
@@ -204,7 +207,8 @@ mod inner {
 
             // 4. KV cache write + attention
             Self::cache_write(
-                &self.device,
+                &self.stream,
+                &self.loader,
                 &k_rot,
                 &v,
                 input.key_cache,
@@ -217,7 +221,8 @@ mod inner {
 
             let attn_out = if input.is_prefill {
                 Self::prefill_attention(
-                    &self.device,
+                    &self.stream,
+                    &self.loader,
                     &q_rot,
                     input.key_cache,
                     input.value_cache,
@@ -234,7 +239,8 @@ mod inner {
                 )?
             } else {
                 Self::decode_attention(
-                    &self.device,
+                    &self.stream,
+                    &self.loader,
                     &q_rot,
                     input.key_cache,
                     input.value_cache,
@@ -257,7 +263,8 @@ mod inner {
 
             // Residual
             let residual = Self::add_tensors(
-                &self.device,
+                &self.stream,
+                &self.loader,
                 input.hidden_states,
                 &attn_proj,
                 num_tokens * hidden,
@@ -265,7 +272,8 @@ mod inner {
 
             // 6. Post-attention RMSNorm (f32)
             let normed2 = Self::rms_norm(
-                &self.device,
+                &self.stream,
+                &self.loader,
                 &residual,
                 weights.post_attention_layernorm,
                 cfg.rms_norm_eps,
@@ -280,13 +288,13 @@ mod inner {
             let up = CudaLinearLayer::forward_once_f16(
                 &normed2, weights.up_proj, num_tokens, intermediate, hidden, blas,
             )?;
-            let fused = Self::fused_silu_mul(&self.device, &gate, &up, num_tokens * intermediate)?;
+            let fused = Self::fused_silu_mul(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?;
             let mlp_out = CudaLinearLayer::forward_once_f16(
                 &fused, weights.down_proj, num_tokens, hidden, intermediate, blas,
             )?;
 
             // 8. Residual
-            Self::add_tensors(&self.device, &residual, &mlp_out, num_tokens * hidden)
+            Self::add_tensors(&self.stream, &self.loader, &residual, &mlp_out, num_tokens * hidden)
         }
 
         pub fn forward(
@@ -313,7 +321,8 @@ mod inner {
             // 1. Pre-attention RMSNorm
             // ---------------------------------------------------------------
             let normed = Self::rms_norm(
-                &self.device,
+                &self.stream,
+                &self.loader,
                 input.hidden_states,
                 weights.input_layernorm,
                 cfg.rms_norm_eps,
@@ -321,7 +330,7 @@ mod inner {
                 hidden,
             )?;
 
-            // All ops on stream 0 -- no cross-stream sync needed
+            // All ops on this stream -- no cross-stream sync needed
 
             // ---------------------------------------------------------------
             // 2. QKV projections via cuBLAS sgemm
@@ -331,7 +340,7 @@ mod inner {
             let kv_dim = num_kv_heads * head_dim;
 
             let mut q = Self::linear(
-                &self.device,
+                &self.stream,
                 blas,
                 &normed,
                 weights.q_proj,
@@ -340,7 +349,7 @@ mod inner {
                 hidden,
             )?;
             let mut k = Self::linear(
-                &self.device,
+                &self.stream,
                 blas,
                 &normed,
                 weights.k_proj,
@@ -349,7 +358,7 @@ mod inner {
                 hidden,
             )?;
             let mut v = Self::linear(
-                &self.device,
+                &self.stream,
                 blas,
                 &normed,
                 weights.v_proj,
@@ -360,20 +369,21 @@ mod inner {
 
             // Apply QKV biases if present (e.g. Qwen2.5)
             if let Some(bias) = weights.q_proj_bias {
-                Self::add_bias(&self.device, &mut q, bias, num_tokens, q_dim)?;
+                Self::add_bias(&self.stream, &self.loader, &mut q, bias, num_tokens, q_dim)?;
             }
             if let Some(bias) = weights.k_proj_bias {
-                Self::add_bias(&self.device, &mut k, bias, num_tokens, kv_dim)?;
+                Self::add_bias(&self.stream, &self.loader, &mut k, bias, num_tokens, kv_dim)?;
             }
             if let Some(bias) = weights.v_proj_bias {
-                Self::add_bias(&self.device, &mut v, bias, num_tokens, kv_dim)?;
+                Self::add_bias(&self.stream, &self.loader, &mut v, bias, num_tokens, kv_dim)?;
             }
 
             // ---------------------------------------------------------------
             // 3. RoPE on Q and K
             // ---------------------------------------------------------------
             let (q_rot, k_rot) = Self::apply_rotary_embedding(
-                &self.device,
+                &self.stream,
+                &self.loader,
                 &q,
                 &k,
                 input.positions,
@@ -391,7 +401,8 @@ mod inner {
             // Always write K/V into paged cache via slot_mapping
             info!(layer = cfg.layer_idx, "gpu_layer: cache_write start");
             Self::cache_write(
-                &self.device,
+                &self.stream,
+                &self.loader,
                 &k_rot,
                 &v,
                 input.key_cache,
@@ -408,7 +419,8 @@ mod inner {
                 // Prefill: use FA2 prefill kernel reading from paged cache
                 info!(layer = cfg.layer_idx, "gpu_layer: prefill_attention start");
                 Self::prefill_attention(
-                    &self.device,
+                    &self.stream,
+                    &self.loader,
                     &q_rot,
                     input.key_cache,
                     input.value_cache,
@@ -427,7 +439,8 @@ mod inner {
                 // Decode: read from paged cache
                 info!(layer = cfg.layer_idx, "gpu_layer: decode_attention start");
                 Self::decode_attention(
-                    &self.device,
+                    &self.stream,
+                    &self.loader,
                     &q_rot,
                     input.key_cache,
                     input.value_cache,
@@ -447,7 +460,7 @@ mod inner {
             // 5. Output projection
             // ---------------------------------------------------------------
             let attn_proj = Self::linear(
-                &self.device,
+                &self.stream,
                 blas,
                 &attn_out,
                 weights.o_proj,
@@ -460,7 +473,8 @@ mod inner {
             // Residual: hidden_states + attn_proj
             // ---------------------------------------------------------------
             let residual = Self::add_tensors(
-                &self.device,
+                &self.stream,
+                &self.loader,
                 input.hidden_states,
                 &attn_proj,
                 num_tokens * hidden,
@@ -470,7 +484,8 @@ mod inner {
             // 6. Post-attention RMSNorm
             // ---------------------------------------------------------------
             let normed2 = Self::rms_norm(
-                &self.device,
+                &self.stream,
+                &self.loader,
                 &residual,
                 weights.post_attention_layernorm,
                 cfg.rms_norm_eps,
@@ -482,7 +497,7 @@ mod inner {
             // 7. MLP: gate_proj + up_proj -> fused_silu_mul -> down_proj
             // ---------------------------------------------------------------
             let gate = Self::linear(
-                &self.device,
+                &self.stream,
                 blas,
                 &normed2,
                 weights.gate_proj,
@@ -491,7 +506,7 @@ mod inner {
                 hidden,
             )?;
             let up = Self::linear(
-                &self.device,
+                &self.stream,
                 blas,
                 &normed2,
                 weights.up_proj,
@@ -500,10 +515,10 @@ mod inner {
                 hidden,
             )?;
 
-            let fused = Self::fused_silu_mul(&self.device, &gate, &up, num_tokens * intermediate)?;
+            let fused = Self::fused_silu_mul(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?;
 
             let mlp_out = Self::linear(
-                &self.device,
+                &self.stream,
                 blas,
                 &fused,
                 weights.down_proj,
@@ -515,7 +530,7 @@ mod inner {
             // ---------------------------------------------------------------
             // 8. Residual: residual + mlp_out
             // ---------------------------------------------------------------
-            let output = Self::add_tensors(&self.device, &residual, &mlp_out, num_tokens * hidden)?;
+            let output = Self::add_tensors(&self.stream, &self.loader, &residual, &mlp_out, num_tokens * hidden)?;
 
             Ok(output)
         }
@@ -532,7 +547,8 @@ mod inner {
         ///
         /// Dispatches to the rms_norm CUDA kernel.
         fn rms_norm(
-            device: &Arc<CudaDevice>,
+            stream: &Arc<CudaStream>,
+            loader: &KernelLoader,
             input: &CudaSlice<f32>,
             weight: &CudaSlice<f32>,
             eps: f32,
@@ -540,7 +556,7 @@ mod inner {
             hidden_size: usize,
         ) -> Result<CudaSlice<f32>> {
             let n = num_tokens * hidden_size;
-            let mut output = device
+            let mut output = stream
                 .alloc_zeros::<f32>(n)
                 .map_err(|e| LLMError::GpuError(format!("rms_norm alloc failed: {e}")))?;
 
@@ -560,12 +576,16 @@ mod inner {
             // the same device. Grid/block dims are checked above. The kernel reads
             // `input` [num_tokens * hidden_size], `weight` [hidden_size], and writes
             // `output` [num_tokens * hidden_size].
-            let kernel = device.get_func(module_name, func_name).ok_or_else(|| {
-                LLMError::GpuError(format!("kernel {module_name}::{func_name} not loaded"))
-            })?;
+            let kernel = loader.get_func(module_name, func_name)?;
             unsafe {
-                kernel
-                    .launch(cfg, (&mut output, input, weight, eps, hidden_size as i32))
+                stream
+                    .launch_builder(&kernel)
+                    .arg(&mut output)
+                    .arg(input)
+                    .arg(weight)
+                    .arg(&eps)
+                    .arg(&(hidden_size as i32))
+                    .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("rms_norm launch failed: {e}")))?;
             }
 
@@ -577,30 +597,34 @@ mod inner {
         ///   input: [m, k], weight: [n, k] (row-major), output: [m, n].
         /// Add bias in-place: tensor[i*dim + j] += bias[j]
         fn add_bias(
-            device: &Arc<CudaDevice>,
+            stream: &Arc<CudaStream>,
+            loader: &KernelLoader,
             tensor: &mut CudaSlice<f32>,
             bias: &CudaSlice<f32>,
             num_tokens: usize,
             dim: usize,
         ) -> Result<()> {
-            let kernel = device
-                .get_func("add_bias", "add_bias_kernel")
-                .ok_or_else(|| LLMError::GpuError("add_bias_kernel not loaded".into()))?;
+            let kernel = loader.get_func("add_bias", "add_bias_kernel")?;
             let cfg = LaunchConfig {
                 grid_dim: (num_tokens as u32, 1, 1),
                 block_dim: (dim.min(1024) as u32, 1, 1),
                 shared_mem_bytes: 0,
             };
+            let dim_i32 = dim as i32;
             unsafe {
-                kernel
-                    .launch(cfg, (tensor as &mut CudaSlice<f32>, bias, dim as i32))
+                stream
+                    .launch_builder(&kernel)
+                    .arg(tensor)
+                    .arg(bias)
+                    .arg(&dim_i32)
+                    .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("add_bias launch: {e}")))?;
             }
             Ok(())
         }
 
         fn linear(
-            device: &Arc<CudaDevice>,
+            stream: &Arc<CudaStream>,
             blas: &CublasHandle,
             input: &CudaSlice<f32>,
             weight: &CudaSlice<f32>,
@@ -608,7 +632,7 @@ mod inner {
             n: usize,
             k: usize,
         ) -> Result<CudaSlice<f32>> {
-            let mut output = device
+            let mut output = stream
                 .alloc_zeros::<f32>(m * n)
                 .map_err(|e| LLMError::GpuError(format!("linear alloc failed: {e}")))?;
 
@@ -627,7 +651,8 @@ mod inner {
         /// Kernel signature: (query, key, cos_cache, sin_cache, positions,
         ///                     num_tokens, num_heads, num_kv_heads, head_dim)
         fn apply_rotary_embedding(
-            device: &Arc<CudaDevice>,
+            stream: &Arc<CudaStream>,
+            loader: &KernelLoader,
             q: &CudaSlice<f32>,
             k: &CudaSlice<f32>,
             positions: &CudaSlice<i32>,
@@ -642,23 +667,21 @@ mod inner {
             let k_len = num_tokens * num_kv_heads * head_dim;
 
             // Clone Q and K so we can apply rotation in-place.
-            let mut q_out = device
+            let mut q_out = stream
                 .alloc_zeros::<f32>(q_len)
                 .map_err(|e| LLMError::GpuError(format!("rope q alloc: {e}")))?;
-            let mut k_out = device
+            let mut k_out = stream
                 .alloc_zeros::<f32>(k_len)
                 .map_err(|e| LLMError::GpuError(format!("rope k alloc: {e}")))?;
 
-            device
-                .dtod_copy(q, &mut q_out)
+            stream
+                .memcpy_dtod(q, &mut q_out)
                 .map_err(|e| LLMError::GpuError(format!("rope q copy: {e}")))?;
-            device
-                .dtod_copy(k, &mut k_out)
+            stream
+                .memcpy_dtod(k, &mut k_out)
                 .map_err(|e| LLMError::GpuError(format!("rope k copy: {e}")))?;
 
-            let kernel = device
-                .get_func("rotary_embedding", "rotary_embedding_kernel")
-                .ok_or_else(|| LLMError::GpuError("rotary_embedding_kernel not loaded".into()))?;
+            let kernel = loader.get_func("rotary_embedding", "rotary_embedding_kernel")?;
 
             // Single launch: grid (num_tokens, max(num_heads, num_kv_heads), 1)
             // The kernel internally guards `if (head_idx < num_kv_heads)` for K.
@@ -670,24 +693,26 @@ mod inner {
                 shared_mem_bytes: 0,
             };
 
+            let num_tokens_i32 = num_tokens as i32;
+            let num_heads_i32 = num_heads as i32;
+            let num_kv_heads_i32 = num_kv_heads as i32;
+            let head_dim_i32 = head_dim as i32;
+
             // positions is u32 on GPU but kernel expects int* (i32).
             // They're the same size; cast is safe.
             unsafe {
-                kernel
-                    .launch(
-                        cfg,
-                        (
-                            &mut q_out,
-                            &mut k_out,
-                            rope_cos,
-                            rope_sin,
-                            positions, // u32 == i32 in CUDA ABI
-                            num_tokens as i32,
-                            num_heads as i32,
-                            num_kv_heads as i32,
-                            head_dim as i32,
-                        ),
-                    )
+                stream
+                    .launch_builder(&kernel)
+                    .arg(&mut q_out)
+                    .arg(&mut k_out)
+                    .arg(rope_cos)
+                    .arg(rope_sin)
+                    .arg(positions)
+                    .arg(&num_tokens_i32)
+                    .arg(&num_heads_i32)
+                    .arg(&num_kv_heads_i32)
+                    .arg(&head_dim_i32)
+                    .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("rope k launch failed: {e}")))?;
             }
 
@@ -701,7 +726,8 @@ mod inner {
         /// Uses reshape_and_cache_f16_kernel: 1 launch per layer.
         #[allow(clippy::too_many_arguments)]
         fn cache_write(
-            device: &Arc<CudaDevice>,
+            stream: &Arc<CudaStream>,
+            loader: &KernelLoader,
             k: &CudaSlice<f32>,
             v: &CudaSlice<f32>,
             key_cache: &CudaSlice<f16>,
@@ -711,9 +737,7 @@ mod inner {
             num_kv_heads: usize,
             head_dim: usize,
         ) -> Result<()> {
-            let kernel = device
-                .get_func("reshape_and_cache", "reshape_and_cache_f16_kernel")
-                .ok_or_else(|| LLMError::GpuError("reshape_and_cache_f16_kernel not loaded".into()))?;
+            let kernel = loader.get_func("reshape_and_cache", "reshape_and_cache_f16_kernel")?;
 
             let kv_dim = num_kv_heads * head_dim;
             let cfg = LaunchConfig {
@@ -722,22 +746,23 @@ mod inner {
                 shared_mem_bytes: 0,
             };
 
+            let num_tokens_i32 = num_tokens as i32;
+            let num_kv_heads_i32 = num_kv_heads as i32;
+            let head_dim_i32 = head_dim as i32;
+
             // Kernel: (f16* key_cache, f16* value_cache, f32* key, f32* value, int* slot_mapping, int, int, int)
             unsafe {
-                kernel
-                    .launch(
-                        cfg,
-                        (
-                            key_cache,
-                            value_cache,
-                            k,
-                            v,
-                            slot_mapping,
-                            num_tokens as i32,
-                            num_kv_heads as i32,
-                            head_dim as i32,
-                        ),
-                    )
+                stream
+                    .launch_builder(&kernel)
+                    .arg(key_cache)
+                    .arg(value_cache)
+                    .arg(k)
+                    .arg(v)
+                    .arg(slot_mapping)
+                    .arg(&num_tokens_i32)
+                    .arg(&num_kv_heads_i32)
+                    .arg(&head_dim_i32)
+                    .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("reshape_and_cache_f16 launch: {e}")))?;
             }
             Ok(())
@@ -749,7 +774,7 @@ mod inner {
         /// Bypasses FA2 kernel for correctness. Used only during prefill (once per request).
         #[allow(dead_code)]
         fn naive_prefill_attention(
-            device: &Arc<CudaDevice>,
+            stream: &Arc<CudaStream>,
             blas: &CublasHandle,
             q: &CudaSlice<f32>, // [num_tokens, num_heads * head_dim]
             k: &CudaSlice<f32>, // [num_tokens, num_kv_heads * head_dim]
@@ -764,7 +789,7 @@ mod inner {
             let q_stride = num_heads * head_dim;
 
             // Output: [num_tokens, num_heads * head_dim]
-            let mut output = device
+            let mut output = stream
                 .alloc_zeros::<f32>(num_tokens * q_stride)
                 .map_err(|e| LLMError::GpuError(format!("naive attn output alloc: {e}")))?;
 
@@ -776,14 +801,14 @@ mod inner {
                 // Extract K_head [num_tokens, head_dim] from K [num_tokens, num_kv_heads * head_dim]
                 // Extract V_head [num_tokens, head_dim] from V [num_tokens, num_kv_heads * head_dim]
                 // Use CPU gather for correctness (not perf-critical for prefill)
-                let q_all: Vec<f32> = device
-                    .dtoh_sync_copy(q)
+                let q_all: Vec<f32> = stream
+                    .clone_dtoh(q)
                     .map_err(|e| LLMError::GpuError(format!("naive attn q DtoH: {e}")))?;
-                let k_all: Vec<f32> = device
-                    .dtoh_sync_copy(k)
+                let k_all: Vec<f32> = stream
+                    .clone_dtoh(k)
                     .map_err(|e| LLMError::GpuError(format!("naive attn k DtoH: {e}")))?;
-                let v_all: Vec<f32> = device
-                    .dtoh_sync_copy(v)
+                let v_all: Vec<f32> = stream
+                    .clone_dtoh(v)
                     .map_err(|e| LLMError::GpuError(format!("naive attn v DtoH: {e}")))?;
 
                 let kv_stride = num_kv_heads * head_dim;
@@ -843,16 +868,16 @@ mod inner {
                 }
 
                 // Scatter back into output
-                let mut out_all: Vec<f32> = device
-                    .dtoh_sync_copy(&output)
+                let mut out_all: Vec<f32> = stream
+                    .clone_dtoh(&output)
                     .map_err(|e| LLMError::GpuError(format!("naive attn out DtoH: {e}")))?;
                 for t in 0..num_tokens {
                     for d in 0..head_dim {
                         out_all[t * q_stride + h * head_dim + d] = out_head[t * head_dim + d];
                     }
                 }
-                output = device
-                    .htod_sync_copy(&out_all)
+                output = stream
+                    .clone_htod(&out_all)
                     .map_err(|e| LLMError::GpuError(format!("naive attn out HtoD: {e}")))?;
             }
 
@@ -862,7 +887,8 @@ mod inner {
         /// FA2 prefill attention reading from f16 paged cache with real block_tables.
         /// Q is f32, cache is f16; the kernel loads f16 and promotes to f32 internally.
         fn prefill_attention(
-            device: &Arc<CudaDevice>,
+            stream: &Arc<CudaStream>,
+            loader: &KernelLoader,
             q: &CudaSlice<f32>,
             key_cache: &CudaSlice<f16>,
             value_cache: &CudaSlice<f16>,
@@ -878,7 +904,7 @@ mod inner {
             block_size: usize,
         ) -> Result<CudaSlice<f32>> {
             let out_len = num_tokens * num_heads * head_dim;
-            let output = device
+            let output = stream
                 .alloc_zeros::<f32>(out_len)
                 .map_err(|e| LLMError::GpuError(format!("prefill_attn alloc: {e}")))?;
 
@@ -889,9 +915,7 @@ mod inner {
             let shared_mem_bytes = ((2 * FA2_BC * head_dim + FA2_BC + (FA2_THREADS as usize / 32))
                 * std::mem::size_of::<f32>()) as u32;
 
-            let kernel = device
-                .get_func("flash_attention", "flash_attention_2_f16kv_kernel")
-                .ok_or_else(|| LLMError::GpuError("flash_attention_2_f16kv_kernel not loaded".into()))?;
+            let kernel = loader.get_func("flash_attention", "flash_attention_2_f16kv_kernel")?;
 
             let bt_len = DeviceSlice::len(block_tables);
             info!(
@@ -937,45 +961,35 @@ mod inner {
                 ).map_err(|e| LLMError::GpuError(format!("prefill FA2 set max shared mem: {e}")))?;
             }
 
-            // FA2 prefill kernel: 16 args, use raw void** launch (exceeds tuple limit)
+            let p_num_heads = num_heads as i32;
+            let p_num_kv = num_kv_heads as i32;
+            let p_head_dim = head_dim as i32;
+            let p_block_size = block_size as i32;
+            let p_max_ctx = max_context_len as i32;
+            let p_num_tokens = num_tokens as i32;
+            let p_causal = 1i32;
+
+            // FA2 prefill kernel: 16 args via builder pattern
             unsafe {
-                use cudarc::driver::DevicePtr;
-                let mut out_ptr = *DevicePtr::device_ptr(&output);
-                let mut q_ptr = *DevicePtr::device_ptr(q);
-                let mut kc_ptr = *DevicePtr::device_ptr(key_cache);
-                let mut vc_ptr = *DevicePtr::device_ptr(value_cache);
-                let mut bt_ptr = *DevicePtr::device_ptr(block_tables);
-                let mut cl_ptr = *DevicePtr::device_ptr(context_lens);
-                let mut ss_ptr = *DevicePtr::device_ptr(seq_start_pos);
-                let mut p_scale = scale;
-                let mut p_num_heads = num_heads as i32;
-                let mut p_num_kv = num_kv_heads as i32;
-                let mut p_head_dim = head_dim as i32;
-                let mut p_block_size = block_size as i32;
-                let mut p_max_ctx = max_context_len as i32;
-                let mut p_max_blocks = max_blocks_per_seq;
-                let mut p_num_tokens = num_tokens as i32;
-                let mut p_causal = 1i32;
-                let params: &mut [*mut std::ffi::c_void] = &mut [
-                    &mut out_ptr as *mut _ as *mut _,
-                    &mut q_ptr as *mut _ as *mut _,
-                    &mut kc_ptr as *mut _ as *mut _,
-                    &mut vc_ptr as *mut _ as *mut _,
-                    &mut bt_ptr as *mut _ as *mut _,
-                    &mut cl_ptr as *mut _ as *mut _,
-                    &mut ss_ptr as *mut _ as *mut _,
-                    &mut p_scale as *mut _ as *mut _,
-                    &mut p_num_heads as *mut _ as *mut _,
-                    &mut p_num_kv as *mut _ as *mut _,
-                    &mut p_head_dim as *mut _ as *mut _,
-                    &mut p_block_size as *mut _ as *mut _,
-                    &mut p_max_ctx as *mut _ as *mut _,
-                    &mut p_max_blocks as *mut _ as *mut _,
-                    &mut p_num_tokens as *mut _ as *mut _,
-                    &mut p_causal as *mut _ as *mut _,
-                ];
-                kernel
-                    .launch(cfg, params)
+                stream
+                    .launch_builder(&kernel)
+                    .arg(&output)
+                    .arg(q)
+                    .arg(key_cache)
+                    .arg(value_cache)
+                    .arg(block_tables)
+                    .arg(context_lens)
+                    .arg(seq_start_pos)
+                    .arg(&scale)
+                    .arg(&p_num_heads)
+                    .arg(&p_num_kv)
+                    .arg(&p_head_dim)
+                    .arg(&p_block_size)
+                    .arg(&p_max_ctx)
+                    .arg(&max_blocks_per_seq)
+                    .arg(&p_num_tokens)
+                    .arg(&p_causal)
+                    .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("prefill FA2 launch: {e}")))?;
             }
 
@@ -985,7 +999,8 @@ mod inner {
         /// Decode attention: read f16 K/V from paged cache, one FA2 decode kernel per layer.
         /// Q is f32, cache is f16; kernel promotes f16 to f32 on load.
         fn decode_attention(
-            device: &Arc<CudaDevice>,
+            stream: &Arc<CudaStream>,
+            loader: &KernelLoader,
             q: &CudaSlice<f32>,
             key_cache: &CudaSlice<f16>,
             value_cache: &CudaSlice<f16>,
@@ -1000,7 +1015,7 @@ mod inner {
             block_size: usize,
         ) -> Result<CudaSlice<f32>> {
             let out_len = num_tokens * num_heads * head_dim;
-            let mut output = device
+            let mut output = stream
                 .alloc_zeros::<f32>(out_len)
                 .map_err(|e| LLMError::GpuError(format!("paged_attn alloc failed: {e}")))?;
 
@@ -1023,9 +1038,7 @@ mod inner {
                 shared_mem_bytes,
             };
 
-            let kernel = device.get_func(module_name, func_name).ok_or_else(|| {
-                LLMError::GpuError(format!("kernel {module_name}::{func_name} not loaded"))
-            })?;
+            let kernel = loader.get_func(module_name, func_name)?;
 
             // Opt into extended shared memory if needed
             if shared_mem_bytes > 49152 {
@@ -1035,6 +1048,12 @@ mod inner {
                 ).map_err(|e| LLMError::GpuError(format!("decode FA2 set max shared mem: {e}")))?;
             }
 
+            let p_num_heads = num_heads as i32;
+            let p_num_kv_heads = num_kv_heads as i32;
+            let p_head_dim = head_dim as i32;
+            let p_block_size = block_size as i32;
+            let p_max_blocks = (block_tables.len() / num_seqs.max(1)) as i32;
+
             // SAFETY: All slices are valid GPU memory on this device.
             // output: [num_seqs, num_heads, head_dim]
             // q:      [num_seqs, num_heads, head_dim]  (decode: num_seqs == num_tokens)
@@ -1043,25 +1062,21 @@ mod inner {
             // context_lens: [num_seqs]
             // Scalar int args cast from usize; all values fit in i32 range.
             unsafe {
-                kernel
-                    .launch(
-                        cfg,
-                        (
-                            &mut output,
-                            q,
-                            key_cache,
-                            value_cache,
-                            block_tables,
-                            context_lens,
-                            scale,
-                            num_heads as i32,
-                            num_kv_heads as i32,
-                            head_dim as i32,
-                            block_size as i32,
-                            // max_blocks_per_seq: block_tables row width
-                            (block_tables.len() / num_seqs.max(1)) as i32,
-                        ),
-                    )
+                stream
+                    .launch_builder(&kernel)
+                    .arg(&mut output)
+                    .arg(q)
+                    .arg(key_cache)
+                    .arg(value_cache)
+                    .arg(block_tables)
+                    .arg(context_lens)
+                    .arg(&scale)
+                    .arg(&p_num_heads)
+                    .arg(&p_num_kv_heads)
+                    .arg(&p_head_dim)
+                    .arg(&p_block_size)
+                    .arg(&p_max_blocks)
+                    .launch(cfg)
                     .map_err(|e| {
                         LLMError::GpuError(format!("flash_attention_2_decode launch failed: {e}"))
                     })?;
@@ -1074,12 +1089,13 @@ mod inner {
         ///
         /// Dispatches to the activation CUDA kernel.
         fn fused_silu_mul(
-            device: &Arc<CudaDevice>,
+            stream: &Arc<CudaStream>,
+            loader: &KernelLoader,
             gate: &CudaSlice<f32>,
             up: &CudaSlice<f32>,
             n: usize,
         ) -> Result<CudaSlice<f32>> {
-            let mut output = device
+            let mut output = stream
                 .alloc_zeros::<f32>(n)
                 .map_err(|e| LLMError::GpuError(format!("fused_silu_mul alloc failed: {e}")))?;
 
@@ -1094,15 +1110,20 @@ mod inner {
                 shared_mem_bytes: 0,
             };
 
-            let kernel = device.get_func(module_name, func_name).ok_or_else(|| {
-                LLMError::GpuError(format!("kernel {module_name}::{func_name} not loaded"))
-            })?;
+            let kernel = loader.get_func(module_name, func_name)?;
+
+            let n_i32 = n as i32;
 
             // SAFETY: gate, up, and output all have exactly n elements.
             // Grid covers all elements with ceil division.
             unsafe {
-                kernel
-                    .launch(cfg, (&mut output, gate, up, n as i32))
+                stream
+                    .launch_builder(&kernel)
+                    .arg(&mut output)
+                    .arg(gate)
+                    .arg(up)
+                    .arg(&n_i32)
+                    .launch(cfg)
                     .map_err(|e| {
                         LLMError::GpuError(format!("fused_silu_mul launch failed: {e}"))
                     })?;
@@ -1116,12 +1137,13 @@ mod inner {
         /// Tries "add_bias" module first (Agent 20's dedicated kernel), then
         /// "activation" module, then falls back to CPU.
         fn add_tensors(
-            device: &Arc<CudaDevice>,
+            stream: &Arc<CudaStream>,
+            loader: &KernelLoader,
             a: &CudaSlice<f32>,
             b: &CudaSlice<f32>,
             n: usize,
         ) -> Result<CudaSlice<f32>> {
-            let mut output = device
+            let mut output = stream
                 .alloc_zeros::<f32>(n)
                 .map_err(|e| LLMError::GpuError(format!("add_tensors alloc failed: {e}")))?;
 
@@ -1133,35 +1155,44 @@ mod inner {
                 shared_mem_bytes: 0,
             };
 
+            let n_i32 = n as i32;
+
             // Try dedicated add_bias module first, then activation module
-            let kernel = device
+            let kernel = loader
                 .get_func("add_bias", "add_kernel")
-                .or_else(|| device.get_func("activation", "add_kernel"));
+                .or_else(|_| loader.get_func("activation", "add_kernel"));
 
             match kernel {
-                Some(k) => {
+                Ok(k) => {
                     // SAFETY: a, b, output all have exactly n elements.
                     unsafe {
-                        k.launch(cfg, (&mut output, a, b, n as i32)).map_err(|e| {
-                            LLMError::GpuError(format!("add_kernel launch failed: {e}"))
-                        })?;
+                        stream
+                            .launch_builder(&k)
+                            .arg(&mut output)
+                            .arg(a)
+                            .arg(b)
+                            .arg(&n_i32)
+                            .launch(cfg)
+                            .map_err(|e| {
+                                LLMError::GpuError(format!("add_kernel launch failed: {e}"))
+                            })?;
                     }
                 }
-                None => {
+                Err(_) => {
                     // Fallback: CPU add (only until kernels are compiled).
-                    let a_host = device
-                        .dtoh_sync_copy(a)
+                    let a_host = stream
+                        .clone_dtoh(a)
                         .map_err(|e| LLMError::GpuError(format!("add dtoh a failed: {e}")))?;
-                    let b_host = device
-                        .dtoh_sync_copy(b)
+                    let b_host = stream
+                        .clone_dtoh(b)
                         .map_err(|e| LLMError::GpuError(format!("add dtoh b failed: {e}")))?;
                     let sum: Vec<f32> = a_host
                         .iter()
                         .zip(b_host.iter())
                         .map(|(x, y)| x + y)
                         .collect();
-                    output = device
-                        .htod_sync_copy(&sum)
+                    output = stream
+                        .clone_htod(&sum)
                         .map_err(|e| LLMError::GpuError(format!("add htod failed: {e}")))?;
                 }
             }

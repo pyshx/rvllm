@@ -1,7 +1,7 @@
 //! Async GPU stream wrapper.
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::CudaDevice;
+use cudarc::driver::CudaContext;
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
@@ -14,9 +14,9 @@ use crate::Result;
 pub struct GpuStream {
     device_id: usize,
     #[cfg(feature = "cuda")]
-    device: Arc<CudaDevice>,
+    context: Arc<CudaContext>,
     #[cfg(feature = "cuda")]
-    stream: cudarc::driver::CudaStream,
+    stream: Arc<cudarc::driver::CudaStream>,
 }
 
 impl GpuStream {
@@ -29,14 +29,14 @@ impl GpuStream {
     #[cfg(feature = "cuda")]
     pub fn new(device_id: usize) -> Result<Self> {
         tracing::debug!(device_id, "creating CUDA GPU stream");
-        let device = CudaDevice::new(device_id)
+        let context = CudaContext::new(device_id)
             .map_err(|e| crate::LLMError::MemoryError(format!("CUDA device init failed: {e}")))?;
-        let stream = device.fork_default_stream().map_err(|e| {
+        let stream = context.new_stream().map_err(|e| {
             crate::LLMError::MemoryError(format!("CUDA stream creation failed: {e}"))
         })?;
         Ok(Self {
             device_id,
-            device,
+            context,
             stream,
         })
     }
@@ -45,7 +45,7 @@ impl GpuStream {
         tracing::trace!(device_id = self.device_id, "synchronizing stream");
         #[cfg(feature = "cuda")]
         {
-            self.device.wait_for(&self.stream).map_err(|e| {
+            self.stream.synchronize().map_err(|e| {
                 crate::LLMError::MemoryError(format!("CUDA stream sync failed: {e}"))
             })?;
         }
@@ -57,12 +57,12 @@ impl GpuStream {
     }
 
     #[cfg(feature = "cuda")]
-    pub fn cuda_device(&self) -> &Arc<CudaDevice> {
-        &self.device
+    pub fn cuda_context(&self) -> &Arc<CudaContext> {
+        &self.context
     }
 
     #[cfg(feature = "cuda")]
-    pub fn cuda_stream(&self) -> &cudarc::driver::CudaStream {
+    pub fn cuda_stream(&self) -> &Arc<cudarc::driver::CudaStream> {
         &self.stream
     }
 }

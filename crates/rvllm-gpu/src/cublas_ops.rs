@@ -6,7 +6,7 @@
 
 use cudarc::cublas::sys::cublasOperation_t;
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
-use cudarc::driver::{CudaDevice, CudaSlice};
+use cudarc::driver::{CudaSlice, CudaStream};
 use half::f16;
 use std::sync::Arc;
 
@@ -15,19 +15,19 @@ use crate::{LLMError, Result};
 /// Wrapper that owns a `CudaBlas` handle and exposes safe GEMM operations.
 pub struct CublasOps {
     cublas: CudaBlas,
-    device: Arc<CudaDevice>,
+    stream: Arc<CudaStream>,
 }
 
 impl CublasOps {
-    pub fn new(device: Arc<CudaDevice>) -> Result<Self> {
-        let cublas = CudaBlas::new(device.clone())
+    pub fn new(stream: Arc<CudaStream>) -> Result<Self> {
+        let cublas = CudaBlas::new(stream.clone())
             .map_err(|e| LLMError::GpuError(format!("CudaBlas init failed: {e}")))?;
-        Ok(Self { cublas, device })
+        Ok(Self { cublas, stream })
     }
 
-    /// Reference to the underlying CUDA device.
-    pub fn device(&self) -> &Arc<CudaDevice> {
-        &self.device
+    /// Reference to the underlying CUDA stream.
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
     }
 
     /// Row-major SGEMM: `C[m,n] = alpha * A[m,k] @ B^T[k,n] + beta * C[m,n]`

@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaDevice, CudaSlice};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use half::f16;
 use tracing::{debug, info};
 
@@ -38,7 +38,8 @@ pub struct CudaCacheEngine {
     block_size: usize,
     num_gpu_blocks: usize,
     num_cpu_blocks: usize,
-    device: Arc<CudaDevice>,
+    context: Arc<CudaContext>,
+    stream: Arc<CudaStream>,
 }
 
 impl CudaCacheEngine {
@@ -53,7 +54,8 @@ impl CudaCacheEngine {
         block_size: usize,
         num_gpu_blocks: usize,
         num_cpu_blocks: usize,
-        device: Arc<CudaDevice>,
+        context: Arc<CudaContext>,
+        stream: Arc<CudaStream>,
     ) -> Result<Self> {
         let elements_per_block = block_size * num_heads * head_dim;
         let gpu_total = num_gpu_blocks * elements_per_block;
@@ -76,10 +78,10 @@ impl CudaCacheEngine {
         for layer in 0..num_layers {
             debug!(layer, gpu_total, "allocating f16 CUDA KV cache");
 
-            let key_gpu: CudaSlice<f16> = device.alloc_zeros(gpu_total).map_err(|e| {
+            let key_gpu: CudaSlice<f16> = stream.alloc_zeros(gpu_total).map_err(|e| {
                 LLMError::GpuError(format!("CUDA key cache alloc failed layer {layer}: {e}"))
             })?;
-            let val_gpu: CudaSlice<f16> = device.alloc_zeros(gpu_total).map_err(|e| {
+            let val_gpu: CudaSlice<f16> = stream.alloc_zeros(gpu_total).map_err(|e| {
                 LLMError::GpuError(format!("CUDA value cache alloc failed layer {layer}: {e}"))
             })?;
             gpu_cache.push((key_gpu, val_gpu));
@@ -99,7 +101,8 @@ impl CudaCacheEngine {
             block_size,
             num_gpu_blocks,
             num_cpu_blocks,
-            device,
+            context,
+            stream,
         })
     }
 
@@ -108,9 +111,14 @@ impl CudaCacheEngine {
         self.block_size * self.num_heads * self.head_dim
     }
 
-    /// Reference to the CUDA device.
-    pub fn device(&self) -> &Arc<CudaDevice> {
-        &self.device
+    /// Reference to the CUDA context.
+    pub fn context(&self) -> &Arc<CudaContext> {
+        &self.context
+    }
+
+    /// Reference to the CUDA stream.
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
     }
 
     /// Number of transformer layers.
@@ -177,23 +185,23 @@ impl CudaCacheEngine {
 
             for (key_buf, val_buf) in &mut self.gpu_cache {
                 let mut key_host = self
-                    .device
-                    .dtoh_sync_copy(key_buf)
+                    .stream
+                    .clone_dtoh(key_buf)
                     .map_err(|e| LLMError::GpuError(format!("copy_blocks dtoh key: {e}")))?;
                 let src_slice: Vec<f16> = key_host[src_off..src_off + epb].to_vec();
                 key_host[dst_off..dst_off + epb].copy_from_slice(&src_slice);
-                self.device
-                    .htod_sync_copy_into(&key_host, key_buf)
+                self.stream
+                    .memcpy_htod(&key_host, key_buf)
                     .map_err(|e| LLMError::GpuError(format!("copy_blocks htod key: {e}")))?;
 
                 let mut val_host = self
-                    .device
-                    .dtoh_sync_copy(val_buf)
+                    .stream
+                    .clone_dtoh(val_buf)
                     .map_err(|e| LLMError::GpuError(format!("copy_blocks dtoh val: {e}")))?;
                 let src_slice: Vec<f16> = val_host[src_off..src_off + epb].to_vec();
                 val_host[dst_off..dst_off + epb].copy_from_slice(&src_slice);
-                self.device
-                    .htod_sync_copy_into(&val_host, val_buf)
+                self.stream
+                    .memcpy_htod(&val_host, val_buf)
                     .map_err(|e| LLMError::GpuError(format!("copy_blocks htod val: {e}")))?;
             }
         }
@@ -236,22 +244,22 @@ impl CudaCacheEngine {
                 .zip(self.cpu_cache.iter())
                 .enumerate()
             {
-                let mut key_host = self.device.dtoh_sync_copy(key_gpu).map_err(|e| {
+                let mut key_host = self.stream.clone_dtoh(key_gpu).map_err(|e| {
                     LLMError::GpuError(format!("swap_in dtoh key layer {layer_idx}: {e}"))
                 })?;
                 key_host[gpu_off..gpu_off + epb].copy_from_slice(&key_cpu[cpu_off..cpu_off + epb]);
-                self.device
-                    .htod_sync_copy_into(&key_host, key_gpu)
+                self.stream
+                    .memcpy_htod(&key_host, key_gpu)
                     .map_err(|e| {
                         LLMError::GpuError(format!("swap_in htod key layer {layer_idx}: {e}"))
                     })?;
 
-                let mut val_host = self.device.dtoh_sync_copy(val_gpu).map_err(|e| {
+                let mut val_host = self.stream.clone_dtoh(val_gpu).map_err(|e| {
                     LLMError::GpuError(format!("swap_in dtoh val layer {layer_idx}: {e}"))
                 })?;
                 val_host[gpu_off..gpu_off + epb].copy_from_slice(&val_cpu[cpu_off..cpu_off + epb]);
-                self.device
-                    .htod_sync_copy_into(&val_host, val_gpu)
+                self.stream
+                    .memcpy_htod(&val_host, val_gpu)
                     .map_err(|e| {
                         LLMError::GpuError(format!("swap_in htod val layer {layer_idx}: {e}"))
                     })?;
@@ -293,12 +301,12 @@ impl CudaCacheEngine {
                 .zip(self.cpu_cache.iter_mut())
                 .enumerate()
             {
-                let key_host = self.device.dtoh_sync_copy(key_gpu).map_err(|e| {
+                let key_host = self.stream.clone_dtoh(key_gpu).map_err(|e| {
                     LLMError::GpuError(format!("swap_out dtoh key layer {layer_idx}: {e}"))
                 })?;
                 key_cpu[cpu_off..cpu_off + epb].copy_from_slice(&key_host[gpu_off..gpu_off + epb]);
 
-                let val_host = self.device.dtoh_sync_copy(val_gpu).map_err(|e| {
+                let val_host = self.stream.clone_dtoh(val_gpu).map_err(|e| {
                     LLMError::GpuError(format!("swap_out dtoh val layer {layer_idx}: {e}"))
                 })?;
                 val_cpu[cpu_off..cpu_off + epb].copy_from_slice(&val_host[gpu_off..gpu_off + epb]);

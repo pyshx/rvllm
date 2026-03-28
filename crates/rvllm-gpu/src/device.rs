@@ -43,9 +43,9 @@ pub fn list_devices() -> Vec<GpuDevice> {
 
 #[cfg(feature = "cuda")]
 fn cuda_list_devices() -> Vec<GpuDevice> {
-    use cudarc::driver::CudaDevice;
+    use cudarc::driver::CudaContext;
 
-    let count = match CudaDevice::count() {
+    let count = match CudaContext::device_count() {
         Ok(n) => n as usize,
         Err(e) => {
             tracing::warn!("Failed to query CUDA device count: {e}");
@@ -55,26 +55,19 @@ fn cuda_list_devices() -> Vec<GpuDevice> {
 
     let mut devices = Vec::with_capacity(count);
     for id in 0..count {
-        let dev = match CudaDevice::new(id) {
-            Ok(d) => d,
+        let ctx = match CudaContext::new(id) {
+            Ok(c) => c,
             Err(e) => {
                 tracing::warn!(id, "Failed to init CUDA device: {e}");
                 continue;
             }
         };
 
-        let name = dev.name().unwrap_or_else(|_| format!("CUDA Device {id}"));
+        let name = ctx.name().unwrap_or_else(|_| format!("CUDA Device {id}"));
 
-        let (major, minor) = dev
-            .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
-            .and_then(|maj| {
-                dev.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
-                    .map(|min| (maj as u32, min as u32))
-            })
-            .unwrap_or((0, 0));
+        let (major, minor) = ctx.compute_capability().unwrap_or((0, 0));
 
-        let total_memory =
-            unsafe { cudarc::driver::result::device::total_mem(*dev.cu_device()) }.unwrap_or(0);
+        let total_memory = ctx.total_mem().unwrap_or(0);
 
         devices.push(GpuDevice {
             id,

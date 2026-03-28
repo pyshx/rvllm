@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaDevice, CudaSlice, CudaStream, LaunchAsync, LaunchConfig};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream, CudaModule, CudaFunction, LaunchConfig};
 use half::f16;
 use tracing::{debug, trace};
 
@@ -16,9 +16,6 @@ use rvllm_core::prelude::{LLMError, Result};
 
 use crate::backend::AttentionBackend;
 use crate::buffer::GpuBuffer;
-
-/// Name of the PTX module loaded into cudarc.
-const MODULE_NAME: &str = "paged_attention";
 
 /// Name of the kernel function within the PTX module.
 const KERNEL_NAME: &str = "paged_attention_v2_kernel";
@@ -29,8 +26,10 @@ const KERNEL_NAME: &str = "paged_attention_v2_kernel";
 /// passes to the GPU. Each call uploads the f16 host data as f32, launches the
 /// kernel, and converts the f32 output back to f16.
 pub struct CudaPagedAttention {
-    device: Arc<CudaDevice>,
-    stream: CudaStream,
+    context: Arc<CudaContext>,
+    stream: Arc<CudaStream>,
+    _module: Arc<CudaModule>,
+    func: CudaFunction,
 }
 
 // SAFETY: CudaStream wraps a driver handle bound to a device context.
@@ -43,45 +42,45 @@ impl CudaPagedAttention {
     ///
     /// `ptx_bytes` must contain the compiled PTX for `paged_attention.cu`.
     /// The module is loaded once and reused for every `forward` call.
-    pub fn new(device: Arc<CudaDevice>, ptx_bytes: &[u8]) -> Result<Self> {
+    pub fn new(context: Arc<CudaContext>, ptx_bytes: &[u8]) -> Result<Self> {
         let ptx_str = std::str::from_utf8(ptx_bytes)
             .map_err(|e| LLMError::GpuError(format!("PTX is not valid UTF-8: {e}")))?;
 
-        device
-            .load_ptx(
-                cudarc::nvrtc::Ptx::from_src(ptx_str),
-                MODULE_NAME,
-                &[KERNEL_NAME, "paged_attention_v2_f16kv_kernel"],
-            )
+        let module = context
+            .load_module(cudarc::nvrtc::Ptx::from_src(ptx_str))
             .map_err(|e| LLMError::GpuError(format!("failed to load paged_attention PTX: {e}")))?;
 
-        let stream = device
-            .fork_default_stream()
+        let func = module
+            .load_function(KERNEL_NAME)
+            .map_err(|e| LLMError::GpuError(format!("failed to load kernel {KERNEL_NAME}: {e}")))?;
+
+        let stream = context
+            .new_stream()
             .map_err(|e| LLMError::GpuError(format!("failed to create CUDA stream: {e}")))?;
 
         debug!("CudaPagedAttention initialized");
-        Ok(Self { device, stream })
+        Ok(Self { context, stream, _module: module, func })
     }
 
-    /// Convenience constructor that creates a CudaDevice for the given ordinal.
+    /// Convenience constructor that creates a CudaContext for the given ordinal.
     pub fn with_device(device_id: usize, ptx_bytes: &[u8]) -> Result<Self> {
-        let device = CudaDevice::new(device_id)
+        let context = CudaContext::new(device_id)
             .map_err(|e| LLMError::GpuError(format!("CUDA device {device_id} init: {e}")))?;
-        Self::new(device, ptx_bytes)
+        Self::new(context, ptx_bytes)
     }
 
     /// Upload a host f16 slice to the GPU as f32.
     fn upload_f16_as_f32(&self, host: &[f16]) -> Result<CudaSlice<f32>> {
         let f32_data: Vec<f32> = host.iter().map(|v| v.to_f32()).collect();
-        self.device
-            .htod_sync_copy(&f32_data)
+        self.stream
+            .clone_htod(&f32_data)
             .map_err(|e| LLMError::GpuError(format!("htod f32 upload failed: {e}")))
     }
 
     /// Upload a host i32 slice to the GPU.
     fn upload_i32(&self, host: &[i32]) -> Result<CudaSlice<i32>> {
-        self.device
-            .htod_sync_copy(host)
+        self.stream
+            .clone_htod(host)
             .map_err(|e| LLMError::GpuError(format!("htod i32 upload failed: {e}")))
     }
 }
@@ -144,7 +143,7 @@ impl AttentionBackend for CudaPagedAttention {
         // -- allocate output on GPU -------------------------------------------
         let output_len = num_seqs * num_heads * head_dim;
         let d_output: CudaSlice<f32> = self
-            .device
+            .stream
             .alloc_zeros(output_len)
             .map_err(|e| LLMError::GpuError(format!("output alloc failed: {e}")))?;
 
@@ -162,52 +161,40 @@ impl AttentionBackend for CudaPagedAttention {
             shared_mem_bytes,
         };
 
-        let func = self
-            .device
-            .get_func(MODULE_NAME, KERNEL_NAME)
-            .ok_or_else(|| {
-                LLMError::GpuError(format!(
-                    "kernel function '{KERNEL_NAME}' not found in module '{MODULE_NAME}'"
-                ))
-            })?;
-
         // SAFETY: All device pointers are valid CudaSlice allocations from this
         // device. The grid/block dimensions match the kernel's expectations
         // (one thread per head_dim element, one block per seq*head). Scalar
         // arguments are passed by value. Shared memory is sized to hold
         // block_size + head_dim floats as required by the kernel.
         unsafe {
-            func.launch_on_stream(
-                &self.stream,
-                cfg,
-                (
-                    &d_output,
-                    &d_query,
-                    &d_key_cache,
-                    &d_value_cache,
-                    &d_block_tables,
-                    &d_context_lens,
-                    scale,
-                    num_heads as i32,
-                    head_dim as i32,
-                    block_size as i32,
-                    max_context_len as i32,
-                    max_blocks as i32,
-                ),
-            )
-            .map_err(|e| {
-                LLMError::GpuError(format!("paged_attention kernel launch failed: {e}"))
-            })?;
+            self.stream
+                .launch_builder(&self.func)
+                .arg(&d_output)
+                .arg(&d_query)
+                .arg(&d_key_cache)
+                .arg(&d_value_cache)
+                .arg(&d_block_tables)
+                .arg(&d_context_lens)
+                .arg(&scale)
+                .arg(&(num_heads as i32))
+                .arg(&(head_dim as i32))
+                .arg(&(block_size as i32))
+                .arg(&(max_context_len as i32))
+                .arg(&(max_blocks as i32))
+                .launch(cfg)
+                .map_err(|e| {
+                    LLMError::GpuError(format!("paged_attention kernel launch failed: {e}"))
+                })?;
         }
 
         // -- synchronize and download -----------------------------------------
-        self.device
-            .wait_for(&self.stream)
+        self.stream
+            .synchronize()
             .map_err(|e| LLMError::GpuError(format!("stream sync failed: {e}")))?;
 
         let host_output: Vec<f32> = self
-            .device
-            .dtoh_sync_copy(&d_output)
+            .stream
+            .clone_dtoh(&d_output)
             .map_err(|e| LLMError::GpuError(format!("dtoh output copy failed: {e}")))?;
 
         // Convert f32 output back to f16

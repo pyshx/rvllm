@@ -2,7 +2,7 @@
 
 use cudarc::cublas::sys::cublasOperation_t;
 use cudarc::cublas::{CudaBlas, Gemm as _, GemmConfig, Gemv as _, GemvConfig};
-use cudarc::driver::{CudaDevice, CudaSlice};
+use cudarc::driver::{CudaSlice, CudaStream};
 use std::sync::Arc;
 
 use crate::Result;
@@ -10,19 +10,19 @@ use crate::Result;
 /// Wrapper around cuBLAS for matrix operations.
 pub struct CublasHandle {
     blas: CudaBlas,
-    device: Arc<CudaDevice>,
+    stream: Arc<CudaStream>,
 }
 
 impl CublasHandle {
-    pub fn new(device: Arc<CudaDevice>) -> Result<Self> {
-        let blas = CudaBlas::new(device.clone())
+    pub fn new(stream: Arc<CudaStream>) -> Result<Self> {
+        let blas = CudaBlas::new(stream.clone())
             .map_err(|e| crate::LLMError::GpuError(format!("cuBLAS init failed: {e}")))?;
-        Ok(Self { blas, device })
+        Ok(Self { blas, stream })
     }
 
-    /// Returns a reference to the underlying device.
-    pub fn device(&self) -> &Arc<CudaDevice> {
-        &self.device
+    /// Returns a reference to the underlying stream.
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
     }
 
     /// SGEMM: C[m,n] = A[m,k] @ B[n,k]^T
@@ -225,12 +225,13 @@ impl CublasHandle {
 #[cfg(feature = "cuda")]
 mod tests {
     use super::*;
-    use cudarc::driver::CudaDevice;
+    use cudarc::driver::CudaContext;
 
     #[test]
     fn sgemm_a_times_bt() {
-        let dev = CudaDevice::new(0).unwrap();
-        let handle = CublasHandle::new(dev.clone()).unwrap();
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.new_stream().unwrap();
+        let handle = CublasHandle::new(stream.clone()).unwrap();
 
         // A[2,3] row-major (activations)
         let a_host: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
@@ -239,16 +240,16 @@ mod tests {
             1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
         ];
 
-        let a_gpu = dev.htod_sync_copy(&a_host).unwrap();
-        let b_gpu = dev.htod_sync_copy(&b_host).unwrap();
-        let mut c_gpu = dev.alloc_zeros::<f32>(2 * 4).unwrap();
+        let a_gpu = stream.clone_htod(&a_host).unwrap();
+        let b_gpu = stream.clone_htod(&b_host).unwrap();
+        let mut c_gpu = stream.alloc_zeros::<f32>(2 * 4).unwrap();
 
         // sgemm(m=2, n=4, k=3): C[2,4] = A[2,3] @ B[4,3]^T
         handle
             .sgemm(2, 4, 3, 1.0, &a_gpu, &b_gpu, 0.0, &mut c_gpu)
             .unwrap();
 
-        let c_host = dev.dtoh_sync_copy(&c_gpu).unwrap();
+        let c_host = stream.clone_dtoh(&c_gpu).unwrap();
 
         // CPU reference: C[i,j] = sum_k A[i,k] * B[j,k]
         let mut expected = vec![0.0f32; 8];

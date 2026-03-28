@@ -29,6 +29,11 @@ pub use rvllm_core::prelude::{LLMError, Result};
 #[cfg(feature = "cuda")]
 pub use cuda_allocator::CudaGpuAllocator;
 
+#[cfg(feature = "cuda")]
+pub use cudarc::driver::CudaContext;
+#[cfg(feature = "cuda")]
+pub use cudarc::driver::CudaStream;
+
 pub mod prelude {
     pub use crate::allocator::GpuAllocator;
     pub use crate::buffer::GpuBuffer;
@@ -37,6 +42,10 @@ pub mod prelude {
     pub use crate::cublas::CublasHandle;
     #[cfg(feature = "cuda")]
     pub use crate::cuda_allocator::CudaGpuAllocator;
+    #[cfg(feature = "cuda")]
+    pub use crate::CudaContext;
+    #[cfg(feature = "cuda")]
+    pub use crate::CudaStream;
     pub use crate::cuda_graph::{padded_batch_size, CudaGraph, CudaGraphPool, GRAPH_BATCH_SIZES};
     pub use crate::device::{list_devices, GpuDevice, MemoryInfo};
     #[cfg(feature = "cuda")]

@@ -5,15 +5,11 @@
 //! cudarc for device memory types.
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::{
-    CudaDevice, CudaSlice, DevicePtr, DevicePtrMut, DeviceSlice as _, LaunchAsync, LaunchConfig,
-};
+use cudarc::driver::{CudaSlice, CudaStream, DeviceSlice as _, LaunchConfig};
 #[cfg(feature = "cuda")]
 use rvllm_core::error::{LLMError, Result};
 #[cfg(feature = "cuda")]
 use rvllm_gpu::kernel_loader::KernelLoader;
-#[cfg(feature = "cuda")]
-use std::sync::Arc;
 
 /// CUDA-backed RMSNorm layer.
 ///
@@ -45,6 +41,7 @@ impl CudaRMSNorm {
         eps: f32,
         hidden_size: usize,
         loader: &KernelLoader,
+        stream: &CudaStream,
     ) -> Result<CudaSlice<f32>> {
         let num_elements = input.len();
         if num_elements == 0 {
@@ -75,9 +72,8 @@ impl CudaRMSNorm {
             shared_mem_bytes,
         };
 
-        // Allocate output buffer on the same device
-        let device = loader.device();
-        let output = device
+        // Allocate output buffer on the stream
+        let output = stream
             .alloc_zeros::<f32>(num_elements)
             .map_err(|e| LLMError::GpuError(format!("CudaRMSNorm: output alloc failed: {e}")))?;
 
@@ -89,7 +85,14 @@ impl CudaRMSNorm {
         // memory layout as documented in rms_norm.cu.
         let func = loader.get_func("rms_norm", "rms_norm_kernel")?;
         unsafe {
-            func.launch(cfg, (&output, input, weight, eps, hidden_size_i32))
+            stream
+                .launch_builder(&func)
+                .arg(&output)
+                .arg(input)
+                .arg(weight)
+                .arg(&eps)
+                .arg(&hidden_size_i32)
+                .launch(cfg)
                 .map_err(|e| {
                     LLMError::GpuError(format!("CudaRMSNorm: kernel launch failed: {e}"))
                 })?;
@@ -107,6 +110,7 @@ impl CudaRMSNorm {
         eps: f32,
         hidden_size: usize,
         loader: &KernelLoader,
+        stream: &CudaStream,
     ) -> Result<()> {
         let num_elements = input.len();
         if num_elements == 0 {
@@ -144,20 +148,19 @@ impl CudaRMSNorm {
         // block, so there is no data race for a single-token-per-block launch.
         let func = loader.get_func("rms_norm", "rms_norm_kernel")?;
         unsafe {
-            let mut in_ptr = *DevicePtrMut::device_ptr_mut(input);
-            let mut w_ptr = *DevicePtr::device_ptr(weight);
-            let mut eps_val = eps;
-            let mut hs = hidden_size_i32;
-            let params: &mut [*mut std::ffi::c_void] = &mut [
-                &mut in_ptr as *mut _ as *mut _, // output (aliases input)
-                &mut in_ptr as *mut _ as *mut _, // input
-                &mut w_ptr as *mut _ as *mut _,
-                &mut eps_val as *mut _ as *mut _,
-                &mut hs as *mut _ as *mut _,
-            ];
-            func.launch(cfg, params).map_err(|e| {
-                LLMError::GpuError(format!("CudaRMSNorm: inplace kernel launch failed: {e}"))
-            })?;
+            stream
+                .launch_builder(&func)
+                .arg(input)   // output (aliases input)
+                .arg(input)   // input
+                .arg(weight)
+                .arg(&eps)
+                .arg(&hidden_size_i32)
+                .launch(cfg)
+                .map_err(|e| {
+                    LLMError::GpuError(format!(
+                        "CudaRMSNorm: inplace kernel launch failed: {e}"
+                    ))
+                })?;
         }
 
         Ok(())

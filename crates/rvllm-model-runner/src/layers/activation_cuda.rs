@@ -13,15 +13,14 @@ mod inner {
     use std::sync::Arc;
 
     use cudarc::driver::{
-        CudaDevice, CudaFunction, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceSlice as _,
-        LaunchAsync, LaunchConfig,
+        CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DevicePtr, DevicePtrMut,
+        DeviceSlice as _, LaunchConfig,
     };
     use tracing::trace;
 
     use rvllm_core::prelude::{LLMError, Result};
 
     const BLOCK_SIZE: u32 = 256;
-    const MODULE_NAME: &str = "activation";
 
     fn launch_cfg(n: u32) -> LaunchConfig {
         let grid = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -32,11 +31,25 @@ mod inner {
         }
     }
 
+    /// Load the activation PTX module into the context, returning the module handle.
+    fn load_activation_module(
+        context: &Arc<CudaContext>,
+        ptx_bytes: &[u8],
+    ) -> Result<Arc<CudaModule>> {
+        let ptx_str = std::str::from_utf8(ptx_bytes)
+            .map_err(|e| LLMError::GpuError(format!("activation PTX is not valid UTF-8: {e}")))?;
+        let module = context
+            .load_module(cudarc::nvrtc::Ptx::from_src(ptx_str))
+            .map_err(|e| LLMError::GpuError(format!("failed to load activation PTX: {e}")))?;
+        trace!("activation module loaded");
+        Ok(module)
+    }
+
     /// CUDA SiLU (Swish) activation: x / (1 + exp(-x)).
     ///
     /// Holds a preloaded kernel handle to avoid repeated PTX lookups.
     pub struct CudaSiLU {
-        device: Arc<CudaDevice>,
+        context: Arc<CudaContext>,
         func: CudaFunction,
     }
 
@@ -44,34 +57,37 @@ mod inner {
         /// Load the activation PTX and extract `silu_kernel`.
         ///
         /// `ptx_bytes` should be the compiled PTX of `kernels/activation.cu`.
-        pub fn new(device: Arc<CudaDevice>, ptx_bytes: &[u8]) -> Result<Self> {
-            load_module_if_needed(&device, ptx_bytes)?;
-            let func = device.get_func(MODULE_NAME, "silu_kernel").ok_or_else(|| {
-                LLMError::GpuError("silu_kernel not found in activation module".into())
+        pub fn new(context: Arc<CudaContext>, ptx_bytes: &[u8]) -> Result<Self> {
+            let module = load_activation_module(&context, ptx_bytes)?;
+            let func = module.load_function("silu_kernel").map_err(|e| {
+                LLMError::GpuError(format!("silu_kernel not found in activation module: {e}"))
             })?;
             trace!("CudaSiLU: loaded silu_kernel");
-            Ok(Self { device, func })
+            Ok(Self { context, func })
         }
 
         /// Apply SiLU element-wise, returning a new device buffer.
         pub fn forward(
             &self,
             input: &CudaSlice<f32>,
-            stream: &CudaStream,
+            stream: &Arc<CudaStream>,
         ) -> Result<CudaSlice<f32>> {
             let n = input.len();
-            let output = self
-                .device
+            let mut output = stream
                 .alloc_zeros::<f32>(n)
                 .map_err(|e| LLMError::GpuError(format!("SiLU alloc failed: {e}")))?;
             let cfg = launch_cfg(n as u32);
+            let n_i32 = n as i32;
             // SAFETY: kernel reads `n` f32 from `input`, writes `n` f32 to `output`.
             // Both device slices have length >= n. The i32 `n` matches the kernel
             // signature `int n`.
             unsafe {
-                self.func
-                    .clone()
-                    .launch_on_stream(stream, cfg, (&output, input, n as i32))
+                stream
+                    .launch_builder(&self.func)
+                    .arg(&mut output)
+                    .arg(input)
+                    .arg(&n_i32)
+                    .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("silu_kernel launch failed: {e}")))?;
             }
             trace!(n, "silu_kernel launched");
@@ -82,23 +98,21 @@ mod inner {
         pub fn forward_inplace(
             &self,
             data: &mut CudaSlice<f32>,
-            stream: &CudaStream,
+            stream: &Arc<CudaStream>,
         ) -> Result<()> {
             let n = data.len();
             let cfg = launch_cfg(n as u32);
+            let n_i32 = n as i32;
             // SAFETY: In-place: output==input is safe for element-wise SiLU.
-            // Use raw pointer to avoid Rust borrow conflict on aliased output/input.
+            // Extract raw device pointer to pass aliased output/input to the kernel.
             unsafe {
-                let mut ptr = *DevicePtrMut::device_ptr_mut(data);
-                let mut n_i32 = n as i32;
-                let params: &mut [*mut std::ffi::c_void] = &mut [
-                    &mut ptr as *mut _ as *mut _, // output
-                    &mut ptr as *mut _ as *mut _, // input (aliased)
-                    &mut n_i32 as *mut _ as *mut _,
-                ];
-                self.func
-                    .clone()
-                    .launch_on_stream(stream, cfg, params)
+                let (ptr, _sync_guard) = DevicePtrMut::device_ptr_mut(data, stream);
+                stream
+                    .launch_builder(&self.func)
+                    .arg(&ptr) // output
+                    .arg(&ptr) // input (aliased)
+                    .arg(&n_i32)
+                    .launch(cfg)
                     .map_err(|e| {
                         LLMError::GpuError(format!("silu_kernel inplace launch failed: {e}"))
                     })?;
@@ -107,46 +121,49 @@ mod inner {
             Ok(())
         }
 
-        pub fn device(&self) -> &Arc<CudaDevice> {
-            &self.device
+        pub fn context(&self) -> &Arc<CudaContext> {
+            &self.context
         }
     }
 
     /// CUDA GELU activation (tanh approximation).
     pub struct CudaGELU {
-        device: Arc<CudaDevice>,
+        context: Arc<CudaContext>,
         func: CudaFunction,
     }
 
     impl CudaGELU {
         /// Load the activation PTX and extract `gelu_kernel`.
-        pub fn new(device: Arc<CudaDevice>, ptx_bytes: &[u8]) -> Result<Self> {
-            load_module_if_needed(&device, ptx_bytes)?;
-            let func = device.get_func(MODULE_NAME, "gelu_kernel").ok_or_else(|| {
-                LLMError::GpuError("gelu_kernel not found in activation module".into())
+        pub fn new(context: Arc<CudaContext>, ptx_bytes: &[u8]) -> Result<Self> {
+            let module = load_activation_module(&context, ptx_bytes)?;
+            let func = module.load_function("gelu_kernel").map_err(|e| {
+                LLMError::GpuError(format!("gelu_kernel not found in activation module: {e}"))
             })?;
             trace!("CudaGELU: loaded gelu_kernel");
-            Ok(Self { device, func })
+            Ok(Self { context, func })
         }
 
         /// Apply GELU element-wise, returning a new device buffer.
         pub fn forward(
             &self,
             input: &CudaSlice<f32>,
-            stream: &CudaStream,
+            stream: &Arc<CudaStream>,
         ) -> Result<CudaSlice<f32>> {
             let n = input.len();
-            let output = self
-                .device
+            let mut output = stream
                 .alloc_zeros::<f32>(n)
                 .map_err(|e| LLMError::GpuError(format!("GELU alloc failed: {e}")))?;
             let cfg = launch_cfg(n as u32);
+            let n_i32 = n as i32;
             // SAFETY: kernel reads `n` f32 from `input`, writes `n` f32 to `output`.
             // Both slices are device-allocated with length >= n.
             unsafe {
-                self.func
-                    .clone()
-                    .launch_on_stream(stream, cfg, (&output, input, n as i32))
+                stream
+                    .launch_builder(&self.func)
+                    .arg(&mut output)
+                    .arg(input)
+                    .arg(&n_i32)
+                    .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("gelu_kernel launch failed: {e}")))?;
             }
             trace!(n, "gelu_kernel launched");
@@ -157,22 +174,20 @@ mod inner {
         pub fn forward_inplace(
             &self,
             data: &mut CudaSlice<f32>,
-            stream: &CudaStream,
+            stream: &Arc<CudaStream>,
         ) -> Result<()> {
             let n = data.len();
             let cfg = launch_cfg(n as u32);
+            let n_i32 = n as i32;
             // SAFETY: pure element-wise -- same aliasing rationale as CudaSiLU::forward_inplace.
             unsafe {
-                let mut ptr = *DevicePtrMut::device_ptr_mut(data);
-                let mut n_i32 = n as i32;
-                let params: &mut [*mut std::ffi::c_void] = &mut [
-                    &mut ptr as *mut _ as *mut _,
-                    &mut ptr as *mut _ as *mut _,
-                    &mut n_i32 as *mut _ as *mut _,
-                ];
-                self.func
-                    .clone()
-                    .launch_on_stream(stream, cfg, params)
+                let (ptr, _sync_guard) = DevicePtrMut::device_ptr_mut(data, stream);
+                stream
+                    .launch_builder(&self.func)
+                    .arg(&ptr)
+                    .arg(&ptr)
+                    .arg(&n_i32)
+                    .launch(cfg)
                     .map_err(|e| {
                         LLMError::GpuError(format!("gelu_kernel inplace launch failed: {e}"))
                     })?;
@@ -181,31 +196,31 @@ mod inner {
             Ok(())
         }
 
-        pub fn device(&self) -> &Arc<CudaDevice> {
-            &self.device
+        pub fn context(&self) -> &Arc<CudaContext> {
+            &self.context
         }
     }
 
     /// Fused SiLU(gate) * up on GPU -- single kernel, saves a full memory traversal
     /// and a temporary buffer compared to separate SiLU + element-wise multiply.
     pub struct CudaFusedSiLUMul {
-        device: Arc<CudaDevice>,
+        context: Arc<CudaContext>,
         func: CudaFunction,
     }
 
     impl CudaFusedSiLUMul {
         /// Load the activation PTX and extract `fused_silu_mul_kernel`.
-        pub fn new(device: Arc<CudaDevice>, ptx_bytes: &[u8]) -> Result<Self> {
-            load_module_if_needed(&device, ptx_bytes)?;
-            let func = device
-                .get_func(MODULE_NAME, "fused_silu_mul_kernel")
-                .ok_or_else(|| {
-                    LLMError::GpuError(
-                        "fused_silu_mul_kernel not found in activation module".into(),
-                    )
+        pub fn new(context: Arc<CudaContext>, ptx_bytes: &[u8]) -> Result<Self> {
+            let module = load_activation_module(&context, ptx_bytes)?;
+            let func = module
+                .load_function("fused_silu_mul_kernel")
+                .map_err(|e| {
+                    LLMError::GpuError(format!(
+                        "fused_silu_mul_kernel not found in activation module: {e}"
+                    ))
                 })?;
             trace!("CudaFusedSiLUMul: loaded fused_silu_mul_kernel");
-            Ok(Self { device, func })
+            Ok(Self { context, func })
         }
 
         /// Compute silu(gate) * up element-wise, returning a new device buffer.
@@ -215,7 +230,7 @@ mod inner {
             &self,
             gate: &CudaSlice<f32>,
             up: &CudaSlice<f32>,
-            stream: &CudaStream,
+            stream: &Arc<CudaStream>,
         ) -> Result<CudaSlice<f32>> {
             let n = gate.len();
             if up.len() != n {
@@ -225,17 +240,21 @@ mod inner {
                     up.len()
                 )));
             }
-            let output = self
-                .device
+            let mut output = stream
                 .alloc_zeros::<f32>(n)
                 .map_err(|e| LLMError::GpuError(format!("fused_silu_mul alloc failed: {e}")))?;
             let cfg = launch_cfg(n as u32);
+            let n_i32 = n as i32;
             // SAFETY: kernel reads `n` elements each from `gate` and `up`, writes `n`
             // elements to `output`. All three slices are device-allocated with length >= n.
             unsafe {
-                self.func
-                    .clone()
-                    .launch_on_stream(stream, cfg, (&output, gate, up, n as i32))
+                stream
+                    .launch_builder(&self.func)
+                    .arg(&mut output)
+                    .arg(gate)
+                    .arg(up)
+                    .arg(&n_i32)
+                    .launch(cfg)
                     .map_err(|e| {
                         LLMError::GpuError(format!("fused_silu_mul_kernel launch failed: {e}"))
                     })?;
@@ -251,7 +270,7 @@ mod inner {
             &self,
             gate: &mut CudaSlice<f32>,
             up: &CudaSlice<f32>,
-            stream: &CudaStream,
+            stream: &Arc<CudaStream>,
         ) -> Result<()> {
             let n = gate.len();
             if up.len() != n {
@@ -262,20 +281,19 @@ mod inner {
                 )));
             }
             let cfg = launch_cfg(n as u32);
+            let n_i32 = n as i32;
             // SAFETY: output aliases gate for in-place element-wise op.
+            // Extract raw pointers to pass aliased gate as both output and input.
             unsafe {
-                let mut gate_ptr = *DevicePtrMut::device_ptr_mut(gate);
-                let mut up_ptr = *DevicePtr::device_ptr(up);
-                let mut n_i32 = n as i32;
-                let params: &mut [*mut std::ffi::c_void] = &mut [
-                    &mut gate_ptr as *mut _ as *mut _, // output (aliases gate)
-                    &mut gate_ptr as *mut _ as *mut _, // gate input
-                    &mut up_ptr as *mut _ as *mut _,   // up input
-                    &mut n_i32 as *mut _ as *mut _,
-                ];
-                self.func
-                    .clone()
-                    .launch_on_stream(stream, cfg, params)
+                let (gate_ptr, _gate_guard) = DevicePtrMut::device_ptr_mut(gate, stream);
+                let (up_ptr, _up_guard) = DevicePtr::device_ptr(up, stream);
+                stream
+                    .launch_builder(&self.func)
+                    .arg(&gate_ptr) // output (aliases gate)
+                    .arg(&gate_ptr) // gate input
+                    .arg(&up_ptr)   // up input
+                    .arg(&n_i32)
+                    .launch(cfg)
                     .map_err(|e| {
                         LLMError::GpuError(format!(
                             "fused_silu_mul_kernel inplace launch failed: {e}"
@@ -286,30 +304,9 @@ mod inner {
             Ok(())
         }
 
-        pub fn device(&self) -> &Arc<CudaDevice> {
-            &self.device
+        pub fn context(&self) -> &Arc<CudaContext> {
+            &self.context
         }
-    }
-
-    /// Load the activation PTX module into the device if not already present.
-    ///
-    /// All three activation structs share the same module, so only the first
-    /// call actually loads; subsequent calls are no-ops.
-    fn load_module_if_needed(device: &Arc<CudaDevice>, ptx_bytes: &[u8]) -> Result<()> {
-        if device.has_func(MODULE_NAME, "silu_kernel") {
-            return Ok(());
-        }
-        let ptx_str = std::str::from_utf8(ptx_bytes)
-            .map_err(|e| LLMError::GpuError(format!("activation PTX is not valid UTF-8: {e}")))?;
-        device
-            .load_ptx(
-                cudarc::nvrtc::Ptx::from_src(ptx_str),
-                MODULE_NAME,
-                &["silu_kernel", "gelu_kernel", "fused_silu_mul_kernel"],
-            )
-            .map_err(|e| LLMError::GpuError(format!("failed to load activation PTX: {e}")))?;
-        trace!("activation module loaded with 3 kernels");
-        Ok(())
     }
 }
 

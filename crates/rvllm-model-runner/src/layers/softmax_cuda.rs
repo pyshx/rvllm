@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use cudarc::driver::{
-    CudaDevice, CudaFunction, CudaSlice, CudaStream, DeviceSlice as _, LaunchAsync, LaunchConfig,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, DeviceSlice as _, LaunchConfig,
 };
 use tracing::trace;
 
@@ -35,7 +35,7 @@ const MAX_BLOCK_SIZE: u32 = 1024;
 /// re-loading overhead. Constructed once during model init, then reused
 /// for every forward pass.
 pub struct CudaSoftmax {
-    device: Arc<CudaDevice>,
+    context: Arc<CudaContext>,
     func: CudaFunction,
 }
 
@@ -45,26 +45,22 @@ impl CudaSoftmax {
     /// `ptx_bytes` should be the compiled PTX of `kernels/softmax.cu`.
     /// The caller can embed this at compile time or load from disk via
     /// `RVLLM_KERNEL_DIR`.
-    pub fn new(device: Arc<CudaDevice>, ptx_bytes: &[u8]) -> Result<Self> {
+    pub fn new(context: Arc<CudaContext>, ptx_bytes: &[u8]) -> Result<Self> {
         let ptx = std::str::from_utf8(ptx_bytes)
             .map_err(|e| LLMError::GpuError(format!("softmax PTX is not valid UTF-8: {e}")))?;
 
-        device
-            .load_ptx(
-                cudarc::nvrtc::Ptx::from_src(ptx),
-                "softmax",
-                &["softmax_kernel"],
-            )
+        let module = context
+            .load_module(cudarc::nvrtc::Ptx::from_src(ptx))
             .map_err(|e| LLMError::GpuError(format!("failed to load softmax PTX: {e}")))?;
 
-        let func = device
-            .get_func("softmax", "softmax_kernel")
-            .ok_or_else(|| {
-                LLMError::GpuError("softmax_kernel function not found in PTX module".into())
+        let func = module
+            .load_function("softmax_kernel")
+            .map_err(|e| {
+                LLMError::GpuError(format!("softmax_kernel function not found in PTX module: {e}"))
             })?;
 
         trace!("CudaSoftmax: loaded softmax_kernel");
-        Ok(Self { device, func })
+        Ok(Self { context, func })
     }
 
     /// Run softmax over `input` rows, returning a new output buffer.
@@ -94,8 +90,7 @@ impl CudaSoftmax {
             )));
         }
 
-        let output: CudaSlice<f32> = self
-            .device
+        let output: CudaSlice<f32> = stream
             .alloc_zeros(total)
             .map_err(|e| LLMError::GpuError(format!("softmax output alloc failed: {e}")))?;
 
@@ -133,8 +128,8 @@ impl CudaSoftmax {
         let tmp = self.forward(data, num_rows, vocab_size, stream)?;
 
         // Device-to-device copy: tmp -> data.
-        self.device
-            .dtod_copy(&tmp, data)
+        stream
+            .memcpy_dtod(&tmp, data)
             .map_err(|e| LLMError::GpuError(format!("softmax d2d copy failed: {e}")))?;
 
         trace!(num_rows, vocab_size, "softmax inplace completed");
@@ -171,9 +166,12 @@ impl CudaSoftmax {
         //   stride loop expectations.
         // - `output` and `input` do not alias (separate CudaSlice allocations).
         unsafe {
-            self.func
-                .clone()
-                .launch_on_stream(stream, cfg, (output, input, vocab_size_i32))
+            stream
+                .launch_builder(&self.func)
+                .arg(output)
+                .arg(input)
+                .arg(&vocab_size_i32)
+                .launch(cfg)
                 .map_err(|e| LLMError::GpuError(format!("softmax kernel launch failed: {e}")))?;
         }
 
@@ -181,9 +179,9 @@ impl CudaSoftmax {
         Ok(())
     }
 
-    /// Returns a reference to the underlying CUDA device.
-    pub fn device(&self) -> &Arc<CudaDevice> {
-        &self.device
+    /// Returns a reference to the underlying CUDA context.
+    pub fn context(&self) -> &Arc<CudaContext> {
+        &self.context
     }
 }
 
@@ -195,7 +193,7 @@ mod tests {
     // Run with: cargo test -p rvllm-model-runner --features cuda -- softmax_cuda
     //
     // Test outline (requires GPU):
-    // 1. Create CudaDevice
+    // 1. Create CudaContext
     // 2. Load softmax.cu PTX (pre-compiled with nvcc --ptx)
     // 3. Upload known logits [e.g., [1,2,3], [0,0,0]] to GPU
     // 4. Call CudaSoftmax::forward

@@ -11,8 +11,7 @@ mod inner {
     use std::sync::Arc;
 
     use cudarc::driver::{
-        CudaDevice, CudaFunction, CudaSlice, CudaStream, DeviceRepr, DeviceSlice as _, LaunchAsync,
-        LaunchConfig,
+        CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig,
     };
     use tracing::debug;
 
@@ -23,10 +22,12 @@ mod inner {
     pub struct CudaRotaryEmbedding {
         cos_cache: CudaSlice<f32>, // [max_position, half_dim]
         sin_cache: CudaSlice<f32>, // [max_position, half_dim]
-        device: Arc<CudaDevice>,
+        context: Arc<CudaContext>,
+        stream: Arc<CudaStream>,
         head_dim: usize,
         half_dim: usize,
         max_position: usize,
+        _module: Arc<CudaModule>,
         kernel_fn: CudaFunction,
     }
 
@@ -36,13 +37,15 @@ mod inner {
         /// * `head_dim`     -- dimension per attention head (must be even)
         /// * `max_position` -- maximum sequence position to precompute
         /// * `base`         -- RoPE frequency base (typically 10000.0)
-        /// * `device`       -- CUDA device for allocation
+        /// * `context`      -- CUDA context for module loading
+        /// * `stream`       -- CUDA stream for memory ops
         /// * `ptx`          -- compiled PTX bytes for `rotary_embedding.cu`
         pub fn new(
             head_dim: usize,
             max_position: usize,
             base: f32,
-            device: Arc<CudaDevice>,
+            context: Arc<CudaContext>,
+            stream: &Arc<CudaStream>,
             ptx: &[u8],
         ) -> Result<Self> {
             assert!(head_dim % 2 == 0, "head_dim must be even for RoPE");
@@ -67,11 +70,11 @@ mod inner {
             }
 
             // --- upload to GPU ---
-            let cos_cache = device
-                .htod_sync_copy(&cos_host)
+            let cos_cache = stream
+                .clone_htod(&cos_host)
                 .map_err(|e| LLMError::GpuError(format!("RoPE cos cache upload: {e}")))?;
-            let sin_cache = device
-                .htod_sync_copy(&sin_host)
+            let sin_cache = stream
+                .clone_htod(&sin_host)
                 .map_err(|e| LLMError::GpuError(format!("RoPE sin cache upload: {e}")))?;
 
             debug!(
@@ -82,31 +85,29 @@ mod inner {
             );
 
             // --- load PTX module ---
-            let module_name = "rotary_embedding";
-            device
-                .load_ptx(
-                    cudarc::nvrtc::Ptx::from_src(
-                        std::str::from_utf8(ptx)
-                            .map_err(|e| LLMError::GpuError(format!("invalid PTX UTF-8: {e}")))?,
-                    ),
-                    module_name,
-                    &["rotary_embedding_kernel"],
-                )
+            let ptx_src = std::str::from_utf8(ptx)
+                .map_err(|e| LLMError::GpuError(format!("invalid PTX UTF-8: {e}")))?;
+            let module: Arc<CudaModule> = context
+                .load_module(cudarc::nvrtc::Ptx::from_src(ptx_src))
                 .map_err(|e| LLMError::GpuError(format!("RoPE PTX load: {e}")))?;
 
-            let kernel_fn = device
-                .get_func(module_name, "rotary_embedding_kernel")
-                .ok_or_else(|| {
-                    LLMError::GpuError("rotary_embedding_kernel not found after PTX load".into())
+            let kernel_fn = module
+                .load_function("rotary_embedding_kernel")
+                .map_err(|e| {
+                    LLMError::GpuError(format!(
+                        "rotary_embedding_kernel not found after PTX load: {e}"
+                    ))
                 })?;
 
             Ok(Self {
                 cos_cache,
                 sin_cache,
-                device,
+                context,
+                stream: Arc::clone(stream),
                 head_dim,
                 half_dim,
                 max_position,
+                _module: module,
                 kernel_fn,
             })
         }
@@ -151,23 +152,18 @@ mod inner {
             // the caller. The launch config ensures thread counts stay within
             // the allocated buffer bounds.
             unsafe {
-                self.kernel_fn
-                    .clone()
-                    .launch_on_stream(
-                        stream,
-                        cfg,
-                        (
-                            query,                // float* query
-                            key,                  // float* key
-                            &self.cos_cache,      // const float* cos_cache
-                            &self.sin_cache,      // const float* sin_cache
-                            positions,            // const int* positions
-                            num_tokens as i32,    // int num_tokens
-                            num_heads as i32,     // int num_heads
-                            num_kv_heads as i32,  // int num_kv_heads
-                            self.head_dim as i32, // int head_dim
-                        ),
-                    )
+                stream
+                    .launch_builder(&self.kernel_fn)
+                    .arg(query)                // float* query
+                    .arg(key)                  // float* key
+                    .arg(&self.cos_cache)      // const float* cos_cache
+                    .arg(&self.sin_cache)      // const float* sin_cache
+                    .arg(positions)            // const int* positions
+                    .arg(&(num_tokens as i32))    // int num_tokens
+                    .arg(&(num_heads as i32))     // int num_heads
+                    .arg(&(num_kv_heads as i32))  // int num_kv_heads
+                    .arg(&(self.head_dim as i32)) // int head_dim
+                    .launch(cfg)
                     .map_err(|e| LLMError::GpuError(format!("RoPE kernel launch: {e}")))?;
             }
 
@@ -187,9 +183,8 @@ mod inner {
             num_kv_heads: usize,
             stream: &CudaStream,
         ) -> Result<()> {
-            let positions_dev = self
-                .device
-                .htod_sync_copy(positions_host)
+            let positions_dev = stream
+                .clone_htod(positions_host)
                 .map_err(|e| LLMError::GpuError(format!("RoPE positions upload: {e}")))?;
 
             self.forward(
