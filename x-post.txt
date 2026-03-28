@@ -1,13 +1,13 @@
-**rvLLM -- vLLM rewritten in Rust. One dev, 22 hours, $1,780.**
+rvLLM -- vLLM rewritten in Rust. One dev, 22 hours, $1,780.
 10,291 tok/s. Beats Python vLLM up to N=256. 20x faster startup. 31x smaller. work in progress -- help me push this further.
 
-## what is it
+what is it
 rvLLM is a from-scratch Rust implementation of vLLM for serving LLMs on GPUs. drop-in OpenAI API replacement. same endpoints, same format, just point your client at the Rust server.
 
-## why
+why
 python vLLM transfers the entire logit matrix (74 MB for Qwen2.5-1.5B at batch 128) from GPU to host every decode step for sampling. rvLLM runs argmax directly on GPU and transfers 512 bytes. 150,000x reduction in PCIe traffic per step. no GIL, no GC, no PyTorch tensor metadata overhead. deterministic memory with Rust ownership. single 16 MB binary vs ~500 MB pip install.
 
-## architecture
+architecture
 - 23 Rust crates, strict dependency tree from GPU primitives to HTTP API
 - 15 hand-written CUDA kernels compiled to PTX (sm_70 through sm_120)
 - cuBLAS hgemm (FP16 tensor cores) for all linear projections
@@ -24,8 +24,8 @@ python vLLM transfers the entire logit matrix (74 MB for Qwen2.5-1.5B at batch 1
 - mock-GPU backend for development without NVIDIA hardware
 - 793 tests across 23 crates
 
-## head-to-head (same A100 80GB SXM4, Qwen2.5-1.5B, greedy, 32 tok/req)
-```
+head-to-head (same A100 80GB SXM4, Qwen2.5-1.5B, greedy, 32 tok/req)
+
 N=1:    rvLLM 117   | vLLM 69     -- rvLLM 1.7x faster
 N=4:    rvLLM 882   | vLLM 256
 N=8:    rvLLM 1,213 | vLLM 517
@@ -36,27 +36,30 @@ N=64:   rvLLM 4,796 | vLLM 3,828  -- rvLLM 1.25x
 N=96:   rvLLM 5,965 | vLLM 5,197  -- rvLLM 1.15x
 N=128:  rvLLM 7,380 | vLLM 6,400  -- rvLLM 1.15x
 N=256:  rvLLM 9,905 | vLLM 9,437  -- rvLLM 1.05x
-N=512:  rvLLM 10,291 | vLLM 10,771 -- 0.96x (near parity)
+N=512:  rvLLM 10,291 | vLLM 10,771 -- near parity
 N=768:  rvLLM 10,235 (peak)
 N=1024: rvLLM 10,051 | vLLM 12,740
-```
 
-## system comparison
+system comparison
 - startup: 6s vs 121s (20x)
 - binary: 16 MB vs ~500 MB (31x)
 - CPU RSS: 348 MB vs 1,033 MB (3x)
 - zero errors across 14,620 verified requests
 - runs on 40GB cards where vLLM needs 73GB
 
-## GPU support
+GPU support
 V100, T4, A100, RTX 3090/4090, H100, H200, B100, B200, RTX PRO 6000 Blackwell (sm_120). verified on A100 + B200 + RTX PRO 6000. CUDA 12.x and 13.x.
 
-## cost
+optimization phases
+phase 1 (FP32): 3,191 tok/s -- baseline
+phase 2 (FP16 hgemm + f16 KV cache): 8,339 tok/s -- 2.6x
+phase 3 (fused GEMMs, CUDA graph fix, vectorized kernels, pre-alloc buffers): 10,291 tok/s -- 3.2x total
+
+cost
 $1,500 vast.ai GPU rentals + $280 Claude Code extra usage. built with Claude Opus doing architecture, CUDA kernels, debugging, and 20-agent swarms for major refactors. one developer, 22 hours.
 
-## links
-- repo: https://github.com/m0at/rvllm
-- paper: https://m0at.github.io/rvllm/paper/rvllm.pdf
-- site: https://m0at.github.io/rvllm/
+repo: https://github.com/m0at/rvllm
+paper: https://m0at.github.io/rvllm/paper/rvllm.pdf
+site: https://m0at.github.io/rvllm/
 
 Apache-2.0. open source. PRs welcome.
