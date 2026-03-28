@@ -2626,6 +2626,7 @@ dependencies = [
 name = "rvllm-block-manager"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "parking_lot",
  "rvllm-core",
  "rvllm-memory",

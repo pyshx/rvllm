@@ -477,7 +477,6 @@ mod tests {
     use super::*;
     use rvllm_block_manager::MemoryPool;
     use rvllm_core::prelude::{BlockId, SequenceId};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     // -----------------------------------------------------------------------
@@ -486,35 +485,31 @@ mod tests {
 
     struct TestPool {
         total: usize,
-        next_id: AtomicUsize,
-        free_count: AtomicUsize,
+        inner: parking_lot::Mutex<std::collections::VecDeque<u32>>,
     }
 
     impl TestPool {
         fn new(total: usize) -> Self {
+            let mut free = std::collections::VecDeque::with_capacity(total);
+            for i in 0..total {
+                free.push_back(i as u32);
+            }
             Self {
                 total,
-                next_id: AtomicUsize::new(0),
-                free_count: AtomicUsize::new(total),
+                inner: parking_lot::Mutex::new(free),
             }
         }
     }
 
     impl MemoryPool for TestPool {
         fn allocate(&self) -> Option<BlockId> {
-            let free = self.free_count.load(Ordering::SeqCst);
-            if free == 0 {
-                return None;
-            }
-            self.free_count.fetch_sub(1, Ordering::SeqCst);
-            let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-            Some(BlockId(id as u32))
+            self.inner.lock().pop_front().map(BlockId)
         }
-        fn free(&self, _block_id: BlockId) {
-            self.free_count.fetch_add(1, Ordering::SeqCst);
+        fn free(&self, block_id: BlockId) {
+            self.inner.lock().push_back(block_id.0);
         }
         fn free_blocks(&self) -> usize {
-            self.free_count.load(Ordering::SeqCst)
+            self.inner.lock().len()
         }
         fn total_blocks(&self) -> usize {
             self.total

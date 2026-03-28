@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -8,35 +8,96 @@ use crate::block_table::BlockTable;
 use crate::prefix_cache::PrefixCache;
 use crate::{Device, MemoryPool, PhysicalBlock, Sequence};
 
-/// Tracks reference counts for physical blocks and pending CoW copies.
+/// Flat-array reference counter indexed by `BlockId`.
+///
+/// All block IDs must be in `[0, capacity)`. The entire array fits in L2
+/// cache for typical block counts (~32 KB at 4K blocks).
 struct RefCounter {
-    /// block_id -> reference count
-    counts: HashMap<BlockId, usize>,
+    counts: Vec<usize>,
 }
 
 impl RefCounter {
-    fn new() -> Self {
+    fn new(capacity: usize) -> Self {
         Self {
-            counts: HashMap::new(),
+            counts: vec![0; capacity],
         }
     }
 
+    #[inline]
     fn increment(&mut self, block_id: BlockId) {
-        *self.counts.entry(block_id).or_insert(0) += 1;
+        self.counts[block_id.0 as usize] += 1;
     }
 
+    #[inline]
     fn decrement(&mut self, block_id: BlockId) -> usize {
-        let count = self.counts.entry(block_id).or_insert(1);
-        *count = count.saturating_sub(1);
-        *count
+        let c = &mut self.counts[block_id.0 as usize];
+        *c = c.saturating_sub(1);
+        *c
     }
 
+    #[inline]
     fn get(&self, block_id: BlockId) -> usize {
-        self.counts.get(&block_id).copied().unwrap_or(0)
+        self.counts[block_id.0 as usize]
     }
 
+    #[inline]
     fn remove(&mut self, block_id: BlockId) {
-        self.counts.remove(&block_id);
+        self.counts[block_id.0 as usize] = 0;
+    }
+}
+
+/// Dense slot allocator mapping `SequenceId` to recycled internal indices.
+///
+/// Per-sequence data is stored in flat `Vec`s indexed by slot. Freed slots
+/// are recycled so storage stays bounded by max concurrent sequences.
+struct SeqSlots {
+    id_to_slot: HashMap<SequenceId, u32>,
+    free_list: VecDeque<u32>,
+    next_slot: u32,
+}
+
+impl SeqSlots {
+    fn new() -> Self {
+        Self {
+            id_to_slot: HashMap::new(),
+            free_list: VecDeque::new(),
+            next_slot: 0,
+        }
+    }
+
+    fn get_or_create(&mut self, seq_id: SequenceId) -> u32 {
+        if let Some(&slot) = self.id_to_slot.get(&seq_id) {
+            return slot;
+        }
+        let slot = self.free_list.pop_front().unwrap_or_else(|| {
+            let s = self.next_slot;
+            self.next_slot += 1;
+            s
+        });
+        self.id_to_slot.insert(seq_id, slot);
+        slot
+    }
+
+    #[inline]
+    fn get(&self, seq_id: SequenceId) -> Option<u32> {
+        self.id_to_slot.get(&seq_id).copied()
+    }
+
+    fn remove(&mut self, seq_id: SequenceId) -> Option<u32> {
+        if let Some(slot) = self.id_to_slot.remove(&seq_id) {
+            self.free_list.push_back(slot);
+            Some(slot)
+        } else {
+            None
+        }
+    }
+}
+
+#[inline]
+fn ensure_slot<T>(vec: &mut Vec<Option<T>>, slot: u32) {
+    let idx = slot as usize;
+    if idx >= vec.len() {
+        vec.resize_with(idx + 1, || None);
     }
 }
 
@@ -45,13 +106,15 @@ pub struct BlockManager {
     gpu_pool: Arc<dyn MemoryPool>,
     cpu_pool: Arc<dyn MemoryPool>,
     block_size: usize,
-    /// Per-sequence block tables (GPU side).
-    gpu_tables: HashMap<SequenceId, BlockTable>,
-    /// Per-sequence block tables (CPU side, for swapped sequences).
-    cpu_tables: HashMap<SequenceId, BlockTable>,
-    /// Reference counting for GPU blocks.
+    /// Dense slot allocator for per-sequence data.
+    seq_slots: SeqSlots,
+    /// Per-slot GPU block tables (indexed by slot).
+    gpu_tables: Vec<Option<BlockTable>>,
+    /// Per-slot CPU block tables (indexed by slot).
+    cpu_tables: Vec<Option<BlockTable>>,
+    /// Flat-array ref counting for GPU blocks (indexed by BlockId).
     gpu_ref_counts: RefCounter,
-    /// Reference counting for CPU blocks.
+    /// Flat-array ref counting for CPU blocks (indexed by BlockId).
     cpu_ref_counts: RefCounter,
     /// Pending copy-on-write pairs: (src, dst).
     cow_pending: Vec<(BlockId, BlockId)>,
@@ -59,9 +122,8 @@ pub struct BlockManager {
     watermark: f32,
     /// Optional prefix cache for KV block reuse across requests.
     prefix_cache: Option<PrefixCache>,
-    /// Tracks which blocks per sequence came from the prefix cache,
-    /// so we can release refs on free.
-    prefix_blocks: HashMap<SequenceId, Vec<BlockId>>,
+    /// Per-slot prefix block IDs (indexed by slot).
+    prefix_blocks: Vec<Option<Vec<BlockId>>>,
 }
 
 impl BlockManager {
@@ -70,18 +132,21 @@ impl BlockManager {
         cpu_pool: Arc<dyn MemoryPool>,
         block_size: usize,
     ) -> Self {
+        let gpu_cap = gpu_pool.total_blocks();
+        let cpu_cap = cpu_pool.total_blocks();
         Self {
             gpu_pool,
             cpu_pool,
             block_size,
-            gpu_tables: HashMap::new(),
-            cpu_tables: HashMap::new(),
-            gpu_ref_counts: RefCounter::new(),
-            cpu_ref_counts: RefCounter::new(),
+            seq_slots: SeqSlots::new(),
+            gpu_tables: Vec::new(),
+            cpu_tables: Vec::new(),
+            gpu_ref_counts: RefCounter::new(gpu_cap),
+            cpu_ref_counts: RefCounter::new(cpu_cap),
             cow_pending: Vec::new(),
             watermark: 0.04,
             prefix_cache: None,
-            prefix_blocks: HashMap::new(),
+            prefix_blocks: Vec::new(),
         }
     }
 
@@ -105,12 +170,10 @@ impl BlockManager {
         self.watermark = watermark;
     }
 
-    /// Number of blocks needed to hold `num_tokens` tokens.
     fn blocks_needed(&self, num_tokens: usize) -> usize {
         (num_tokens + self.block_size - 1) / self.block_size
     }
 
-    /// Number of free GPU blocks available after watermark reserve.
     fn usable_gpu_blocks(&self) -> usize {
         let total = self.gpu_pool.total_blocks();
         let reserved = ((total as f32) * self.watermark).ceil() as usize;
@@ -118,19 +181,17 @@ impl BlockManager {
     }
 
     /// Check if enough free GPU blocks exist for the sequence.
-    ///
-    /// When prefix caching is enabled, accounts for blocks that will be
-    /// reused from the cache (they don't need fresh allocation).
     pub fn can_allocate(&self, seq: &Sequence) -> bool {
         let needed = self.blocks_needed(seq.get_len());
         let existing = self
-            .gpu_tables
-            .get(&seq.seq_id)
+            .seq_slots
+            .get(seq.seq_id)
+            .and_then(|s| self.gpu_tables.get(s as usize))
+            .and_then(|o| o.as_ref())
             .map(|t| t.len())
             .unwrap_or(0);
         let mut additional = needed.saturating_sub(existing);
 
-        // Subtract prefix cache hits (blocks we'll reuse, not allocate).
         if existing == 0 {
             if let Some(ref pc) = self.prefix_cache {
                 additional = additional.saturating_sub(pc.count_hits(&seq.prompt_token_ids));
@@ -141,24 +202,22 @@ impl BlockManager {
     }
 
     /// Allocate GPU blocks for new tokens in a sequence.
-    ///
-    /// When prefix caching is enabled, checks the prefix cache first and
-    /// reuses any matching blocks for the prompt prefix. Newly allocated
-    /// blocks are fresh from the pool; cached blocks get their ref counts
-    /// bumped via [`mark_shared`].
     pub fn allocate(&mut self, seq: &Sequence) -> Result<()> {
         let needed = self.blocks_needed(seq.get_len());
-        let table = self
-            .gpu_tables
-            .entry(seq.seq_id)
-            .or_insert_with(BlockTable::new);
+        let slot = self.seq_slots.get_or_create(seq.seq_id);
+
+        ensure_slot(&mut self.gpu_tables, slot);
+        let table_opt = &mut self.gpu_tables[slot as usize];
+        if table_opt.is_none() {
+            *table_opt = Some(BlockTable::new());
+        }
+        let table = table_opt.as_mut().unwrap();
         let existing = table.len();
 
         if existing >= needed {
             return Ok(());
         }
 
-        // Check prefix cache for reusable blocks (only on first allocation).
         let mut cached_hits: Vec<(usize, BlockId)> = Vec::new();
         if existing == 0 {
             if let Some(ref mut pc) = self.prefix_cache {
@@ -176,20 +235,17 @@ impl BlockManager {
         let mut prefix_block_ids = Vec::new();
 
         for block_logical_idx in existing..needed {
-            // Try to use a cached prefix block for this index.
             let cached = cached_hits
                 .iter()
                 .find(|(idx, _)| *idx == block_logical_idx)
                 .map(|(_, bid)| *bid);
 
             if let Some(block_id) = cached {
-                // Reuse cached prefix block -- bump ref count.
                 let block = PhysicalBlock::new(block_id, self.block_size, Device::Gpu);
                 table.push(block);
                 self.gpu_ref_counts.increment(block_id);
                 prefix_block_ids.push(block_id);
             } else {
-                // Allocate fresh block from pool.
                 let block_id = self
                     .gpu_pool
                     .allocate()
@@ -201,22 +257,24 @@ impl BlockManager {
         }
 
         if !prefix_block_ids.is_empty() {
-            self.prefix_blocks.insert(seq.seq_id, prefix_block_ids);
+            ensure_slot(&mut self.prefix_blocks, slot);
+            self.prefix_blocks[slot as usize] = Some(prefix_block_ids);
         }
 
         Ok(())
     }
 
     /// Register completed prefix blocks in the cache after prefill.
-    ///
-    /// Should be called after the prompt KV has been computed. Only full
-    /// blocks (not the partial last block) are registered.
     pub fn register_prefix(&mut self, seq: &Sequence) {
         let pc = match self.prefix_cache {
             Some(ref mut pc) => pc,
             None => return,
         };
-        let table = match self.gpu_tables.get(&seq.seq_id) {
+        let slot = match self.seq_slots.get(seq.seq_id) {
+            Some(s) => s,
+            None => return,
+        };
+        let table = match self.gpu_tables.get(slot as usize).and_then(|o| o.as_ref()) {
             Some(t) => t,
             None => return,
         };
@@ -229,7 +287,6 @@ impl BlockManager {
             self.block_size,
         );
 
-        // Bump ref counts for newly cached blocks so they survive sequence free.
         for &bid in &newly_cached {
             self.gpu_ref_counts.increment(bid);
         }
@@ -244,20 +301,27 @@ impl BlockManager {
     }
 
     /// Free all GPU and CPU blocks for a sequence.
-    ///
-    /// When prefix caching is enabled, releases prefix cache references
-    /// so those blocks become evictable. The physical blocks are only
-    /// returned to the pool when their ref count reaches zero (i.e. no
-    /// other sequence and no cache entry holds them).
     pub fn free(&mut self, seq: &Sequence) {
-        // Release prefix cache refs for this sequence.
-        if let Some(prefix_bids) = self.prefix_blocks.remove(&seq.seq_id) {
+        let slot = match self.seq_slots.remove(seq.seq_id) {
+            Some(s) => s,
+            None => return,
+        };
+
+        if let Some(prefix_bids) = self
+            .prefix_blocks
+            .get_mut(slot as usize)
+            .and_then(|o| o.take())
+        {
             if let Some(ref mut pc) = self.prefix_cache {
                 pc.release(&prefix_bids);
             }
         }
 
-        if let Some(table) = self.gpu_tables.remove(&seq.seq_id) {
+        if let Some(table) = self
+            .gpu_tables
+            .get_mut(slot as usize)
+            .and_then(|o| o.take())
+        {
             for block in table.iter() {
                 let remaining = self.gpu_ref_counts.decrement(block.block_id);
                 if remaining == 0 {
@@ -266,7 +330,12 @@ impl BlockManager {
                 }
             }
         }
-        if let Some(table) = self.cpu_tables.remove(&seq.seq_id) {
+
+        if let Some(table) = self
+            .cpu_tables
+            .get_mut(slot as usize)
+            .and_then(|o| o.take())
+        {
             for block in table.iter() {
                 let remaining = self.cpu_ref_counts.decrement(block.block_id);
                 if remaining == 0 {
@@ -278,7 +347,6 @@ impl BlockManager {
     }
 
     /// Evict a prefix cache block, freeing the physical GPU block.
-    /// Returns the freed block id, or None if nothing can be evicted.
     pub fn evict_prefix_block(&mut self) -> Option<BlockId> {
         let pc = self.prefix_cache.as_mut()?;
         let block_id = pc.evict_one()?;
@@ -296,11 +364,16 @@ impl BlockManager {
     }
 
     /// Fork a parent sequence into a child (CoW for beam search).
-    /// The child shares all parent blocks with incremented ref counts.
     pub fn fork(&mut self, parent: &Sequence, child: &mut Sequence) -> Result<()> {
+        let parent_slot = self
+            .seq_slots
+            .get(parent.seq_id)
+            .ok_or_else(|| LLMError::MemoryError("parent has no block table".into()))?;
+
         let parent_table = self
             .gpu_tables
-            .get(&parent.seq_id)
+            .get(parent_slot as usize)
+            .and_then(|o| o.as_ref())
             .ok_or_else(|| LLMError::MemoryError("parent has no block table".into()))?
             .clone();
 
@@ -310,16 +383,23 @@ impl BlockManager {
             child_table.push(block.clone());
         }
 
-        self.gpu_tables.insert(child.seq_id, child_table);
+        let child_slot = self.seq_slots.get_or_create(child.seq_id);
+        ensure_slot(&mut self.gpu_tables, child_slot);
+        self.gpu_tables[child_slot as usize] = Some(child_table);
         Ok(())
     }
 
     /// Perform copy-on-write for the last block of a sequence if shared.
-    /// Returns the new block id if a copy was made.
     pub fn cow_if_needed(&mut self, seq: &Sequence) -> Result<Option<BlockId>> {
+        let slot = self
+            .seq_slots
+            .get(seq.seq_id)
+            .ok_or_else(|| LLMError::MemoryError("sequence has no block table".into()))?;
+
         let table = self
             .gpu_tables
-            .get_mut(&seq.seq_id)
+            .get_mut(slot as usize)
+            .and_then(|o| o.as_mut())
             .ok_or_else(|| LLMError::MemoryError("sequence has no block table".into()))?;
 
         let last_idx = match table.len().checked_sub(1) {
@@ -355,23 +435,33 @@ impl BlockManager {
 
     /// Get the block table for a sequence.
     pub fn get_block_table(&self, seq_id: SequenceId) -> Option<&BlockTable> {
-        self.gpu_tables.get(&seq_id)
+        let slot = self.seq_slots.get(seq_id)?;
+        self.gpu_tables.get(slot as usize)?.as_ref()
     }
 
     /// Check if there are enough CPU blocks to swap out a sequence.
     pub fn can_swap_out(&self, seq: &Sequence) -> bool {
-        let gpu_table = match self.gpu_tables.get(&seq.seq_id) {
-            Some(t) => t,
+        let slot = match self.seq_slots.get(seq.seq_id) {
+            Some(s) => s,
             None => return false,
         };
-        gpu_table.len() <= self.cpu_pool.free_blocks()
+        match self.gpu_tables.get(slot as usize).and_then(|o| o.as_ref()) {
+            Some(t) => t.len() <= self.cpu_pool.free_blocks(),
+            None => false,
+        }
     }
 
     /// Swap out a sequence from GPU to CPU. Returns GPU->CPU block id mapping.
     pub fn swap_out(&mut self, seq: &Sequence) -> Result<Vec<(BlockId, BlockId)>> {
+        let slot = self
+            .seq_slots
+            .get(seq.seq_id)
+            .ok_or_else(|| LLMError::MemoryError("sequence has no GPU block table".into()))?;
+
         let gpu_table = self
             .gpu_tables
-            .remove(&seq.seq_id)
+            .get_mut(slot as usize)
+            .and_then(|o| o.take())
             .ok_or_else(|| LLMError::MemoryError("sequence has no GPU block table".into()))?;
 
         let mut mapping = Vec::with_capacity(gpu_table.len());
@@ -397,15 +487,22 @@ impl BlockManager {
             }
         }
 
-        self.cpu_tables.insert(seq.seq_id, cpu_table);
+        ensure_slot(&mut self.cpu_tables, slot);
+        self.cpu_tables[slot as usize] = Some(cpu_table);
         Ok(mapping)
     }
 
     /// Swap in a sequence from CPU back to GPU. Returns CPU->GPU block id mapping.
     pub fn swap_in(&mut self, seq: &Sequence) -> Result<Vec<(BlockId, BlockId)>> {
+        let slot = self
+            .seq_slots
+            .get(seq.seq_id)
+            .ok_or_else(|| LLMError::MemoryError("sequence has no CPU block table".into()))?;
+
         let cpu_table = self
             .cpu_tables
-            .remove(&seq.seq_id)
+            .get_mut(slot as usize)
+            .and_then(|o| o.take())
             .ok_or_else(|| LLMError::MemoryError("sequence has no CPU block table".into()))?;
 
         let mut mapping = Vec::with_capacity(cpu_table.len());
@@ -431,7 +528,8 @@ impl BlockManager {
             }
         }
 
-        self.gpu_tables.insert(seq.seq_id, gpu_table);
+        ensure_slot(&mut self.gpu_tables, slot);
+        self.gpu_tables[slot as usize] = Some(gpu_table);
         Ok(mapping)
     }
 
@@ -470,41 +568,37 @@ mod tests {
     use super::*;
     use crate::SequenceStatus;
     use rvllm_core::prelude::TokenId;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Test pool that recycles BlockIds within `[0, total)`.
     struct TestPool {
         total: usize,
-        next_id: AtomicUsize,
-        free_count: AtomicUsize,
+        inner: Mutex<VecDeque<u32>>,
     }
 
     impl TestPool {
         fn new(total: usize) -> Self {
+            let mut free = VecDeque::with_capacity(total);
+            for i in 0..total {
+                free.push_back(i as u32);
+            }
             Self {
                 total,
-                next_id: AtomicUsize::new(0),
-                free_count: AtomicUsize::new(total),
+                inner: Mutex::new(free),
             }
         }
     }
 
     impl MemoryPool for TestPool {
         fn allocate(&self) -> Option<BlockId> {
-            let free = self.free_count.load(Ordering::SeqCst);
-            if free == 0 {
-                return None;
-            }
-            self.free_count.fetch_sub(1, Ordering::SeqCst);
-            let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-            Some(BlockId(id as u32))
+            self.inner.lock().pop_front().map(BlockId)
         }
 
-        fn free(&self, _block_id: BlockId) {
-            self.free_count.fetch_add(1, Ordering::SeqCst);
+        fn free(&self, block_id: BlockId) {
+            self.inner.lock().push_back(block_id.0);
         }
 
         fn free_blocks(&self) -> usize {
-            self.free_count.load(Ordering::SeqCst)
+            self.inner.lock().len()
         }
 
         fn total_blocks(&self) -> usize {
@@ -728,31 +822,25 @@ mod tests {
         let mut mgr = make_prefix_manager(20, 10);
         assert!(mgr.prefix_caching_enabled());
 
-        // Sequence 1: 32 tokens = 2 blocks.
         let tokens: Vec<TokenId> = (0..32).collect();
         let seq1 = make_seq_with_tokens(1, tokens.clone());
         mgr.allocate(&seq1).unwrap();
         assert_eq!(mgr.get_block_table(SequenceId(1)).unwrap().len(), 2);
 
-        // Register prefix blocks after prefill.
         mgr.register_prefix(&seq1);
 
-        // Check prefix cache has 2 entries.
         let pc = mgr.prefix_cache().unwrap();
         assert_eq!(pc.len(), 2);
 
-        // Sequence 2: same 32-token prefix = should reuse both blocks.
         let seq2 = make_seq_with_tokens(2, tokens.clone());
         let free_before = mgr.gpu_pool.free_blocks();
         mgr.allocate(&seq2).unwrap();
         let free_after = mgr.gpu_pool.free_blocks();
 
-        // No new blocks allocated -- reused from prefix cache.
         assert_eq!(free_before, free_after);
 
         let t1 = mgr.get_block_table(SequenceId(1)).unwrap();
         let t2 = mgr.get_block_table(SequenceId(2)).unwrap();
-        // Both should reference the same physical blocks.
         assert_eq!(t1.get(0).unwrap().block_id, t2.get(0).unwrap().block_id);
         assert_eq!(t1.get(1).unwrap().block_id, t2.get(1).unwrap().block_id);
     }
@@ -761,12 +849,11 @@ mod tests {
     fn prefix_cache_partial_match() {
         let mut mgr = make_prefix_manager(20, 10);
 
-        let tokens_a: Vec<TokenId> = (0..48).collect(); // 3 blocks
+        let tokens_a: Vec<TokenId> = (0..48).collect();
         let seq1 = make_seq_with_tokens(1, tokens_a.clone());
         mgr.allocate(&seq1).unwrap();
         mgr.register_prefix(&seq1);
 
-        // Seq 2 shares first 32 tokens, differs in last block.
         let mut tokens_b: Vec<TokenId> = (0..48).collect();
         tokens_b[32] = 999;
         let seq2 = make_seq_with_tokens(2, tokens_b);
@@ -775,26 +862,21 @@ mod tests {
         mgr.allocate(&seq2).unwrap();
         let free_after = mgr.gpu_pool.free_blocks();
 
-        // Should have allocated 1 new block (for the differing 3rd block).
         assert_eq!(free_before - free_after, 1);
     }
 
     #[test]
     fn prefix_cache_can_allocate_accounts_for_hits() {
-        // Only 1 free GPU block, but prefix cache has 1 cached block.
         let mut mgr = make_prefix_manager(10, 10);
 
-        let tokens: Vec<TokenId> = (0..32).collect(); // 2 blocks
+        let tokens: Vec<TokenId> = (0..32).collect();
         let seq1 = make_seq_with_tokens(1, tokens.clone());
         mgr.allocate(&seq1).unwrap();
         mgr.register_prefix(&seq1);
 
-        // Use up remaining blocks.
-        let filler = make_seq(99, 7 * 16); // 7 blocks
+        let filler = make_seq(99, 7 * 16);
         mgr.allocate(&filler).unwrap();
-        // Now 10 - 2 - 7 = 1 free block.
 
-        // Seq 2 needs 2 blocks, but 1 is cached, so only needs 1 from pool.
         let seq2 = make_seq_with_tokens(2, tokens);
         assert!(mgr.can_allocate(&seq2));
     }
@@ -803,19 +885,16 @@ mod tests {
     fn prefix_cache_evict_frees_block() {
         let mut mgr = make_prefix_manager(10, 10);
 
-        let tokens: Vec<TokenId> = (0..16).collect(); // 1 block
+        let tokens: Vec<TokenId> = (0..16).collect();
         let seq1 = make_seq_with_tokens(1, tokens);
         mgr.allocate(&seq1).unwrap();
         mgr.register_prefix(&seq1);
 
-        // Free the sequence -- prefix cache still holds the block.
         let free_before_free = mgr.gpu_pool.free_blocks();
         mgr.free(&seq1);
         let free_after_free = mgr.gpu_pool.free_blocks();
-        // Block not returned to pool because prefix cache ref keeps it alive.
         assert_eq!(free_after_free, free_before_free);
 
-        // Evict the cached block.
         let evicted = mgr.evict_prefix_block();
         assert!(evicted.is_some());
         let free_after_evict = mgr.gpu_pool.free_blocks();
@@ -831,14 +910,33 @@ mod tests {
         mgr.allocate(&seq1).unwrap();
         mgr.register_prefix(&seq1);
 
-        // Completely different tokens.
         let tokens_b: Vec<TokenId> = (100..132).collect();
         let seq2 = make_seq_with_tokens(2, tokens_b);
         let free_before = mgr.gpu_pool.free_blocks();
         mgr.allocate(&seq2).unwrap();
         let free_after = mgr.gpu_pool.free_blocks();
 
-        // All 2 blocks freshly allocated.
         assert_eq!(free_before - free_after, 2);
+    }
+
+    #[test]
+    fn slot_recycling() {
+        let mut mgr = make_manager(10, 10);
+
+        // Allocate and free many sequences to exercise slot recycling.
+        for i in 0..20u64 {
+            let seq = make_seq(i, 16);
+            mgr.allocate(&seq).unwrap();
+            mgr.free(&seq);
+        }
+
+        // Slots should be recycled -- next_slot shouldn't grow unboundedly.
+        // With 20 sequential alloc/free, slots should be reused after the first.
+        assert!(mgr.seq_slots.next_slot <= 20);
+
+        // Verify allocator still works.
+        let seq = make_seq(100, 16);
+        mgr.allocate(&seq).unwrap();
+        assert_eq!(mgr.get_block_table(SequenceId(100)).unwrap().len(), 1);
     }
 }
