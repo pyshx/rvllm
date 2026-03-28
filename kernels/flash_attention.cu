@@ -844,3 +844,144 @@ __global__ void flash_attention_2_decode_f16kv_kernel(
         }
     }
 }
+
+// Fully f16 I/O variant: f16 query, f16 KV cache, f16 output.
+// All internal math remains f32 for numerical stability.
+// This eliminates the f32<->f16 casts around the attention kernel.
+extern "C"
+__global__ void flash_attention_2_decode_f16io_kernel(
+    __half* __restrict__ output,           // [num_seqs, num_heads, head_dim] f16
+    const __half* __restrict__ query,      // [num_seqs, num_heads, head_dim] f16
+    const __half* __restrict__ key_cache,  // [num_blocks, block_size, num_kv_heads, head_dim] f16
+    const __half* __restrict__ value_cache,// [num_blocks, block_size, num_kv_heads, head_dim] f16
+    const int* __restrict__ block_tables,  // [num_seqs, max_blocks_per_seq]
+    const int* __restrict__ context_lens,  // [num_seqs]
+    float scale,
+    int num_heads,
+    int num_kv_heads,
+    int head_dim,
+    int block_size,
+    int max_blocks_per_seq
+) {
+    const int seq_idx  = blockIdx.x;
+    const int head_idx = blockIdx.y;
+    const int tid      = threadIdx.x;
+
+    const int context_len = context_lens[seq_idx];
+    if (context_len == 0) return;
+
+    const int kv_head_idx = (num_kv_heads == num_heads) ? head_idx : (head_idx / (num_heads / num_kv_heads));
+
+    extern __shared__ float smem[];
+    float* s_key    = smem;
+    float* s_val    = smem + FA2_BC * head_dim;
+    float* s_score  = smem + 2 * FA2_BC * head_dim;
+    float* s_reduce = smem + 2 * FA2_BC * head_dim + FA2_BC;
+
+    const int num_kv_tiles = (context_len + FA2_BC - 1) / FA2_BC;
+    const int dims_per_thread = (head_dim + FA2_THREADS - 1) / FA2_THREADS;
+
+    // Load Q (f16 -> f32 registers)
+    float q_reg[8];
+    for (int r = 0; r < dims_per_thread && r < 8; r++) {
+        int d = tid + r * FA2_THREADS;
+        if (d < head_dim) {
+            q_reg[r] = __half2float(query[(seq_idx * num_heads + head_idx) * head_dim + d]) * scale;
+        } else {
+            q_reg[r] = 0.0f;
+        }
+    }
+
+    float row_max = -FLT_MAX;
+    float row_sum = 0.0f;
+    float acc[8];
+    for (int r = 0; r < dims_per_thread && r < 8; r++) acc[r] = 0.0f;
+
+    for (int tile = 0; tile < num_kv_tiles; tile++) {
+        const int tile_start = tile * FA2_BC;
+        const int tile_len = min(FA2_BC, context_len - tile_start);
+
+        for (int idx = tid; idx < tile_len * head_dim; idx += FA2_THREADS) {
+            int t = idx / head_dim;
+            int d = idx % head_dim;
+            int kv_pos = tile_start + t;
+            int page_idx = kv_pos / block_size;
+            int page_off = kv_pos % block_size;
+            int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+            s_key[t * head_dim + d] = __half2float(key_cache[((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d]);
+        }
+        __syncthreads();
+
+        for (int t = 0; t < tile_len; t++) {
+            float dot = 0.0f;
+            for (int r = 0; r < dims_per_thread && r < 8; r++) {
+                int d = tid + r * FA2_THREADS;
+                if (d < head_dim) dot += q_reg[r] * s_key[t * head_dim + d];
+            }
+            dot = block_reduce_sum(dot, s_reduce, tid, FA2_THREADS);
+            if (tid == 0) s_score[t] = dot;
+            __syncthreads();
+        }
+
+        float tile_max = -FLT_MAX;
+        if (tid == 0) {
+            for (int t = 0; t < tile_len; t++) tile_max = fmaxf(tile_max, s_score[t]);
+            s_reduce[0] = tile_max;
+        }
+        __syncthreads();
+        tile_max = s_reduce[0];
+        __syncthreads();
+
+        float prev_max = row_max;
+        float new_max = fmaxf(row_max, tile_max);
+        if (new_max > prev_max && prev_max > -FLT_MAX) {
+            float correction = expf(prev_max - new_max);
+            for (int r = 0; r < dims_per_thread && r < 8; r++) acc[r] *= correction;
+            row_sum *= correction;
+        }
+        row_max = new_max;
+
+        if (tid == 0) {
+            float tsum = 0.0f;
+            for (int t = 0; t < tile_len; t++) {
+                float val = expf(s_score[t] - row_max);
+                s_score[t] = val;
+                tsum += val;
+            }
+            s_reduce[0] = tsum;
+        }
+        __syncthreads();
+        row_sum += s_reduce[0];
+        __syncthreads();
+
+        for (int idx = tid; idx < tile_len * head_dim; idx += FA2_THREADS) {
+            int t = idx / head_dim;
+            int d = idx % head_dim;
+            int kv_pos = tile_start + t;
+            int page_idx = kv_pos / block_size;
+            int page_off = kv_pos % block_size;
+            int phys_block = block_tables[seq_idx * max_blocks_per_seq + page_idx];
+            s_val[t * head_dim + d] = __half2float(value_cache[((phys_block * block_size + page_off) * num_kv_heads + kv_head_idx) * head_dim + d]);
+        }
+        __syncthreads();
+
+        for (int r = 0; r < dims_per_thread && r < 8; r++) {
+            int d = tid + r * FA2_THREADS;
+            if (d < head_dim) {
+                float val_acc = 0.0f;
+                for (int t = 0; t < tile_len; t++) val_acc += s_score[t] * s_val[t * head_dim + d];
+                acc[r] += val_acc;
+            }
+        }
+        __syncthreads();
+    }
+
+    // Normalize and write (f16 output)
+    float inv_sum = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
+    for (int r = 0; r < dims_per_thread && r < 8; r++) {
+        int d = tid + r * FA2_THREADS;
+        if (d < head_dim) {
+            output[(seq_idx * num_heads + head_idx) * head_dim + d] = __float2half(acc[r] * inv_sum);
+        }
+    }
+}
