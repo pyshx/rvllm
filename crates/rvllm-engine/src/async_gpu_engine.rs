@@ -184,6 +184,13 @@ mod inner {
                 HashMap::new();
             let mut step_counter: u32 = 0;
 
+            // Shared request queue: async loop pushes, engine drains during step.
+            // Requests arriving during GPU compute get buffered here and picked
+            // up at the start of the next step (via drain_request_queue).
+            let request_queue: super::gpu_engine::RequestQueue =
+                std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            engine.set_request_queue(request_queue.clone());
+
             loop {
                 if cancel.is_cancelled() {
                     info!("GPU background loop cancelled, draining");

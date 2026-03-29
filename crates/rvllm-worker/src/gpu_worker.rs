@@ -820,6 +820,43 @@ impl GpuWorker {
         Ok(GpuWorkerOutput { outputs: Vec::new() })
     }
 
+    /// Execute with overlap: runs `during_gpu` closure while GPU computes.
+    /// The closure gets ~4ms of CPU time during the async graph replay path.
+    /// For sync paths (prefill, capture), the closure runs after GPU finishes.
+    pub fn execute_with_overlap<F: FnOnce()>(
+        &mut self,
+        metadata: &[SequenceGroupMetadata],
+        during_gpu: F,
+    ) -> Result<GpuWorkerOutput> {
+        if metadata.is_empty() {
+            during_gpu();
+            return Ok(GpuWorkerOutput { outputs: Vec::new() });
+        }
+
+        let model_input = input::prepare_input(metadata, self.config.block_size)?;
+        let greedy_only = Self::all_greedy(metadata);
+        let fwd_output = self.gpu_forward_ex(&model_input, greedy_only)?;
+
+        let outputs = match fwd_output {
+            ForwardOutput::TokenIdsPending { actual_batch } => {
+                // GPU is computing async. Run the overlap closure NOW.
+                during_gpu();
+                // THEN sync and read results.
+                let token_ids = self.collect_pending_tokens(actual_batch)?;
+                self.sample_tokens_from_gpu_argmax(&token_ids, metadata)?
+            }
+            ForwardOutput::TokenIds(ref token_ids) => {
+                during_gpu();
+                self.sample_tokens_from_gpu_argmax(token_ids, metadata)?
+            }
+            ForwardOutput::Logits(ref logits) => {
+                during_gpu();
+                self.sample_tokens(logits, metadata)?
+            }
+        };
+        Ok(GpuWorkerOutput { outputs })
+    }
+
     /// Execute one inference step with real GPU matmuls.
     pub fn execute(&mut self, metadata: &[SequenceGroupMetadata]) -> Result<GpuWorkerOutput> {
         if metadata.is_empty() {
