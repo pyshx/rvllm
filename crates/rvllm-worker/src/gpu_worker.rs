@@ -568,12 +568,16 @@ impl GpuWorker {
 
             // KernelLoader: try build output dir, fall back to empty (PTX loaded at runtime)
             let ptx_dir = Self::find_ptx_dir();
-            let loader = rvllm_gpu::kernel_loader::KernelLoader::new(
+            let mut loader = rvllm_gpu::kernel_loader::KernelLoader::new(
                 self.context.clone(),
                 self.stream.clone(),
                 &ptx_dir.unwrap_or_else(|| std::path::PathBuf::from("/nonexistent")),
             )
             .map_err(|e| LLMError::GpuError(format!("kernel loader: {e}")))?;
+
+            // JIT compile fused CuTE kernels for this model's specific dimensions.
+            // Uses nvcc + CUTLASS headers. Cached to ~/.cache/rvllm/fusion/.
+            Self::jit_compile_fused_kernels(&mut loader, &self.config)?;
 
             let mr_config = self.config.model_runner_config();
             let mut runner = rvllm_model_runner::gpu_runner::GpuModelRunner::new(
@@ -606,6 +610,150 @@ impl GpuWorker {
         }
 
         Ok(())
+    }
+
+    /// JIT compile fused CuTE kernels for this model's dimensions.
+    /// Checks disk cache first (~/.cache/rvllm/fusion/). On miss, instantiates
+    /// CuTE templates with compile-time constants and invokes nvcc.
+    #[cfg(feature = "cuda")]
+    fn jit_compile_fused_kernels(
+        loader: &mut rvllm_gpu::kernel_loader::KernelLoader,
+        config: &WorkerConfig,
+    ) -> Result<()> {
+        use rvllm_fusion::jit::JitCompiler;
+        use rvllm_fusion::cache::KernelCache;
+
+        // Find CUTLASS headers for CuTE includes
+        let cutlass_dirs: Vec<std::path::PathBuf> = [
+            "/root/cutlass/include",
+            "/root/cutlass/tools/util/include",
+            "/usr/local/cutlass/include",
+            "/opt/cutlass/include",
+        ]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.exists())
+        .collect();
+
+        let jit = if cutlass_dirs.is_empty() {
+            // No CUTLASS headers -- try basic JIT without CuTE
+            match JitCompiler::new() {
+                Ok(j) => j,
+                Err(e) => {
+                    warn!("JIT compiler not available ({e}), skipping fused kernel compilation");
+                    return Ok(());
+                }
+            }
+        } else {
+            match JitCompiler::new() {
+                Ok(mut j) => {
+                    // Re-create with include dirs
+                    let arch = j.arch().to_string();
+                    JitCompiler::with_config(
+                        std::path::PathBuf::from(j.nvcc_path()),
+                        arch,
+                        cutlass_dirs,
+                    )
+                }
+                Err(e) => {
+                    warn!("JIT compiler not available ({e}), skipping fused kernel compilation");
+                    return Ok(());
+                }
+            }
+        };
+
+        let cache_dir = Self::dirs_or_home().join("fusion");
+        let cache = KernelCache::new(cache_dir);
+
+        let hidden = config.hidden_size;
+        let qkv_dim = config.num_attention_heads * config.head_dim
+            + 2 * config.num_kv_heads * config.head_dim;
+        let gate_up_dim = config.intermediate_size * 2;
+        let intermediate = config.intermediate_size;
+        let eps = format!("{:e}", config.rms_norm_eps);
+
+        // CuTE templates embedded at compile time
+        let templates: &[(&str, &str, &str, usize, usize)] = &[
+            ("fused_cute_norm_qkv_gemv", "norm_gemv",
+             include_str!("../../rvllm-fusion/templates/cute_norm_gemv.cu.template"),
+             hidden, qkv_dim),
+            ("fused_cute_add_norm_qkv_gemv", "add_norm_gemv",
+             include_str!("../../rvllm-fusion/templates/cute_add_norm_gemv.cu.template"),
+             hidden, qkv_dim),
+            ("fused_cute_add_norm_gateup_gemv", "add_norm_gemv",
+             include_str!("../../rvllm-fusion/templates/cute_add_norm_gemv.cu.template"),
+             hidden, gate_up_dim),
+            ("fused_cute_silu_down_gemv", "silu_gemv",
+             include_str!("../../rvllm-fusion/templates/cute_silu_mul_gemv.cu.template"),
+             hidden, intermediate),
+        ];
+
+        let t0 = std::time::Instant::now();
+        let mut compiled = 0;
+        let mut cached = 0;
+
+        for &(kernel_name, _tag, template, dim_a, dim_b) in templates {
+            // Build cache key from kernel name + dimensions + arch
+            let cache_key = KernelCache::key_for(
+                kernel_name,
+                &[dim_a, dim_b],
+                jit.arch(),
+            );
+
+            // Check cache
+            if let Some(ptx_bytes) = cache.get(&cache_key) {
+                if loader.load_ptx(kernel_name, &ptx_bytes).is_ok() {
+                    cached += 1;
+                    continue;
+                }
+            }
+
+            // Instantiate template
+            let source = template
+                .replace("{{KERNEL_NAME}}", kernel_name)
+                .replace("{{HIDDEN_SIZE}}", &dim_a.to_string())
+                .replace("{{OUT_DIM}}", &dim_b.to_string())
+                .replace("{{INTERMEDIATE_SIZE}}", &dim_b.to_string())
+                .replace("{{THREADS}}", "256")
+                .replace("{{EPS}}", &eps);
+
+            // Compile
+            match jit.compile_to_ptx(&source, kernel_name) {
+                Ok(ptx_bytes) => {
+                    // Cache to disk
+                    if let Err(e) = cache.put(&cache_key, &ptx_bytes) {
+                        warn!("failed to cache fused kernel {kernel_name}: {e}");
+                    }
+                    // Load into kernel loader
+                    if let Err(e) = loader.load_ptx(kernel_name, &ptx_bytes) {
+                        warn!("failed to load fused kernel {kernel_name}: {e}");
+                    } else {
+                        compiled += 1;
+                    }
+                }
+                Err(e) => {
+                    warn!("JIT compile failed for {kernel_name}: {e}");
+                }
+            }
+        }
+
+        let elapsed = t0.elapsed();
+        if compiled > 0 || cached > 0 {
+            info!(
+                compiled, cached,
+                elapsed_ms = elapsed.as_millis(),
+                "fused kernels ready"
+            );
+        }
+        Ok(())
+    }
+
+    /// Get cache directory (HOME/.cache/rvllm or /tmp/rvllm)
+    #[cfg(feature = "cuda")]
+    fn dirs_or_home() -> std::path::PathBuf {
+        std::env::var("HOME")
+            .map(|h| std::path::PathBuf::from(h).join(".cache").join("rvllm"))
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/rvllm"))
     }
 
     /// Search for compiled PTX directory from build output.

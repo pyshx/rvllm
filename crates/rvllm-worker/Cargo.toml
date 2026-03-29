@@ -26,6 +26,7 @@ rvllm-model-runner.workspace = true
 rvllm-kv-cache.workspace = true
 rvllm-sampling.workspace = true
 rvllm-model-loader.workspace = true
+rvllm-fusion.workspace = true
 rvllm-sequence.workspace = true
 rvllm-telemetry.workspace = true
 hf-hub = "0.4"

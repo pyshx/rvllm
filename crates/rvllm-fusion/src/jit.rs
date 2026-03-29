@@ -72,6 +72,10 @@ impl JitCompiler {
         &self.cuda_arch
     }
 
+    pub fn nvcc_path(&self) -> &Path {
+        &self.nvcc_path
+    }
+
     pub fn add_include_dir(&mut self, dir: PathBuf) {
         self.include_dirs.push(dir);
     }

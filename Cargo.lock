@@ -2924,6 +2924,7 @@ dependencies = [
  "rand 0.8.5",
  "rvllm-config",
  "rvllm-core",
+ "rvllm-fusion",
  "rvllm-gpu",
  "rvllm-kv-cache",
  "rvllm-model-loader",
