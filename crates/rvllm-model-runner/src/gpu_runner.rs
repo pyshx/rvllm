@@ -121,6 +121,8 @@ mod cuda_impl {
         weights: GpuModelWeights,
         cache: CudaCacheEngine,
         blas: CublasHandle,
+        #[cfg(feature = "cublaslt")]
+        blas_lt: Option<rvllm_gpu::cublaslt_ops::CublasLtOps>,
         loader: Arc<KernelLoader>,
         config: ModelRunnerConfig,
         device: Arc<CudaContext>,
@@ -249,10 +251,15 @@ mod cuda_impl {
             info!(graph_max_blocks, block_size, max_position = config.max_position,
                   "fixed block_tables stride for CUDA graph stability");
 
+            #[cfg(feature = "cublaslt")]
+            let blas_lt = rvllm_gpu::cublaslt_ops::CublasLtOps::new(stream.clone()).ok();
+
             Ok(Self {
                 weights,
                 cache,
                 blas,
+                #[cfg(feature = "cublaslt")]
+                blas_lt,
                 loader,
                 config,
                 device,
@@ -516,7 +523,7 @@ mod cuda_impl {
                         rope_sin: &self.rope_sin,
                     };
                     let weights = self.layer_weights_f16(layer_idx)?;
-                    let (residual, mlp_out) = layer.forward_f16(&input, &weights, &self.blas, prev_mlp_out.as_ref())?;
+                    let (residual, mlp_out) = layer.forward_f16(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.blas_lt.as_ref())?;
                     hidden_f16 = residual;
                     prev_mlp_out = Some(mlp_out);
                 }
@@ -831,7 +838,7 @@ mod cuda_impl {
                         rope_sin: &self.rope_sin,
                     };
                     let weights = self.layer_weights_f16(layer_idx)?;
-                    let (residual, mlp_out) = layer.forward_f16(&input, &weights, &self.blas, prev_mlp_out.as_ref())?;
+                    let (residual, mlp_out) = layer.forward_f16(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.blas_lt.as_ref())?;
                     hidden_f16 = residual;
                     prev_mlp_out = Some(mlp_out);
                 }
@@ -1059,7 +1066,7 @@ mod cuda_impl {
                         rope_sin: &self.rope_sin,
                     };
                     let weights = self.layer_weights_f16(layer_idx)?;
-                    let (residual, mlp_out) = layer.forward_f16(&input, &weights, &self.blas, prev_mlp_out.as_ref())?;
+                    let (residual, mlp_out) = layer.forward_f16(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.blas_lt.as_ref())?;
                     hidden_f16 = residual;
                     prev_mlp_out = Some(mlp_out);
                 }
