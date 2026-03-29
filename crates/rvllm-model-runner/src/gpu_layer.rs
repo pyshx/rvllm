@@ -271,7 +271,7 @@ mod inner {
             let qkv_dim = q_dim + kv_dim + kv_dim;
 
             let mut qkv = if let Some(fused_qkv) = weights.fused_qkv {
-                Self::hgemm_dispatch(&self.stream, blas, lt, &normed, fused_qkv, num_tokens, qkv_dim, hidden)?
+                Self::hgemm_dispatch(&self.stream, blas, lt, &normed, fused_qkv, num_tokens, qkv_dim, hidden, &self.loader)?
             } else {
                 let mut qkv_buf = unsafe { self.stream.alloc::<f16>(num_tokens * qkv_dim) }
                     .map_err(|e| LLMError::GpuError(format!("qkv f16 alloc: {e}")))?;
@@ -355,7 +355,7 @@ mod inner {
             };
 
             // 7. Output projection: hgemm f16
-            let attn_proj = Self::hgemm_dispatch(&self.stream, blas, lt, &attn_out, weights.o_proj, num_tokens, hidden, q_dim)?;
+            let attn_proj = Self::hgemm_dispatch(&self.stream, blas, lt, &attn_out, weights.o_proj, num_tokens, hidden, q_dim, &self.loader)?;
 
             // 8. Fused residual + post-attention RMSNorm f16
             let (normed2, residual) = Self::fused_residual_rmsnorm_f16(
@@ -366,17 +366,17 @@ mod inner {
 
             // 9. MLP: gate+up -> fused_silu_mul_f16 -> down, all f16
             let fused = if let Some(fused_gate_up) = weights.fused_gate_up {
-                let gate_up = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, fused_gate_up, num_tokens, intermediate * 2, hidden)?;
+                let gate_up = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, fused_gate_up, num_tokens, intermediate * 2, hidden, &self.loader)?;
                 let n = num_tokens * intermediate;
                 Self::fused_silu_mul_f16_split(&self.stream, &self.loader, &gate_up, n)?
             } else {
-                let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.gate_proj, num_tokens, intermediate, hidden)?;
-                let up = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.up_proj, num_tokens, intermediate, hidden)?;
+                let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.gate_proj, num_tokens, intermediate, hidden, &self.loader)?;
+                let up = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.up_proj, num_tokens, intermediate, hidden, &self.loader)?;
                 Self::fused_silu_mul_f16(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?
             };
 
             // 10. Down projection: hgemm f16
-            let mlp_out = Self::hgemm_dispatch(&self.stream, blas, lt, &fused, weights.down_proj, num_tokens, hidden, intermediate)?;
+            let mlp_out = Self::hgemm_dispatch(&self.stream, blas, lt, &fused, weights.down_proj, num_tokens, hidden, intermediate, &self.loader)?;
 
             // 11. Return (residual, mlp_out) -- the add is fused into the NEXT layer's norm
             Ok((residual, mlp_out))
@@ -1532,6 +1532,7 @@ mod inner {
         }
 
         /// hgemm dispatch: uses cublasLt for M<=32 (split-K), falls back to standard cuBLAS.
+        /// GEMM dispatch: custom GEMV for M=1, cublasLt for M<=32, cuBLAS for larger.
         fn hgemm_dispatch(
             stream: &Arc<CudaStream>,
             blas: &CublasHandle,
@@ -1542,9 +1543,34 @@ mod inner {
             m: usize,
             n: usize,
             k: usize,
+            loader: &KernelLoader,
         ) -> Result<CudaSlice<f16>> {
             let mut output = unsafe { stream.alloc::<f16>(m * n) }
                 .map_err(|e| LLMError::GpuError(format!("hgemm_dispatch: {e}")))?;
+
+            // M=1: custom GEMV kernel (vectorized half2, warp shuffle reduction)
+            if m == 1 {
+                if let Ok(kernel) = loader.get_func("gemv_f16", "gemv_f16_kernel") {
+                    let cfg = LaunchConfig {
+                        grid_dim: (n as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    unsafe {
+                        stream.launch_builder(&kernel)
+                            .arg(&mut output)
+                            .arg(weight)
+                            .arg(input)
+                            .arg(&(n as i32))
+                            .arg(&(k as i32))
+                            .launch(cfg)
+                            .map_err(|e| LLMError::GpuError(format!("gemv_f16 launch: {e}")))?;
+                    }
+                    return Ok(output);
+                }
+                // Fallthrough to cuBLAS if kernel not loaded
+            }
+
             #[cfg(feature = "cublaslt")]
             if let Some(lt_ops) = lt {
                 if m <= rvllm_gpu::cublaslt_ops::CUBLASLT_M_THRESHOLD {
