@@ -2,7 +2,46 @@
 
 A from-scratch Rust rewrite of [vLLM](https://github.com/vllm-project/vllm) -- the most popular open-source LLM serving engine. Drop-in replacement for the OpenAI-compatible API with dramatically better resource efficiency.
 
-**23 Rust crates. 28 CUDA kernels. 12,673 tok/s on H100 (FP16, N=128). Pure f16 end-to-end, CUDA graph replay, coherent output verified. 20x faster startup. 31x smaller.**
+**23 Rust crates. 28 CUDA kernels. Pure f16 end-to-end. CUDA graph replay. 20x faster startup. 31x smaller binary.**
+
+## The gap
+
+Honest head-to-head on H100 80GB. Qwen2.5-1.5B, f16, greedy decoding, 100 tokens/request. Direct engine benchmarks (no HTTP). Measured 2026-03-29.
+
+| N | rvLLM | vLLM 0.18 (torch.compile + FA3 + CUDA graphs) | Ratio |
+|---:|---:|---:|---|
+| 1 | 272 | 453 | 0.60x |
+| 2 | 530 | 923 | 0.57x |
+| 4 | 1,022 | 1,713 | 0.60x |
+| 8 | 2,012 | 3,552 | 0.57x |
+| 16 | 3,520 | 6,896 | 0.51x |
+| 32 | 6,943 | 13,219 | 0.53x |
+| 64 | 11,032 | 25,664 | 0.43x |
+| 128 | 15,053 | 41,051 | 0.37x |
+| 256 | 18,578 | 61,922 | 0.30x |
+
+vLLM is faster. Significantly. The gap comes from torch.compile kernel fusion, FlashAttention 3, and piecewise CUDA graph capture -- optimizations that took hundreds of engineers years to build. rvLLM uses hand-written CUDA kernels and cuBLAS without compile-time fusion.
+
+This is the starting point, not the end. The goal of this project is to close this gap in pure Rust + CUDA, without Python, without PyTorch, without torch.compile. Every optimization is explicit, auditable, and understood.
+
+### What rvLLM does well
+
+| Metric | rvLLM | Python vLLM |
+|---|---|---|
+| Startup time | 6 sec | ~120 sec |
+| Binary size | 16 MB | ~500 MB |
+| CPU memory | 348 MB | ~1 GB |
+| Dependencies | 0 (static binary) | PyTorch + 500MB |
+| Scaling | Near-linear N=1 to N=256 | Same |
+
+### What's needed to close the gap
+
+1. **FlashAttention 3** -- vLLM uses FA3 (async warp-specialized, pipelined GMMA). We use a hand-written FA2-style kernel. FA3 alone is ~2x faster for decode attention.
+2. **Kernel fusion** -- torch.compile fuses norm+quant, act+quant, and other adjacent operations. We launch each as a separate kernel with full launch overhead.
+3. **Piecewise CUDA graphs** -- vLLM captures separate graph pieces for prefill and decode attention, composing them dynamically. We capture full graphs per exact batch size.
+4. **FP8/INT8 quantization** -- halves weight reads, doubles effective memory bandwidth.
+
+See [docs/arch.md](docs/arch.md) for the full forward pass trace and [docs/update-log.md](docs/update-log.md) for optimization history.
 
 ## Install
 
@@ -15,30 +54,6 @@ pip install rvllm
 ```
 
 Or build from source -- see [Quick Start](#quick-start) below.
-
-## Benchmarks (Qwen2.5-1.5B, H100 80GB HBM3)
-
-Concurrent requests, greedy decoding, 100 tokens/request. Measured 2026-03-29.
-
-| N | tok/s | Status |
-|---:|---:|---|
-| 1 | 197 | graph replay |
-| 2 | 506 | graph replay |
-| 4 | 976 | graph replay |
-| 8 | 1,905 | graph replay |
-| 16 | 3,564 | graph replay |
-| 32 | 5,714 | graph replay |
-| 64 | 10,016 | graph replay |
-| 128 | **12,673** | graph replay |
-| 256 | WIP | stabilizing |
-
-| Metric | rvLLM | Python vLLM |
-|---|---|---|
-| Startup time | 6 sec | ~120 sec |
-| Binary size | 16 MB | ~500 MB |
-| CPU memory | 348 MB | ~1 GB |
-
-Near-linear scaling from N=1 to N=128. N=256 is the active stabilization target. See [docs/arch.md](docs/arch.md) for the full forward pass trace and [docs/update-log.md](docs/update-log.md) for optimization history.
 
 ### CPU Component Benchmarks (sampling, logit processing)
 

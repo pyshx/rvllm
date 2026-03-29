@@ -89,6 +89,18 @@ mod inner {
         cancel: CancellationToken,
     }
 
+    impl Clone for AsyncGpuLLMEngine {
+        fn clone(&self) -> Self {
+            Self {
+                cmd_tx: self.cmd_tx.clone(),
+                gen_tx: self.gen_tx.clone(),
+                // Clone the token for sending, but DON'T cancel on drop of clones.
+                // Only the original (via explicit shutdown()) should cancel.
+                cancel: self.cancel.clone(),
+            }
+        }
+    }
+
     impl AsyncGpuLLMEngine {
         /// Create a new async GPU engine.
         ///
@@ -483,11 +495,9 @@ mod inner {
         }
     }
 
-    impl Drop for AsyncGpuLLMEngine {
-        fn drop(&mut self) {
-            self.cancel.cancel();
-        }
-    }
+    // No Drop impl -- clones share the CancellationToken. Dropping a clone
+    // must NOT cancel the background loop. Call shutdown() explicitly, or let
+    // the last Sender drop naturally close the channels.
 }
 
 #[cfg(feature = "cuda")]

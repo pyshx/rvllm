@@ -2858,6 +2858,7 @@ dependencies = [
  "tempfile",
  "tokenizers",
  "tokio",
+ "tokio-stream",
  "tracing",
  "tracing-subscriber",
 ]
