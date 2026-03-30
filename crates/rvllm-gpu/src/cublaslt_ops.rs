@@ -4,7 +4,7 @@
 //! shapes (small M, large N/K) common in the decode path, thanks to automatic
 //! split-K heuristics and a larger algorithm search space.
 
-use cudarc::cublaslt::{CudaBlasLT, Matmul, MatmulConfig};
+use cudarc::cublaslt::{CudaBlasLT, Matmul, MatmulConfig, MatmulShared};
 use cudarc::cublaslt::sys as lt_sys;
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use half::f16;
@@ -32,6 +32,11 @@ impl CublasLtOps {
 
     pub fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
+    }
+
+    /// Raw cublasLt handle for autotuning.
+    pub fn handle(&self) -> &lt_sys::cublasLtHandle_t {
+        self.handle.handle()
     }
 
     /// Row-major HGEMM via cublasLt: `C[m,n] = alpha * A[m,k] @ B^T[k,n] + beta * C[m,n]`

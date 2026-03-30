@@ -731,20 +731,21 @@ mod inner {
             // - No extra transpose kernel
             // - Each GEMM writes directly to its slice
             let mut qkv = {
-                let mut qkv_buf = unsafe { self.stream.alloc::<f16>(num_tokens * qkv_dim) }
-                    .map_err(|e| LLMError::GpuError(format!("qkv alloc: {e}")))?;
-                let q_end_t = num_tokens * q_dim;
-                let k_end_t = q_end_t + num_tokens * kv_dim;
                 if let Some(fused_qkv) = weights.fused_qkv {
-                    // Single fused GEMM [N, qkv_dim] -- weight is [Q;K;V] concatenated
-                    // Output is already [Q|K|V] contiguous, no transpose needed
-                    Self::hgemm_dispatch_into(blas, lt, &normed, fused_qkv, num_tokens, qkv_dim, hidden, &mut qkv_buf.slice_mut(..))?;
+                    // Single fused GEMM [N, qkv_dim] -- FP8 when available, f16 fallback
+                    Self::hgemm_dispatch_fp8(&self.stream, blas, lt, &normed, fused_qkv,
+                        num_tokens, qkv_dim, hidden, &self.loader,
+                        weights.fused_qkv_fp8, None)?
                 } else {
+                    let mut qkv_buf = unsafe { self.stream.alloc::<f16>(num_tokens * qkv_dim) }
+                        .map_err(|e| LLMError::GpuError(format!("qkv alloc: {e}")))?;
+                    let q_end_t = num_tokens * q_dim;
+                    let k_end_t = q_end_t + num_tokens * kv_dim;
                     { let mut d = qkv_buf.slice_mut(..q_end_t); Self::hgemm_dispatch_into(blas, lt, &normed, weights.q_proj, num_tokens, q_dim, hidden, &mut d)?; }
                     { let mut d = qkv_buf.slice_mut(q_end_t..k_end_t); Self::hgemm_dispatch_into(blas, lt, &normed, weights.k_proj, num_tokens, kv_dim, hidden, &mut d)?; }
                     { let mut d = qkv_buf.slice_mut(k_end_t..); Self::hgemm_dispatch_into(blas, lt, &normed, weights.v_proj, num_tokens, kv_dim, hidden, &mut d)?; }
+                    qkv_buf
                 }
-                qkv_buf
             };
 
             // 3. QKV bias -- single broadcast kernel for all of [Q|K|V] at once
@@ -806,17 +807,20 @@ mod inner {
 
             if dbg { dbg_dump("attn_out", &attn_out, &self.stream); }
 
-            // 7. O projection (T>1 prefill path)
-            let attn_proj = Self::hgemm_dispatch(&self.stream, blas, lt, &attn_out, weights.o_proj, num_tokens, hidden, q_dim, &self.loader)?;
+            // 7. O projection (T>1 path) -- FP8 when available
+            let attn_proj = Self::hgemm_dispatch_fp8(&self.stream, blas, lt, &attn_out, weights.o_proj,
+                num_tokens, hidden, q_dim, &self.loader, weights.o_proj_fp8, None)?;
 
             // 8-10. Post-attention MLP (T>1 prefill only, separate kernels)
             let (normed2, residual) = Self::fused_residual_rmsnorm_f16(
                 &self.stream, &self.loader, residual_ref, &attn_proj, post_norm_w,
                 cfg.rms_norm_eps, num_tokens, hidden)?;
             // Gate+up: fused GEMM + interleaved silu_mul for all N when available
+            // FP8 weights used when available via hgemm_dispatch_fp8
             let fused_act = if let Some(fused_gate_up) = weights.fused_gate_up {
                 let gate_up_dim = intermediate * 2;
-                let gu_interleaved = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, fused_gate_up, num_tokens, gate_up_dim, hidden, &self.loader)?;
+                let gu_interleaved = Self::hgemm_dispatch_fp8(&self.stream, blas, lt, &normed2, fused_gate_up,
+                    num_tokens, gate_up_dim, hidden, &self.loader, weights.fused_gate_up_fp8, None)?;
                 // Direct silu_mul on interleaved layout: 1 kernel, no transpose/copy
                 if let Ok(ref silu_fn) = self.loader.get_func("silu_mul_interleaved", "silu_mul_interleaved_f16_kernel") {
                     let n_elems = num_tokens * intermediate;
@@ -832,7 +836,7 @@ mod inner {
                     }
                     fused_out
                 } else {
-                    // Fallback: 2 separate GEMMs
+                    // Fallback: 2 separate GEMMs (no FP8 for individual gate/up)
                     let gate = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.gate_proj, num_tokens, intermediate, hidden, &self.loader)?;
                     let up = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.up_proj, num_tokens, intermediate, hidden, &self.loader)?;
                     Self::fused_silu_mul_f16(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?
@@ -842,7 +846,8 @@ mod inner {
                 let up = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.up_proj, num_tokens, intermediate, hidden, &self.loader)?;
                 Self::fused_silu_mul_f16(&self.stream, &self.loader, &gate, &up, num_tokens * intermediate)?
             };
-            let mlp_out = Self::hgemm_dispatch(&self.stream, blas, lt, &fused_act, weights.down_proj, num_tokens, hidden, intermediate, &self.loader)?;
+            let mlp_out = Self::hgemm_dispatch_fp8(&self.stream, blas, lt, &fused_act, weights.down_proj,
+                num_tokens, hidden, intermediate, &self.loader, weights.down_proj_fp8, None)?;
             Ok((residual, mlp_out))
         }
 
@@ -950,8 +955,8 @@ mod inner {
             Self::hgemm_dispatch_fp8(stream, blas, lt, input, weight, m, n, k, loader, None, None)
         }
 
-        /// hgemm dispatch with optional FP8 weights. When fp8_weight + fp8_input_scratch
-        /// are provided and M=1, uses cublasLt FP8 GEMM (1.5-1.9x faster on H100).
+        /// hgemm dispatch with optional FP8 weights. When fp8_weight is provided and
+        /// cublasLt is available, uses FP8 GEMM for any M (1.5-1.9x faster on H100).
         fn hgemm_dispatch_fp8(
             stream: &Arc<CudaStream>,
             blas: &CublasHandle,
@@ -963,34 +968,38 @@ mod inner {
             k: usize,
             loader: &KernelLoader,
             fp8_weight: Option<&CudaSlice<u8>>,
-            fp8_input_scratch: Option<&mut CudaSlice<u8>>,
+            _fp8_input_scratch: Option<&mut CudaSlice<u8>>,
         ) -> Result<CudaSlice<f16>> {
             let mut output = unsafe { stream.alloc::<f16>(m * n) }
                 .map_err(|e| LLMError::GpuError(format!("hgemm_dispatch: {e}")))?;
 
-            // M=1 + FP8 weights: cast input f16->fp8, then cublasLt FP8 GEMM
+            // FP8 weights available: cast input f16->fp8, then cublasLt FP8 GEMM
+            // Works for any M (M=1 decode, M>1 batched decode)
             #[cfg(feature = "cublaslt")]
-            if m == 1 {
-                if let (Some(w_fp8), Some(in_scratch), Some(lt_ops)) = (fp8_weight, fp8_input_scratch, lt) {
-                    // Cast input f16 -> fp8
-                    if let Ok(cast_kernel) = loader.get_func("cast_f16_to_fp8", "cast_f16_to_fp8_kernel") {
-                        let cast_cfg = LaunchConfig {
-                            grid_dim: (((k + 255) / 256) as u32, 1, 1),
-                            block_dim: (256, 1, 1),
-                            shared_mem_bytes: 0,
-                        };
-                        unsafe {
-                            stream.launch_builder(&cast_kernel)
-                                .arg(in_scratch)
-                                .arg(input)
-                                .arg(&(k as i32))
-                                .launch(cast_cfg)
-                                .map_err(|e| LLMError::GpuError(format!("cast f16->fp8: {e}")))?;
-                        }
-                        // FP8 GEMM via cublasLt raw API
-                        lt_ops.fp8_gemm_a_bt(m, n, k, in_scratch, w_fp8, &mut output)?;
-                        return Ok(output);
+            if let (Some(w_fp8), Some(lt_ops)) = (fp8_weight, lt) {
+                if let Ok(cast_kernel) = loader.get_func("cast_f16_to_fp8", "cast_f16_to_fp8_kernel") {
+                    // Cast input [m, k] f16 -> fp8
+                    let total_elems = m * k;
+                    let mut fp8_input_buf = unsafe { stream.alloc::<u8>(total_elems) }
+                        .map_err(|e| LLMError::GpuError(format!("fp8 input alloc: {e}")))?;
+                    let cast_cfg = LaunchConfig {
+                        grid_dim: (((total_elems + 255) / 256) as u32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let (fp8_in_ptr, _ig) = DevicePtrMut::device_ptr_mut(&mut fp8_input_buf, stream);
+                    let (input_ptr, _ipg) = DevicePtr::device_ptr(input, stream);
+                    unsafe {
+                        stream.launch_builder(&cast_kernel)
+                            .arg(&fp8_in_ptr).arg(&input_ptr).arg(&(total_elems as i32))
+                            .launch(cast_cfg)
+                            .map_err(|e| LLMError::GpuError(format!("cast f16->fp8: {e}")))?;
                     }
+                    // FP8 GEMM via cublasLt raw API
+                    let (w_ptr, _wg) = DevicePtr::device_ptr(w_fp8, stream);
+                    let (out_ptr, _og) = DevicePtrMut::device_ptr_mut(&mut output, stream);
+                    lt_ops.fp8_gemm_a_bt_raw(m, n, k, fp8_in_ptr, w_ptr, out_ptr)?;
+                    return Ok(output);
                 }
             }
 

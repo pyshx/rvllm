@@ -4,5 +4,6 @@ pub mod compiler;
 pub mod dispatch;
 pub mod ir;
 pub mod jit;
+pub mod llvm_backend;
 pub mod matcher;
 pub mod verify;

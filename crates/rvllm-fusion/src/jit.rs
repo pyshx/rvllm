@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
+use crate::ir::FusedKernel;
+use crate::llvm_backend::LlvmPtxCompiler;
+
 // ---------------------------------------------------------------------------
 // Error
 // ---------------------------------------------------------------------------
@@ -209,6 +212,67 @@ impl JitCompiler {
         }
 
         Err(JitError::NvccNotFound)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LLVM-based compilation (no nvcc dependency)
+// ---------------------------------------------------------------------------
+
+impl JitCompiler {
+    /// Compile a fused kernel to PTX via the LLVM NVPTX backend.
+    /// Falls back to nvcc-based compilation if LLVM compilation fails.
+    pub fn compile_via_llvm(
+        &self,
+        kernel: &FusedKernel,
+        hidden: usize,
+        out_dim: usize,
+        eps: f32,
+    ) -> Result<Vec<u8>> {
+        let t0 = Instant::now();
+        let compiler = LlvmPtxCompiler::new();
+        let func_name = LlvmPtxCompiler::kernel_function_name(kernel);
+
+        match compiler.compile_fused_kernel(kernel, hidden, out_dim, eps, &self.cuda_arch) {
+            Ok(ptx) => {
+                let elapsed = t0.elapsed();
+                tracing::info!(
+                    "LLVM compiled '{}' -> {} bytes PTX in {:.1}ms",
+                    func_name,
+                    ptx.len(),
+                    elapsed.as_secs_f64() * 1000.0
+                );
+                Ok(ptx)
+            }
+            Err(e) => {
+                tracing::warn!("LLVM compilation failed for '{}': {}, falling back to nvcc", func_name, e);
+                // Fall back to CUDA C codegen + nvcc
+                let cuda_src = crate::codegen::generate_cuda_source(kernel)
+                    .ok_or_else(|| JitError::CompilationFailed {
+                        stderr: format!("unsupported pattern for codegen fallback: {e}"),
+                        exit_code: None,
+                    })?;
+                let cuda_name = crate::codegen::kernel_function_name(kernel);
+                self.compile_to_ptx(&cuda_src, &cuda_name)
+            }
+        }
+    }
+
+    /// Compile via LLVM only, no nvcc fallback.
+    pub fn compile_via_llvm_only(
+        &self,
+        kernel: &FusedKernel,
+        hidden: usize,
+        out_dim: usize,
+        eps: f32,
+    ) -> Result<Vec<u8>> {
+        let compiler = LlvmPtxCompiler::new();
+        compiler
+            .compile_fused_kernel(kernel, hidden, out_dim, eps, &self.cuda_arch)
+            .map_err(|e| JitError::CompilationFailed {
+                stderr: e,
+                exit_code: None,
+            })
     }
 }
 

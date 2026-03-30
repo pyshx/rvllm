@@ -12,6 +12,8 @@ pub mod cublas;
 #[cfg(feature = "cuda")]
 pub mod cublas_ops;
 #[cfg(feature = "cublaslt")]
+pub mod cublas_autotune;
+#[cfg(feature = "cublaslt")]
 pub mod cublaslt_ops;
 #[cfg(feature = "cuda")]
 pub mod cuda_allocator;
@@ -46,6 +48,8 @@ pub mod prelude {
     pub use crate::cpu_buffer::CpuBuffer;
     #[cfg(feature = "cuda")]
     pub use crate::cublas::CublasHandle;
+    #[cfg(feature = "cublaslt")]
+    pub use crate::cublas_autotune::{CublasAutotuner, GemmDtype};
     #[cfg(feature = "cublaslt")]
     pub use crate::cublaslt_ops::{CublasLtOps, CUBLASLT_M_THRESHOLD};
     #[cfg(feature = "cuda")]
