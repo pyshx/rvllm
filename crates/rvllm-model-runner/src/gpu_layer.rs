@@ -114,6 +114,9 @@ mod inner {
         pub gate_up: &'a mut CudaSlice<f16>,
         pub silu_out: &'a mut CudaSlice<f16>,
         pub down: &'a mut CudaSlice<f16>,
+        /// When true, caller handles double-buffering. Forward returns None
+        /// and results stay in scratch.residual / scratch.down.
+        pub zero_copy: bool,
     }
 
     /// One complete GPU transformer layer.
@@ -169,7 +172,7 @@ mod inner {
             lt: Option<&crate::CublasLtRef>,
             scratch: Option<&mut LayerScratchRef<'_>>,
             cutlass: Option<&rvllm_gpu::cutlass_ffi::CutlassKernels>,
-        ) -> Result<(CudaSlice<f16>, CudaSlice<f16>)> {
+        ) -> Result<Option<(CudaSlice<f16>, CudaSlice<f16>)>> {
             let cfg = &self.config;
             let num_tokens = input.num_tokens;
             let hidden = cfg.hidden_size;
@@ -365,7 +368,7 @@ mod inner {
                     }
 
                     if profile { info!("PROFILE L0 path=persistent_kernel"); }
-                    return Ok((residual_out, mlp_out));
+                    return Ok(Some((residual_out, mlp_out)));
                 }
             }
 
@@ -527,7 +530,7 @@ mod inner {
                     drop((_fag, _dg));
 
                     if profile { info!("PROFILE L0 path=fp8_cublaslt"); }
-                    return Ok((residual, mlp_out));
+                    return Ok(Some((residual, mlp_out)));
                 }
             }
 
@@ -874,7 +877,7 @@ mod inner {
                     }
                 };
                 prof!("oproj+mlp");
-                return Ok((residual, mlp_out));
+                return Ok(Some((residual, mlp_out)));
             }
 
             // ================================================================
@@ -1143,7 +1146,11 @@ mod inner {
                 Self::hgemm_dispatch_fp8_into(&self.stream, blas, lt, &*s.silu_out, weights.down_proj,
                     num_tokens, hidden, intermediate, &self.loader, weights.down_proj_fp8, s.down)?;
 
-                // Clone scratch outputs into owned buffers for caller.
+                if s.zero_copy {
+                    // Double-buffered: results in s.residual/s.down, caller reads directly.
+                    return Ok(None);
+                }
+                // Legacy: clone into owned buffers for callers without double-buffering.
                 let mut residual_out = unsafe { self.stream.alloc::<f16>(num_tokens * hidden) }
                     .map_err(|e| LLMError::GpuError(format!("scratch residual clone: {e}")))?;
                 self.stream.memcpy_dtod(&s.residual.slice(..num_tokens * hidden), &mut residual_out)
@@ -1152,7 +1159,7 @@ mod inner {
                     .map_err(|e| LLMError::GpuError(format!("scratch mlp clone: {e}")))?;
                 self.stream.memcpy_dtod(&s.down.slice(..num_tokens * hidden), &mut mlp_out)
                     .map_err(|e| LLMError::GpuError(format!("scratch mlp dtod: {e}")))?;
-                return Ok((residual_out, mlp_out));
+                return Ok(Some((residual_out, mlp_out)));
             }
 
             // ================================================================
@@ -1400,7 +1407,7 @@ mod inner {
             };
             let mlp_out = Self::hgemm_dispatch_fp8(&self.stream, blas, lt, &fused_act, weights.down_proj,
                 num_tokens, hidden, intermediate, &self.loader, weights.down_proj_fp8, None)?;
-            Ok((residual, mlp_out))
+            Ok(Some((residual, mlp_out)))
         }
 
         // ===================================================================

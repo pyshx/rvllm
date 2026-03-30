@@ -95,14 +95,18 @@ mod cuda_impl {
     /// Pre-allocated f16 scratch buffers for the forward pass.
     /// Sized for max_batch_tokens. Reused across all layers (sequential execution).
     pub struct F16LayerScratch {
-        pub qkv: CudaSlice<f16>,      // [max_tokens * qkv_dim]
-        pub attn_out: CudaSlice<f16>, // [max_tokens * q_dim]
-        pub o_proj: CudaSlice<f16>,   // [max_tokens * hidden]
-        pub normed: CudaSlice<f16>,   // [max_tokens * hidden]
-        pub residual: CudaSlice<f16>, // [max_tokens * hidden]
-        pub gate_up: CudaSlice<f16>,  // [max_tokens * intermediate * 2]
-        pub silu_out: CudaSlice<f16>, // [max_tokens * intermediate]
-        pub down: CudaSlice<f16>,     // [max_tokens * hidden]
+        pub qkv: CudaSlice<f16>,          // [max_tokens * qkv_dim]
+        pub attn_out: CudaSlice<f16>,     // [max_tokens * q_dim]
+        pub o_proj: CudaSlice<f16>,       // [max_tokens * hidden]
+        pub normed: CudaSlice<f16>,       // [max_tokens * hidden]
+        pub gate_up: CudaSlice<f16>,      // [max_tokens * intermediate * 2]
+        pub silu_out: CudaSlice<f16>,     // [max_tokens * intermediate]
+        // Double-buffered: layer N writes to pair A, reads from pair B.
+        // Layer N+1 writes to pair B, reads from pair A. Zero alloc, zero copy.
+        pub residual_a: CudaSlice<f16>,   // [max_tokens * hidden]
+        pub down_a: CudaSlice<f16>,       // [max_tokens * hidden]
+        pub residual_b: CudaSlice<f16>,   // [max_tokens * hidden]
+        pub down_b: CudaSlice<f16>,       // [max_tokens * hidden]
     }
 
     /// Element offsets into the packed metadata GPU buffer.
@@ -525,10 +529,12 @@ mod cuda_impl {
                 attn_out: alloc(max_tokens * q_dim)?,
                 o_proj: alloc(max_tokens * hidden)?,
                 normed: alloc(max_tokens * hidden)?,
-                residual: alloc(max_tokens * hidden)?,
                 gate_up: alloc(max_tokens * intermediate * 2)?,
                 silu_out: alloc(max_tokens * intermediate)?,
-                down: alloc(max_tokens * hidden)?,
+                residual_a: alloc(max_tokens * hidden)?,
+                down_a: alloc(max_tokens * hidden)?,
+                residual_b: alloc(max_tokens * hidden)?,
+                down_b: alloc(max_tokens * hidden)?,
             };
 
             let total_bytes = (max_tokens * (qkv_dim + q_dim + hidden * 3 + intermediate * 3)) * 2;
@@ -605,10 +611,51 @@ mod cuda_impl {
             let use_scratch = num_tokens > 1 && !is_prefill;
             let mut scratch_borrow = self.f16_scratch.borrow_mut();
             let mut prev_mlp_out: Option<CudaSlice<f16>> = None;
+
+            // For scratch double-buffering: copy embedding into residual_a so the
+            // first layer can read from it while writing to residual_b.
+            if use_scratch {
+                if let Some(ref mut s) = *scratch_borrow {
+                    self.stream.memcpy_dtod(&hidden_f16, &mut s.residual_a.slice_mut(..num_tokens * hidden_size))
+                        .map_err(|e| LLMError::GpuError(format!("embed->scratch: {e}")))?;
+                }
+            }
+
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let (key_cache, value_cache) = &gpu_cache[layer_idx];
+
+                // Double-buffer: even layers write A read B, odd write B read A.
+                // For the first layer (0), hidden_states comes from residual_a (embedding copy above),
+                // prev_mlp_out is None. Layer writes to residual_b/down_b.
+                // Layer 1 reads residual_b/down_b, writes to residual_a/down_a. Etc.
+                let use_double_buf = use_scratch && scratch_borrow.is_some();
+                let (scratch_ref_opt, hs_ref, pmo_ref): (Option<LayerScratchRef<'_>>, &CudaSlice<f16>, Option<&CudaSlice<f16>>) = if use_double_buf {
+                    let s = scratch_borrow.as_mut().unwrap();
+                    let even = layer_idx % 2 == 0;
+                    // Write targets (residual/down) and read sources alternate
+                    let (write_res, write_down, read_res, read_down) = if even {
+                        (&mut s.residual_b, &mut s.down_b, &s.residual_a, &s.down_a)
+                    } else {
+                        (&mut s.residual_a, &mut s.down_a, &s.residual_b, &s.down_b)
+                    };
+                    let pmo = if layer_idx > 0 { Some(read_down as &CudaSlice<f16>) } else { None };
+                    (Some(LayerScratchRef {
+                        normed: &mut s.normed,
+                        residual: write_res,
+                        qkv: &mut s.qkv,
+                        attn_out: &mut s.attn_out,
+                        o_proj: &mut s.o_proj,
+                        gate_up: &mut s.gate_up,
+                        silu_out: &mut s.silu_out,
+                        down: write_down,
+                        zero_copy: true,
+                    }), read_res as &CudaSlice<f16>, pmo)
+                } else {
+                    (None, &hidden_f16 as &CudaSlice<f16>, prev_mlp_out.as_ref())
+                };
+
                 let input = GpuLayerInput {
-                    hidden_states: &hidden_f16,
+                    hidden_states: hs_ref,
                     positions: packed_buf.slice(offsets.positions..offsets.positions + offsets.num_positions),
                     key_cache,
                     value_cache,
@@ -630,23 +677,17 @@ mod cuda_impl {
                     fp8_input_scratch_len: self.fp8_input_scratch.as_ref().map_or(0, |s| s.len()),
                 };
                 let weights = self.layer_weights(layer_idx)?;
-                let mut scratch_ref = if use_scratch {
-                    scratch_borrow.as_mut().map(|s| LayerScratchRef {
-                        normed: &mut s.normed,
-                        residual: &mut s.residual,
-                        qkv: &mut s.qkv,
-                        attn_out: &mut s.attn_out,
-                        o_proj: &mut s.o_proj,
-                        gate_up: &mut s.gate_up,
-                        silu_out: &mut s.silu_out,
-                        down: &mut s.down,
-                    })
-                } else {
-                    None
-                };
-                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), scratch_ref.as_mut(), self.cutlass.as_deref())?;
-                hidden_f16 = residual;
-                prev_mlp_out = Some(mlp_out);
+                let mut scratch_ref = scratch_ref_opt;
+                let result = layer.forward(&input, &weights, &self.blas,
+                    if use_double_buf { pmo_ref } else { prev_mlp_out.as_ref() },
+                    self.cublaslt_ref(), scratch_ref.as_mut(), self.cutlass.as_deref())?;
+                if let Some((residual, mlp_out)) = result {
+                    // Non-scratch path: take ownership
+                    hidden_f16 = residual;
+                    prev_mlp_out = Some(mlp_out);
+                }
+                // Scratch path (None): results are in s.residual/s.down,
+                // next iteration reads them via the double-buffer swap.
 
                 if debug_fwd && (layer_idx < 3 || layer_idx == num_layers - 1) {
                     let vals: Vec<f16> = self.stream.clone_dtoh(&hidden_f16)
@@ -663,6 +704,29 @@ mod cuda_impl {
                     let mnan = mvals.iter().any(|v| v.to_f32().is_nan());
                     let mmax = mvals.iter().map(|v| v.to_f32().abs()).fold(0.0f32, f32::max);
                     info!("DEBUG layer {layer_idx} mlp_out: first5={mfirst5:?} nan={mnan} max={mmax}");
+                }
+            }
+
+            // Double-buffer: extract final layer results from scratch (1 copy at end, not 28)
+            if use_scratch {
+                if let Some(ref s) = *scratch_borrow {
+                    let last_even = (num_layers - 1) % 2 == 0;
+                    let (res_src, down_src) = if last_even {
+                        (&s.residual_b, &s.down_b)
+                    } else {
+                        (&s.residual_a, &s.down_a)
+                    };
+                    let n = num_tokens * hidden_size;
+                    let mut res_out = unsafe { self.stream.alloc::<f16>(n) }
+                        .map_err(|e| LLMError::GpuError(format!("final res: {e}")))?;
+                    self.stream.memcpy_dtod(&res_src.slice(..n), &mut res_out)
+                        .map_err(|e| LLMError::GpuError(format!("final res dtod: {e}")))?;
+                    hidden_f16 = res_out;
+                    let mut down_out = unsafe { self.stream.alloc::<f16>(n) }
+                        .map_err(|e| LLMError::GpuError(format!("final mlp: {e}")))?;
+                    self.stream.memcpy_dtod(&down_src.slice(..n), &mut down_out)
+                        .map_err(|e| LLMError::GpuError(format!("final mlp dtod: {e}")))?;
+                    prev_mlp_out = Some(down_out);
                 }
             }
             drop(scratch_borrow);
@@ -795,7 +859,8 @@ mod cuda_impl {
                     fp8_input_scratch_len: self.fp8_input_scratch.as_ref().map_or(0, |s| s.len()),
                 };
                 let weights = self.layer_weights(layer_idx)?;
-                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), None, self.cutlass.as_deref())?;
+                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), None, self.cutlass.as_deref())?
+                    .expect("non-scratch forward must return data");
                 hidden_f16 = residual;
                 prev_mlp_out = Some(mlp_out);
             }
@@ -997,18 +1062,20 @@ mod cuda_impl {
                 let mut scratch_ref = if use_scratch {
                     scratch_borrow.as_mut().map(|s| LayerScratchRef {
                         normed: &mut s.normed,
-                        residual: &mut s.residual,
+                        residual: &mut s.residual_a,
                         qkv: &mut s.qkv,
                         attn_out: &mut s.attn_out,
                         o_proj: &mut s.o_proj,
                         gate_up: &mut s.gate_up,
                         silu_out: &mut s.silu_out,
-                        down: &mut s.down,
+                        down: &mut s.down_a,
+                        zero_copy: false,
                     })
                 } else {
                     None
                 };
-                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), scratch_ref.as_mut(), self.cutlass.as_deref())?;
+                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), scratch_ref.as_mut(), self.cutlass.as_deref())?
+                    .expect("non-zero-copy scratch must return data");
                 hidden_f16 = residual;
                 prev_mlp_out = Some(mlp_out);
             }
@@ -1163,18 +1230,20 @@ mod cuda_impl {
                 let mut scratch_ref = if use_scratch {
                     scratch_borrow.as_mut().map(|s| LayerScratchRef {
                         normed: &mut s.normed,
-                        residual: &mut s.residual,
+                        residual: &mut s.residual_a,
                         qkv: &mut s.qkv,
                         attn_out: &mut s.attn_out,
                         o_proj: &mut s.o_proj,
                         gate_up: &mut s.gate_up,
                         silu_out: &mut s.silu_out,
-                        down: &mut s.down,
+                        down: &mut s.down_a,
+                        zero_copy: false,
                     })
                 } else {
                     None
                 };
-                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), scratch_ref.as_mut(), self.cutlass.as_deref())?;
+                let (residual, mlp_out) = layer.forward(&input, &weights, &self.blas, prev_mlp_out.as_ref(), self.cublaslt_ref(), scratch_ref.as_mut(), self.cutlass.as_deref())?
+                    .expect("non-zero-copy scratch must return data");
                 hidden_f16 = residual;
                 prev_mlp_out = Some(mlp_out);
             }
