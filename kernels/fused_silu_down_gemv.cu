@@ -13,6 +13,7 @@
 //   Shared memory: RPB * sizeof(float) = 32 bytes
 
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 #define CUTE_SILU_THREADS 256
 #define CUTE_SILU_RPB 8
@@ -84,6 +85,84 @@ fused_cute_silu_down_gemv(
     acc = warp_reduce_sum_csg(acc);
 
     // Lane 0 of each warp writes the result
+    if (lane_id == 0) {
+        output[row] = __float2half(acc);
+    }
+}
+
+// --------------------------------------------------------------------------
+// FP8 variant: weights stored as E4M3 bytes with per-row scale
+// --------------------------------------------------------------------------
+extern "C"
+__global__ void __launch_bounds__(CUTE_SILU_THREADS)
+fused_cute_silu_down_fp8_gemv(
+    __half* __restrict__ output,
+    const __half* __restrict__ gate,
+    const __half* __restrict__ up,
+    const unsigned char* __restrict__ weight,
+    const __half* __restrict__ weight_scale,
+    int hidden_size,
+    int intermediate_size
+) {
+    const int base_row = blockIdx.x * CUTE_SILU_RPB;
+    const int warp_id = threadIdx.x / CUTE_SILU_WARP_SIZE;
+    const int lane_id = threadIdx.x % CUTE_SILU_WARP_SIZE;
+    const int row = base_row + warp_id;
+
+    if (row >= hidden_size) return;
+
+    const unsigned char* w_row = weight + (long long)row * intermediate_size;
+    float row_sc = __half2float(weight_scale[row]);
+    float acc = 0.0f;
+
+    // 4-wide byte loads for coalescing
+    const int k4 = intermediate_size / 4;
+    const half2* gate2 = (const half2*)gate;
+    const half2* up2   = (const half2*)up;
+
+    for (int i = lane_id; i < k4; i += CUTE_SILU_WARP_SIZE) {
+        int base = i * 4;
+        unsigned int packed = *reinterpret_cast<const unsigned int*>(w_row + base);
+        unsigned char b0 = packed & 0xFF;
+        unsigned char b1 = (packed >> 8) & 0xFF;
+        unsigned char b2 = (packed >> 16) & 0xFF;
+        unsigned char b3 = (packed >> 24) & 0xFF;
+        float w0 = float(*reinterpret_cast<const __nv_fp8_e4m3*>(&b0)) * row_sc;
+        float w1 = float(*reinterpret_cast<const __nv_fp8_e4m3*>(&b1)) * row_sc;
+        float w2 = float(*reinterpret_cast<const __nv_fp8_e4m3*>(&b2)) * row_sc;
+        float w3 = float(*reinterpret_cast<const __nv_fp8_e4m3*>(&b3)) * row_sc;
+
+        // base/2 gives the half2 index for the pair (base, base+1)
+        half2 g01 = gate2[base / 2];
+        half2 g23 = gate2[base / 2 + 1];
+        half2 u01 = up2[base / 2];
+        half2 u23 = up2[base / 2 + 1];
+
+        float g0 = __half2float(g01.x);
+        float g1 = __half2float(g01.y);
+        float g2 = __half2float(g23.x);
+        float g3 = __half2float(g23.y);
+        float u0 = __half2float(u01.x);
+        float u1 = __half2float(u01.y);
+        float u2 = __half2float(u23.x);
+        float u3 = __half2float(u23.y);
+
+        acc += silu_f32_csg(g0) * u0 * w0;
+        acc += silu_f32_csg(g1) * u1 * w1;
+        acc += silu_f32_csg(g2) * u2 * w2;
+        acc += silu_f32_csg(g3) * u3 * w3;
+    }
+
+    // Handle remaining elements
+    for (int i = k4 * 4 + lane_id; i < intermediate_size; i += CUTE_SILU_WARP_SIZE) {
+        unsigned char b = w_row[i];
+        float w = float(*reinterpret_cast<const __nv_fp8_e4m3*>(&b)) * row_sc;
+        float g = __half2float(gate[i]);
+        acc += silu_f32_csg(g) * __half2float(up[i]) * w;
+    }
+
+    acc = warp_reduce_sum_csg(acc);
+
     if (lane_id == 0) {
         output[row] = __float2half(acc);
     }

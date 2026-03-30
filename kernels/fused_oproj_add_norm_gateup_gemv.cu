@@ -17,6 +17,7 @@
 //   Shared mem: hidden_size * sizeof(float) + 8 * sizeof(float)
 
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 #define THREADS 256
 #define RPB 8
@@ -200,5 +201,165 @@ fused_cute_oproj_add_norm_gateup_gemv(
             }
         }
         __syncthreads();
+    }
+}
+
+// --------------------------------------------------------------------------
+// FP8 variant: both o_weight and gateup_weight are E4M3 with per-row scales
+// --------------------------------------------------------------------------
+extern "C"
+__global__ void __launch_bounds__(THREADS)
+fused_cute_oproj_add_norm_gateup_fp8_gemv(
+    __half* __restrict__ gate_up_out,
+    __half* __restrict__ residual_out,
+    const __half* __restrict__ attn_out,
+    const unsigned char* __restrict__ o_weight,
+    const __half* __restrict__ o_weight_scale,
+    const __half* __restrict__ residual,
+    const __half* __restrict__ norm_weight,
+    const unsigned char* __restrict__ gateup_weight,
+    const __half* __restrict__ gateup_weight_scale,
+    float eps,
+    int q_dim,
+    int hidden_size,
+    int gate_up_dim
+) {
+    const int block_row_base = blockIdx.x * RPB;
+    if (block_row_base >= gate_up_dim) return;
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+    constexpr int NUM_WARPS = THREADS / 32;
+
+    extern __shared__ float smem[];
+    float* s_hidden = smem;
+    float* s_warp   = smem + hidden_size;
+
+    // ---- Phase 1: O-projection GEMV with FP8 weights ----
+    const int q4 = q_dim / 4;
+
+    for (int h = 0; h < hidden_size; h++) {
+        const unsigned char* ow_row = o_weight + (long long)h * q_dim;
+        float o_sc = __half2float(o_weight_scale[h]);
+        float acc = 0.0f;
+
+        for (int i = tid; i < q4; i += THREADS) {
+            int base = i * 4;
+            unsigned int packed = *reinterpret_cast<const unsigned int*>(ow_row + base);
+            unsigned char b0 = packed & 0xFF;
+            unsigned char b1 = (packed >> 8) & 0xFF;
+            unsigned char b2 = (packed >> 16) & 0xFF;
+            unsigned char b3 = (packed >> 24) & 0xFF;
+            float w0 = float(*reinterpret_cast<const __nv_fp8_e4m3*>(&b0)) * o_sc;
+            float w1 = float(*reinterpret_cast<const __nv_fp8_e4m3*>(&b1)) * o_sc;
+            float w2 = float(*reinterpret_cast<const __nv_fp8_e4m3*>(&b2)) * o_sc;
+            float w3 = float(*reinterpret_cast<const __nv_fp8_e4m3*>(&b3)) * o_sc;
+            acc += __half2float(attn_out[base])     * w0
+                 + __half2float(attn_out[base + 1]) * w1
+                 + __half2float(attn_out[base + 2]) * w2
+                 + __half2float(attn_out[base + 3]) * w3;
+        }
+        for (int i = q4 * 4 + tid; i < q_dim; i += THREADS) {
+            unsigned char b = ow_row[i];
+            float w = float(*reinterpret_cast<const __nv_fp8_e4m3*>(&b)) * o_sc;
+            acc += __half2float(attn_out[i]) * w;
+        }
+
+        acc = warp_reduce_sum_opag(acc);
+        if (lane_id == 0) s_warp[warp_id] = acc;
+        __syncthreads();
+
+        if (warp_id == 0) {
+            float val = (lane_id < NUM_WARPS) ? s_warp[lane_id] : 0.0f;
+            val = warp_reduce_sum_opag(val);
+            if (lane_id == 0) {
+                s_hidden[h] = val;
+            }
+        }
+        if (h + 1 < hidden_size) __syncthreads();
+    }
+    __syncthreads();
+
+    // ---- Phase 2: Residual add + RMSNorm (unchanged) ----
+    const int h2 = hidden_size / 2;
+    const half2* res2 = (const half2*)residual;
+
+    float local_ss = 0.0f;
+    for (int i = tid; i < h2; i += THREADS) {
+        half2 r = res2[i];
+        float v0 = s_hidden[i * 2]     + __half2float(r.x);
+        float v1 = s_hidden[i * 2 + 1] + __half2float(r.y);
+        s_hidden[i * 2]     = v0;
+        s_hidden[i * 2 + 1] = v1;
+        local_ss += v0 * v0 + v1 * v1;
+    }
+    if ((hidden_size & 1) && tid == 0) {
+        int last = hidden_size - 1;
+        float v = s_hidden[last] + __half2float(residual[last]);
+        s_hidden[last] = v;
+        local_ss += v * v;
+    }
+
+    local_ss = warp_reduce_sum_opag(local_ss);
+    if (lane_id == 0) s_warp[warp_id] = local_ss;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float val = (lane_id < NUM_WARPS) ? s_warp[lane_id] : 0.0f;
+        val = warp_reduce_sum_opag(val);
+        if (lane_id == 0) {
+            s_warp[0] = rsqrtf(val / (float)hidden_size + eps);
+        }
+    }
+    __syncthreads();
+
+    float rms_scale = s_warp[0];
+
+    if (blockIdx.x == 0) {
+        for (int i = tid; i < hidden_size; i += THREADS) {
+            residual_out[i] = __float2half(s_hidden[i]);
+        }
+    }
+
+    for (int i = tid; i < hidden_size; i += THREADS) {
+        s_hidden[i] = s_hidden[i] * __half2float(norm_weight[i]) * rms_scale;
+    }
+    __syncthreads();
+
+    // ---- Phase 3: gate_up GEMV with FP8 weights -- warp-per-row ----
+    {
+        const int row = block_row_base + warp_id;
+        if (row < gate_up_dim) {
+            const unsigned char* w_row = gateup_weight + (long long)row * hidden_size;
+            float gu_sc = __half2float(gateup_weight_scale[row]);
+            float acc = 0.0f;
+            const int h4 = hidden_size / 4;
+            for (int i = lane_id; i < h4; i += 32) {
+                int base = i * 4;
+                unsigned int packed = *reinterpret_cast<const unsigned int*>(w_row + base);
+                unsigned char b0 = packed & 0xFF;
+                unsigned char b1 = (packed >> 8) & 0xFF;
+                unsigned char b2 = (packed >> 16) & 0xFF;
+                unsigned char b3 = (packed >> 24) & 0xFF;
+                float w0 = float(*reinterpret_cast<const __nv_fp8_e4m3*>(&b0)) * gu_sc;
+                float w1 = float(*reinterpret_cast<const __nv_fp8_e4m3*>(&b1)) * gu_sc;
+                float w2 = float(*reinterpret_cast<const __nv_fp8_e4m3*>(&b2)) * gu_sc;
+                float w3 = float(*reinterpret_cast<const __nv_fp8_e4m3*>(&b3)) * gu_sc;
+                acc += w0 * s_hidden[base]
+                     + w1 * s_hidden[base + 1]
+                     + w2 * s_hidden[base + 2]
+                     + w3 * s_hidden[base + 3];
+            }
+            for (int i = h4 * 4 + lane_id; i < hidden_size; i += 32) {
+                unsigned char b = w_row[i];
+                float w = float(*reinterpret_cast<const __nv_fp8_e4m3*>(&b)) * gu_sc;
+                acc += w * s_hidden[i];
+            }
+            acc = warp_reduce_sum_opag(acc);
+            if (lane_id == 0) {
+                gate_up_out[row] = __float2half(acc);
+            }
+        }
     }
 }

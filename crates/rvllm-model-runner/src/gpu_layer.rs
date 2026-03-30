@@ -54,6 +54,12 @@ mod inner {
         // Present when RVLLM_FP8_WEIGHTS=1.
         pub fused_qkv_fp8: Option<&'a CudaSlice<u8>>,
         pub fused_qkv_fp8_scale: Option<&'a CudaSlice<f16>>,
+        pub o_proj_fp8: Option<&'a CudaSlice<u8>>,
+        pub o_proj_fp8_scale: Option<&'a CudaSlice<f16>>,
+        pub fused_gate_up_fp8: Option<&'a CudaSlice<u8>>,
+        pub fused_gate_up_fp8_scale: Option<&'a CudaSlice<f16>>,
+        pub down_proj_fp8: Option<&'a CudaSlice<u8>>,
+        pub down_proj_fp8_scale: Option<&'a CudaSlice<f16>>,
     }
 
     /// Metadata needed for a single layer forward pass.
@@ -361,11 +367,73 @@ mod inner {
                     1, input.num_seqs, num_heads, num_kv_heads, head_dim,
                     input.max_context_len, input.block_size)?;
 
-                // --- Steps 7-10: Try mega-fused O-proj+add+norm+gateup, fall back to separate ---
+                // --- Steps 7-10: Try FP8 mega, then f16 mega, then separate ---
                 let (residual, mlp_out) = {
-                    let mega_ok = self.loader.get_func("fused_oproj_add_norm_gateup_gemv", "fused_cute_oproj_add_norm_gateup_gemv").ok();
                     let fused_gate_up_w = weights.fused_gate_up.unwrap_or(weights.gate_proj);
-                    if let Some(ref mk) = mega_ok {
+                    // FP8 mega kernel: O-proj + add + norm + gateup, both weights FP8
+                    if let (Some(o_fp8), Some(o_sc), Some(gu_fp8), Some(gu_sc), Ok(ref mk)) = (
+                        weights.o_proj_fp8, weights.o_proj_fp8_scale,
+                        weights.fused_gate_up_fp8, weights.fused_gate_up_fp8_scale,
+                        self.loader.get_func("fused_oproj_add_norm_gateup_gemv", "fused_cute_oproj_add_norm_gateup_fp8_gemv"),
+                    ) {
+                        let gate_up_dim = intermediate * 2;
+                        let mut gate_up_out = unsafe { self.stream.alloc::<f16>(gate_up_dim) }
+                            .map_err(|e| LLMError::GpuError(format!("fp8 mega gateup alloc: {e}")))?;
+                        let mut residual_out2 = unsafe { self.stream.alloc::<f16>(hidden) }
+                            .map_err(|e| LLMError::GpuError(format!("fp8 mega residual alloc: {e}")))?;
+                        let smem = (hidden * 4 + 8 * 4) as u32;
+                        let rpb = 8u32;
+                        if smem > 49152 {
+                            mk.set_attribute(cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32)
+                                .map_err(|e| LLMError::GpuError(format!("fp8 mega smem: {e}")))?;
+                        }
+                        unsafe {
+                            self.stream.launch_builder(mk)
+                                .arg(&mut gate_up_out).arg(&mut residual_out2)
+                                .arg(&attn_out)
+                                .arg(o_fp8).arg(o_sc)
+                                .arg(&residual_ref).arg(post_norm_w)
+                                .arg(gu_fp8).arg(gu_sc)
+                                .arg(&cfg.rms_norm_eps).arg(&(q_dim as i32)).arg(&(hidden as i32)).arg(&(gate_up_dim as i32))
+                                .launch(LaunchConfig { grid_dim: ((gate_up_dim as u32 + rpb - 1) / rpb, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: smem })
+                                .map_err(|e| LLMError::GpuError(format!("fp8 mega oproj_gateup: {e}")))?;
+                        }
+                        let gate = gate_up_out.slice(..intermediate);
+                        let up = gate_up_out.slice(intermediate..gate_up_dim);
+                        // FP8 silu+down
+                        let mlp = if let (Some(d_fp8), Some(d_sc), Ok(ref sk)) = (
+                            weights.down_proj_fp8, weights.down_proj_fp8_scale,
+                            self.loader.get_func("fused_silu_down_gemv", "fused_cute_silu_down_fp8_gemv"),
+                        ) {
+                            let mut down_out = unsafe { self.stream.alloc::<f16>(hidden) }
+                                .map_err(|e| LLMError::GpuError(format!("fp8 silu_down alloc: {e}")))?;
+                            unsafe {
+                                self.stream.launch_builder(sk)
+                                    .arg(&mut down_out).arg(&gate).arg(&up)
+                                    .arg(d_fp8).arg(d_sc)
+                                    .arg(&(hidden as i32)).arg(&(intermediate as i32))
+                                    .launch(LaunchConfig { grid_dim: (((hidden as u32) + 7) / 8, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: (8 * 4) as u32 })
+                                    .map_err(|e| LLMError::GpuError(format!("fp8 silu_down: {e}")))?;
+                            }
+                            down_out
+                        } else if let Ok(ref sk) = self.loader.get_func("fused_silu_down_gemv", "fused_cute_silu_down_gemv") {
+                            let mut down_out = unsafe { self.stream.alloc::<f16>(hidden) }
+                                .map_err(|e| LLMError::GpuError(format!("silu_down alloc: {e}")))?;
+                            unsafe {
+                                self.stream.launch_builder(sk)
+                                    .arg(&mut down_out).arg(&gate).arg(&up).arg(weights.down_proj)
+                                    .arg(&(hidden as i32)).arg(&(intermediate as i32))
+                                    .launch(LaunchConfig { grid_dim: (((hidden as u32) + 7) / 8, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: (8 * 4) as u32 })
+                                    .map_err(|e| LLMError::GpuError(format!("silu_down: {e}")))?;
+                            }
+                            down_out
+                        } else {
+                            let fused_act = Self::fused_silu_mul_f16_split(&self.stream, &self.loader, &gate_up_out, intermediate)?;
+                            Self::hgemm_dispatch(&self.stream, blas, lt, &fused_act, weights.down_proj, 1, hidden, intermediate, &self.loader)?
+                        };
+                        (residual_out2, mlp)
+                    // f16 mega kernel
+                    } else if let Some(ref mk) = self.loader.get_func("fused_oproj_add_norm_gateup_gemv", "fused_cute_oproj_add_norm_gateup_gemv").ok() {
                         // Mega kernel: O-proj + add + norm + gateup in one launch
                         let gate_up_dim = intermediate * 2;
                         let mut gate_up_out = unsafe { self.stream.alloc::<f16>(gate_up_dim) }

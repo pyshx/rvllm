@@ -109,19 +109,19 @@ static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
     ),
     (
         "fused_add_norm_qkv_gemv",
-        &["fused_cute_add_norm_qkv_gemv", "fused_cute_norm_qkv_gemv", "fused_cute_add_norm_qkv_bias_gemv", "fused_cute_norm_qkv_bias_gemv"],
+        &["fused_cute_add_norm_qkv_gemv", "fused_cute_norm_qkv_gemv", "fused_cute_add_norm_qkv_bias_gemv", "fused_cute_norm_qkv_bias_gemv", "fused_cute_add_norm_qkv_fp8_gemv", "fused_cute_norm_qkv_fp8_gemv", "fused_cute_add_norm_qkv_fp8_bias_gemv", "fused_cute_norm_qkv_fp8_bias_gemv"],
     ),
     (
         "fused_add_norm_gateup_gemv",
-        &["fused_cute_add_norm_gateup_gemv"],
+        &["fused_cute_add_norm_gateup_gemv", "fused_cute_add_norm_gateup_fp8_gemv"],
     ),
     (
         "fused_oproj_add_norm_gateup_gemv",
-        &["fused_cute_oproj_add_norm_gateup_gemv"],
+        &["fused_cute_oproj_add_norm_gateup_gemv", "fused_cute_oproj_add_norm_gateup_fp8_gemv"],
     ),
     (
         "fused_silu_down_gemv",
-        &["fused_cute_silu_down_gemv"],
+        &["fused_cute_silu_down_gemv", "fused_cute_silu_down_fp8_gemv"],
     ),
     (
         "persistent_layer_decode",
