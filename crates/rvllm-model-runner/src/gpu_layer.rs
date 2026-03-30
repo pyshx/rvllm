@@ -420,23 +420,24 @@ mod inner {
                             };
                             (residual_out2, mlp)
                         } else {
-                        let (normed2, residual2) = Self::fused_residual_rmsnorm_f16(
-                            &self.stream, &self.loader, &residual_ref, &attn_proj, post_norm_w,
-                            cfg.rms_norm_eps, 1, hidden)?;
-                        let gate_up = if let Some(fguw) = weights.fused_gate_up {
-                            Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, fguw, 1, intermediate * 2, hidden, &self.loader)?
-                        } else {
-                            let g = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.gate_proj, 1, intermediate, hidden, &self.loader)?;
-                            let u = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.up_proj, 1, intermediate, hidden, &self.loader)?;
-                            let mut buf = unsafe { self.stream.alloc::<f16>(intermediate * 2) }
-                                .map_err(|e| LLMError::GpuError(format!("concat: {e}")))?;
-                            self.stream.memcpy_dtod(&g, &mut buf.slice_mut(..intermediate)).map_err(|e| LLMError::GpuError(format!("g: {e}")))?;
-                            self.stream.memcpy_dtod(&u, &mut buf.slice_mut(intermediate..)).map_err(|e| LLMError::GpuError(format!("u: {e}")))?;
-                            buf
-                        };
-                        let fused_act = Self::fused_silu_mul_f16_split(&self.stream, &self.loader, &gate_up, intermediate)?;
-                        let mlp = Self::hgemm_dispatch(&self.stream, blas, lt, &fused_act, weights.down_proj, 1, hidden, intermediate, &self.loader)?;
-                        (residual2, mlp)
+                            let (normed2, residual2) = Self::fused_residual_rmsnorm_f16(
+                                &self.stream, &self.loader, &residual_ref, &attn_proj, post_norm_w,
+                                cfg.rms_norm_eps, 1, hidden)?;
+                            let gate_up = if let Some(fguw) = weights.fused_gate_up {
+                                Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, fguw, 1, intermediate * 2, hidden, &self.loader)?
+                            } else {
+                                let g = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.gate_proj, 1, intermediate, hidden, &self.loader)?;
+                                let u = Self::hgemm_dispatch(&self.stream, blas, lt, &normed2, weights.up_proj, 1, intermediate, hidden, &self.loader)?;
+                                let mut buf = unsafe { self.stream.alloc::<f16>(intermediate * 2) }
+                                    .map_err(|e| LLMError::GpuError(format!("concat: {e}")))?;
+                                self.stream.memcpy_dtod(&g, &mut buf.slice_mut(..intermediate)).map_err(|e| LLMError::GpuError(format!("g: {e}")))?;
+                                self.stream.memcpy_dtod(&u, &mut buf.slice_mut(intermediate..)).map_err(|e| LLMError::GpuError(format!("u: {e}")))?;
+                                buf
+                            };
+                            let fused_act = Self::fused_silu_mul_f16_split(&self.stream, &self.loader, &gate_up, intermediate)?;
+                            let mlp = Self::hgemm_dispatch(&self.stream, blas, lt, &fused_act, weights.down_proj, 1, hidden, intermediate, &self.loader)?;
+                            (residual2, mlp)
+                        }
                     }
                 };
                 return Ok((residual, mlp_out));
