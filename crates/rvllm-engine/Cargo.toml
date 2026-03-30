@@ -31,10 +31,11 @@ tracing.workspace = true
 async-trait.workspace = true
 rvllm-worker = { workspace = true, optional = true }
 rvllm-block-manager = { workspace = true, optional = true }
+rvllm-speculative = { workspace = true, optional = true }
 
 [features]
 default = []
-cuda = ["dep:cudarc", "dep:rvllm-worker", "dep:rvllm-block-manager", "rvllm-worker?/cuda"]
+cuda = ["dep:cudarc", "dep:rvllm-worker", "dep:rvllm-block-manager", "dep:rvllm-speculative", "rvllm-worker?/cuda"]
 cublaslt = ["cuda", "rvllm-worker?/cublaslt"]
 
 [dev-dependencies]

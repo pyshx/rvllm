@@ -115,28 +115,8 @@ pub fn quantize_weight_fp8(weights: &[f16], out_dim: usize, in_dim: usize) -> Fp
 #[cfg(feature = "cuda")]
 use cudarc::driver::{CudaSlice, CudaStream};
 
-/// Quantize f16 weights and upload FP8 data + scales to GPU.
-///
-/// Takes host-side f16 weight data (already read from safetensors),
-/// quantizes to FP8 on CPU, then uploads both buffers to the device.
-#[cfg(feature = "cuda")]
-pub fn quantize_and_upload_fp8(
-    stream: &CudaStream,
-    weights: &[f16],
-    out_dim: usize,
-    in_dim: usize,
-) -> crate::Result<(CudaSlice<u8>, CudaSlice<f16>)> {
-    let q = quantize_weight_fp8(weights, out_dim, in_dim);
-
-    let fp8_dev = stream
-        .clone_htod(&q.data)
-        .map_err(|e| crate::LLMError::GpuError(format!("FP8 weight upload: {e}")))?;
-    let scale_dev = stream
-        .clone_htod(&q.scales)
-        .map_err(|e| crate::LLMError::GpuError(format!("FP8 scale upload: {e}")))?;
-
-    Ok((fp8_dev, scale_dev))
-}
+// GPU-side quantization uses fp8_kv.cu kernels via KernelLoader.
+// CPU-side quantize_weight_fp8() above is reference/fallback only.
 
 #[cfg(test)]
 mod tests {

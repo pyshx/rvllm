@@ -187,6 +187,15 @@ mod cuda_impl {
         persistent_scratch: Option<PersistentLayerScratch>,
         /// Cached max cooperative grid size for the persistent layer kernel.
         persistent_max_grid: u32,
+        // FP8 quantized weights per layer (gated by RVLLM_FP8_WEIGHTS=1).
+        fp8_fused_qkv: Vec<CudaSlice<u8>>,
+        fp8_fused_qkv_scale: Vec<CudaSlice<f16>>,
+        fp8_o_proj: Vec<CudaSlice<u8>>,
+        fp8_o_proj_scale: Vec<CudaSlice<f16>>,
+        fp8_fused_gate_up: Vec<CudaSlice<u8>>,
+        fp8_fused_gate_up_scale: Vec<CudaSlice<f16>>,
+        fp8_down_proj: Vec<CudaSlice<u8>>,
+        fp8_down_proj_scale: Vec<CudaSlice<f16>>,
     }
 
     impl GpuModelRunner {
@@ -311,6 +320,14 @@ mod cuda_impl {
                 f16_scratch: None,
                 persistent_scratch: None,
                 persistent_max_grid: 0,
+                fp8_fused_qkv: Vec::new(),
+                fp8_fused_qkv_scale: Vec::new(),
+                fp8_o_proj: Vec::new(),
+                fp8_o_proj_scale: Vec::new(),
+                fp8_fused_gate_up: Vec::new(),
+                fp8_fused_gate_up_scale: Vec::new(),
+                fp8_down_proj: Vec::new(),
+                fp8_down_proj_scale: Vec::new(),
             })
         }
 
@@ -386,7 +403,85 @@ mod cuda_impl {
 
             info!(num_layers, qkv_dim, gate_up_dim, "fused QKV and gate+up weights (f16)");
 
+            // FP8 weight quantization: convert fused f16 weights to FP8 E4M3
+            // with per-row scales. Gated behind RVLLM_FP8_WEIGHTS=1.
+            if std::env::var("RVLLM_FP8_WEIGHTS").map_or(false, |v| v == "1") {
+                self.quantize_weights_fp8(num_layers, hidden, qkv_dim, intermediate)?;
+            }
+
             self.alloc_scratch()?;
+            Ok(())
+        }
+
+        /// Quantize fused f16 weights to FP8 E4M3 with per-row scales.
+        /// Downloads f16 from GPU, quantizes on CPU, re-uploads as u8 + f16 scales.
+        fn quantize_weights_fp8(
+            &mut self,
+            num_layers: usize,
+            hidden: usize,
+            qkv_dim: usize,
+            intermediate: usize,
+        ) -> Result<()> {
+            use rvllm_gpu::fp8_quantize::quantize_weight_fp8;
+
+            let gate_up_dim = intermediate * 2;
+
+            for i in 0..num_layers {
+                // Fused QKV: [qkv_dim, hidden]
+                let qkv_f16: Vec<f16> = self.stream.clone_dtoh(&self.fused_qkv_weights[i])
+                    .map_err(|e| LLMError::GpuError(format!("fp8 qkv dtoh L{i}: {e}")))?;
+                let qkv_q = quantize_weight_fp8(&qkv_f16, qkv_dim, hidden);
+                let qkv_fp8 = self.stream.clone_htod(&qkv_q.data)
+                    .map_err(|e| LLMError::GpuError(format!("fp8 qkv htod L{i}: {e}")))?;
+                let qkv_scale = self.stream.clone_htod(&qkv_q.scales)
+                    .map_err(|e| LLMError::GpuError(format!("fp8 qkv scale htod L{i}: {e}")))?;
+                self.fp8_fused_qkv.push(qkv_fp8);
+                self.fp8_fused_qkv_scale.push(qkv_scale);
+
+                // O projection: [q_dim, hidden] where q_dim = qkv_dim - 2*kv_dim
+                // but we get it from the weight map directly
+                let o_name = format!("model.layers.{i}.self_attn.o_proj.weight");
+                let o_f16: Vec<f16> = self.stream.clone_dtoh(
+                    self.weights.get(&o_name)
+                        .ok_or_else(|| LLMError::GpuError(format!("missing {o_name}")))?
+                ).map_err(|e| LLMError::GpuError(format!("fp8 o_proj dtoh L{i}: {e}")))?;
+                let o_rows = o_f16.len() / hidden;
+                let o_q = quantize_weight_fp8(&o_f16, o_rows, hidden);
+                let o_fp8 = self.stream.clone_htod(&o_q.data)
+                    .map_err(|e| LLMError::GpuError(format!("fp8 o_proj htod L{i}: {e}")))?;
+                let o_scale = self.stream.clone_htod(&o_q.scales)
+                    .map_err(|e| LLMError::GpuError(format!("fp8 o_proj scale htod L{i}: {e}")))?;
+                self.fp8_o_proj.push(o_fp8);
+                self.fp8_o_proj_scale.push(o_scale);
+
+                // Fused gate+up: [gate_up_dim, hidden]
+                let gu_f16: Vec<f16> = self.stream.clone_dtoh(&self.fused_gate_up_weights[i])
+                    .map_err(|e| LLMError::GpuError(format!("fp8 gate_up dtoh L{i}: {e}")))?;
+                let gu_q = quantize_weight_fp8(&gu_f16, gate_up_dim, hidden);
+                let gu_fp8 = self.stream.clone_htod(&gu_q.data)
+                    .map_err(|e| LLMError::GpuError(format!("fp8 gate_up htod L{i}: {e}")))?;
+                let gu_scale = self.stream.clone_htod(&gu_q.scales)
+                    .map_err(|e| LLMError::GpuError(format!("fp8 gate_up scale htod L{i}: {e}")))?;
+                self.fp8_fused_gate_up.push(gu_fp8);
+                self.fp8_fused_gate_up_scale.push(gu_scale);
+
+                // Down projection: [hidden, intermediate]
+                let down_name = format!("model.layers.{i}.mlp.down_proj.weight");
+                let down_f16: Vec<f16> = self.stream.clone_dtoh(
+                    self.weights.get(&down_name)
+                        .ok_or_else(|| LLMError::GpuError(format!("missing {down_name}")))?
+                ).map_err(|e| LLMError::GpuError(format!("fp8 down_proj dtoh L{i}: {e}")))?;
+                let down_rows = down_f16.len() / intermediate;
+                let down_q = quantize_weight_fp8(&down_f16, down_rows, intermediate);
+                let down_fp8 = self.stream.clone_htod(&down_q.data)
+                    .map_err(|e| LLMError::GpuError(format!("fp8 down_proj htod L{i}: {e}")))?;
+                let down_scale = self.stream.clone_htod(&down_q.scales)
+                    .map_err(|e| LLMError::GpuError(format!("fp8 down_proj scale htod L{i}: {e}")))?;
+                self.fp8_down_proj.push(down_fp8);
+                self.fp8_down_proj_scale.push(down_scale);
+            }
+
+            info!(num_layers, "FP8 E4M3 weight quantization complete (per-row scales)");
             Ok(())
         }
 
@@ -1510,6 +1605,14 @@ mod cuda_impl {
                 fused_qkv: self.fused_qkv_weights.get(i),
                 fused_gate_up: self.fused_gate_up_weights.get(i),
                 qkv_bias: self.fused_qkv_bias.get(i).and_then(|o| o.as_ref()),
+                fused_qkv_fp8: self.fp8_fused_qkv.get(i),
+                fused_qkv_scale: self.fp8_fused_qkv_scale.get(i),
+                o_proj_fp8: self.fp8_o_proj.get(i),
+                o_proj_scale: self.fp8_o_proj_scale.get(i),
+                fused_gate_up_fp8: self.fp8_fused_gate_up.get(i),
+                fused_gate_up_scale: self.fp8_fused_gate_up_scale.get(i),
+                down_proj_fp8: self.fp8_down_proj.get(i),
+                down_proj_scale: self.fp8_down_proj_scale.get(i),
             })
         }
 

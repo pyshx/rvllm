@@ -83,6 +83,8 @@ static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
             "split_kv_combine_kernel",
             "split_kv_decode_fp8kv_kernel",
             "split_kv_decode_single_f16kv_kernel",
+            "split_kv_decode_f16io_kernel",
+            "split_kv_combine_f16io_kernel",
         ],
     ),
     (
@@ -124,6 +126,28 @@ static KERNEL_FUNCTIONS: &[(&str, &[&str])] = &[
     (
         "persistent_layer_decode",
         &["persistent_layer_decode_f16"],
+    ),
+    (
+        "gemv_fp8",
+        &[
+            "gemv_fp8_kernel",
+            "fused_add_norm_fp8_gemv_kernel",
+            "fused_norm_fp8_gemv_kernel",
+            "fused_silu_down_fp8_gemv_kernel",
+        ],
+    ),
+    (
+        "tma_gemv_fp16",
+        &["tma_gemv_fp16_kernel", "tma_gemv_fp16_bias_kernel"],
+    ),
+    (
+        "wgmma_gemv",
+        &[
+            "wgmma_gemv_f16_kernel",
+            "wgmma_gemv_f16_unrolled_kernel",
+            "wgmma_gemv_f16_splitk_kernel",
+            "splitk_f32_to_f16_kernel",
+        ],
     ),
     ("gemv_f16", &["gemv_f16_kernel", "gemv_batched_f16_kernel"]),
     ("rms_norm", &["rms_norm_kernel"]),

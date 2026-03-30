@@ -327,6 +327,9 @@ pub struct GpuWorker {
     kv_cache: Option<KVCache>,
     fp8_kv_cache: Option<Fp8KVCache>,
     use_fp8_kv: bool,
+    /// GPU-resident FP8 cache engine (created when use_fp8_kv is true).
+    #[cfg(feature = "cuda")]
+    fp8_cache_engine: Option<rvllm_kv_cache::CudaFP8CacheEngine>,
     guided_states: HashMap<u64, GuidedDecodingState>,
     vocab_table: Option<VocabTable>,
     /// Raw f16 weight map preserved for deferred GpuModelRunner construction.
@@ -420,9 +423,9 @@ impl GpuWorker {
         let use_fp8_kv = matches!(
             config.kv_cache_dtype.to_lowercase().as_str(),
             "fp8" | "fp8_e4m3"
-        );
+        ) || std::env::var("RVLLM_FP8_KV").map_or(false, |v| v == "1");
         if use_fp8_kv {
-            info!("FP8 KV cache enabled");
+            info!("FP8 KV cache enabled (halves KV VRAM via FP8 E4M3 quantization)");
         }
 
         let graph_runner = GraphRunner::new(GraphRunnerConfig {
@@ -456,6 +459,8 @@ impl GpuWorker {
             kv_cache: None,
             fp8_kv_cache: None,
             use_fp8_kv,
+            #[cfg(feature = "cuda")]
+            fp8_cache_engine: None,
             guided_states: HashMap::new(),
             vocab_table: None,
             #[cfg(feature = "cuda")]
@@ -573,6 +578,26 @@ impl GpuWorker {
                 self.stream.clone(),
             )
             .map_err(|e| LLMError::GpuError(format!("CudaCacheEngine init: {e}")))?;
+
+            // Create FP8 cache engine alongside the standard f16 cache when enabled.
+            // The f16 CudaCacheEngine is still needed by GpuModelRunner for the
+            // forward pass. The FP8 engine shadows it for long-term KV storage,
+            // halving VRAM for the KV cache at the cost of quantization noise.
+            if self.use_fp8_kv {
+                let fp8_cache = rvllm_kv_cache::CudaFP8CacheEngine::new(
+                    self.config.num_layers,
+                    self.config.num_kv_heads,
+                    self.config.head_dim,
+                    block_size,
+                    num_gpu_blocks,
+                    num_cpu_blocks,
+                    self.context.clone(),
+                    self.stream.clone(),
+                )
+                .map_err(|e| LLMError::GpuError(format!("CudaFP8CacheEngine init: {e}")))?;
+                self.fp8_cache_engine = Some(fp8_cache);
+                info!("FP8 GPU cache engine initialized alongside standard f16 cache");
+            }
 
             let runner_blas = CublasHandle::new(self.stream.clone())
                 .map_err(|e| LLMError::GpuError(format!("runner cublas: {e}")))?;
@@ -934,9 +959,22 @@ impl GpuWorker {
         let cache_cfg = self.config.cache_config();
         let total_block_bytes = cache_cfg.total_block_bytes();
 
-        // CudaCacheEngine now stores f16, matching CacheConfig::block_bytes.
-        let num_gpu_blocks = if total_block_bytes > 0 {
-            available / total_block_bytes
+        // When FP8 KV is enabled, we allocate both f16 (for GpuModelRunner) and
+        // FP8 (shadow) caches. FP8 data is u8 + f32 scales per head, roughly
+        // ~55% of f16 size. Account for both when computing block budget.
+        let effective_block_bytes = if self.use_fp8_kv {
+            // f16 cache: total_block_bytes
+            // FP8 cache: u8 data (half of f16 data) + f32 scales overhead
+            let fp8_data_bytes = total_block_bytes / 2; // u8 vs f16
+            let scales_per_block = self.config.block_size * self.config.num_kv_heads;
+            let fp8_scale_bytes = scales_per_block * 4 * 2 * self.config.num_layers; // f32 * 2 (K+V) * layers
+            total_block_bytes + fp8_data_bytes + fp8_scale_bytes / self.config.num_layers
+        } else {
+            total_block_bytes
+        };
+
+        let num_gpu_blocks = if effective_block_bytes > 0 {
+            available / effective_block_bytes
         } else {
             0
         };
@@ -944,7 +982,9 @@ impl GpuWorker {
 
         info!(
             free,
-            available, num_gpu_blocks, num_cpu_blocks, "profiled available blocks"
+            available, num_gpu_blocks, num_cpu_blocks,
+            fp8 = self.use_fp8_kv,
+            "profiled available blocks"
         );
         Ok((num_gpu_blocks, num_cpu_blocks))
     }
@@ -959,6 +999,28 @@ impl GpuWorker {
         }
     }
 
+    /// Whether FP8 KV cache quantization is active.
+    pub fn use_fp8_kv(&self) -> bool {
+        self.use_fp8_kv
+    }
+
+    /// Access the GPU-resident FP8 cache engine (if FP8 KV is enabled).
+    #[cfg(feature = "cuda")]
+    pub fn fp8_cache_engine(&self) -> Option<&rvllm_kv_cache::CudaFP8CacheEngine> {
+        self.fp8_cache_engine.as_ref()
+    }
+
+    /// Mutable access to the GPU-resident FP8 cache engine.
+    #[cfg(feature = "cuda")]
+    pub fn fp8_cache_engine_mut(&mut self) -> Option<&mut rvllm_kv_cache::CudaFP8CacheEngine> {
+        self.fp8_cache_engine.as_mut()
+    }
+
+    /// Vocabulary size of the loaded model.
+    pub fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+
     /// Check if all requests in the batch can use greedy (temperature=0) GPU argmax.
     /// Returns false if any request uses temperature>0, guided decoding, or repetition penalty.
     fn all_greedy(metadata: &[SequenceGroupMetadata]) -> bool {
@@ -970,6 +1032,17 @@ impl GpuWorker {
                 && p.frequency_penalty == 0.0
                 && p.presence_penalty == 0.0
         })
+    }
+
+    /// Run a forward pass returning raw logits (no sampling).
+    /// Used by speculative decoding to get probability distributions for
+    /// verification against draft model outputs.
+    pub fn forward_logits(&mut self, metadata: &[SequenceGroupMetadata]) -> Result<Vec<f32>> {
+        if metadata.is_empty() {
+            return Ok(Vec::new());
+        }
+        let model_input = input::prepare_input(metadata, self.config.block_size)?;
+        self.gpu_forward(&model_input)
     }
 
     /// Launch GPU work and return immediately. GPU computes asynchronously.

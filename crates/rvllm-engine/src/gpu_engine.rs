@@ -24,6 +24,8 @@ mod inner {
     use rvllm_tokenizer::Tokenizer;
     use rvllm_worker::gpu_worker::{GpuWorker, GpuWorkerOutput};
 
+    use rvllm_speculative::{SpeculativeConfig, SpeculativeEngine, TargetModel};
+
     use crate::hf_snapshot;
     use crate::output::{OutputProcessor, SequenceOutputState};
 
@@ -444,11 +446,15 @@ mod inner {
                 None
             };
 
+            let spec_enabled = Self::speculative_enabled();
+            let fp8_kv = worker.use_fp8_kv();
             info!(
                 num_gpu_blocks,
                 num_cpu_blocks,
                 block_size = config.cache.block_size,
                 max_num_seqs = config.scheduler.max_num_seqs,
+                fp8_kv,
+                speculative = spec_enabled,
                 "GpuLLMEngine: ready for inference"
             );
             Ok(Self {
@@ -1105,7 +1111,202 @@ mod inner {
     }
 
     unsafe impl Send for GpuLLMEngine {}
+
+    // ------------------------------------------------------------------
+    // GpuTargetModel: adapter for speculative decoding
+    // ------------------------------------------------------------------
+
+    /// Wraps the GPU worker's forward pass as a [`TargetModel`] for
+    /// speculative decoding verification.
+    ///
+    /// Constructs a synthetic single-sequence metadata batch from the token
+    /// list, runs a full forward pass through the GPU model, and extracts
+    /// probability distributions for the requested verification positions.
+    pub struct GpuTargetModel {
+        worker: *mut GpuWorker,
+        vocab_size: usize,
+        block_size: usize,
+    }
+
+    // SAFETY: GpuTargetModel is only used on the same thread as the engine
+    // that owns the GpuWorker. The raw pointer avoids borrow checker issues
+    // with the engine holding both the worker and the speculative engine.
+    unsafe impl Send for GpuTargetModel {}
+
+    impl GpuTargetModel {
+        /// Create from a mutable reference to GpuWorker.
+        /// Caller must ensure the GpuWorker outlives this adapter.
+        pub unsafe fn new(worker: &mut GpuWorker, vocab_size: usize, block_size: usize) -> Self {
+            Self {
+                worker: worker as *mut GpuWorker,
+                vocab_size,
+                block_size,
+            }
+        }
+
+        fn worker(&mut self) -> &mut GpuWorker {
+            // SAFETY: invariant maintained by caller of new()
+            unsafe { &mut *self.worker }
+        }
+    }
+
+    impl TargetModel for GpuTargetModel {
+        fn forward_verify(
+            &mut self,
+            tokens: &[TokenId],
+            num_verify_positions: usize,
+        ) -> Result<Vec<Vec<f32>>> {
+            if tokens.is_empty() || num_verify_positions == 0 {
+                return Ok(Vec::new());
+            }
+
+            // Build a single-sequence metadata for the full token list.
+            // Treat as a prefill (all tokens processed at once).
+            let seq_id = SequenceId(u64::MAX - 1); // sentinel
+            let request_id = RequestId(u64::MAX - 1);
+
+            let mut seq_data_map = HashMap::new();
+            seq_data_map.insert(
+                seq_id,
+                SequenceData {
+                    prompt_token_ids: tokens.to_vec(),
+                    output_token_ids: Vec::new(),
+                    cumulative_logprob: 0.0,
+                },
+            );
+
+            // Allocate enough blocks for the full token sequence.
+            let needed_blocks = (tokens.len() + self.block_size - 1) / self.block_size;
+            let block_table: Vec<BlockId> = (0..needed_blocks as u32).map(BlockId).collect();
+            let mut block_tables = HashMap::new();
+            block_tables.insert(seq_id, block_table);
+
+            let metadata = vec![SequenceGroupMetadata {
+                request_id,
+                is_prompt: true,
+                seq_data: seq_data_map,
+                sampling_params: SamplingParams::default(),
+                block_tables,
+            }];
+
+            // Run forward pass to get logits for all positions.
+            let logits = self.worker().forward_logits(&metadata)?;
+
+            // Extract probability distributions for the last `num_verify_positions`.
+            // logits layout: [num_tokens, vocab_size]
+            let num_tokens = tokens.len();
+            let vs = self.vocab_size;
+
+            if logits.len() < num_tokens * vs {
+                return Err(LLMError::ModelError(format!(
+                    "logits too short: got {} elements, expected {}",
+                    logits.len(),
+                    num_tokens * vs,
+                )));
+            }
+
+            let mut result = Vec::with_capacity(num_verify_positions);
+            let start_pos = num_tokens.saturating_sub(num_verify_positions);
+
+            for pos in start_pos..num_tokens {
+                let offset = pos * vs;
+                let token_logits = &logits[offset..offset + vs];
+
+                // Convert logits to probabilities via softmax.
+                let max_logit = token_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut probs: Vec<f32> = token_logits.iter().map(|&l| (l - max_logit).exp()).collect();
+                let sum: f32 = probs.iter().sum();
+                if sum > 0.0 {
+                    for p in &mut probs {
+                        *p /= sum;
+                    }
+                }
+                result.push(probs);
+            }
+
+            Ok(result)
+        }
+
+        fn vocab_size(&self) -> usize {
+            self.vocab_size
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Speculative decoding integration on GpuLLMEngine
+    // ------------------------------------------------------------------
+
+    impl GpuLLMEngine {
+        /// Check if speculative decoding is enabled via env var or config.
+        fn speculative_enabled() -> bool {
+            std::env::var("RVLLM_SPECULATIVE").map_or(false, |v| v == "1")
+        }
+
+        /// Get the draft model path from env or default.
+        fn speculative_draft_model() -> Option<String> {
+            std::env::var("RVLLM_SPECULATIVE_DRAFT").ok()
+        }
+
+        /// Get the number of speculative tokens (K) from env or default to 3.
+        fn speculative_k() -> usize {
+            std::env::var("RVLLM_SPECULATIVE_K")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3)
+        }
+
+        /// Run a single request through speculative decoding.
+        /// Returns the generated token IDs (excluding prompt).
+        pub fn generate_speculative(
+            &mut self,
+            prompt_tokens: &[TokenId],
+            max_tokens: usize,
+            eos_token_id: TokenId,
+        ) -> Result<Vec<TokenId>> {
+            if !Self::speculative_enabled() {
+                return Err(LLMError::ConfigError(
+                    "speculative decoding not enabled (set RVLLM_SPECULATIVE=1)".into(),
+                ));
+            }
+
+            let draft_path = Self::speculative_draft_model().unwrap_or_default();
+            let k = Self::speculative_k();
+
+            info!(
+                draft_model = %draft_path,
+                k,
+                max_tokens,
+                prompt_len = prompt_tokens.len(),
+                "starting speculative decoding"
+            );
+
+            let spec_config = SpeculativeConfig::new(draft_path, k);
+            let vocab_size = self.worker.vocab_size();
+            let block_size = self.config.cache.block_size;
+
+            // SAFETY: GpuTargetModel borrows worker mutably via raw pointer.
+            // We don't access self.worker while the SpeculativeEngine is alive.
+            let target = unsafe { GpuTargetModel::new(&mut self.worker, vocab_size, block_size) };
+
+            let mut spec_engine = SpeculativeEngine::new(spec_config, target)?;
+
+            let output_tokens =
+                spec_engine.generate(prompt_tokens, max_tokens, |tok| tok == eos_token_id)?;
+
+            let metrics = spec_engine.metrics();
+            info!(
+                accepted = metrics.total_accepted_tokens,
+                drafted = metrics.total_draft_tokens,
+                steps = metrics.total_steps,
+                rate = %format!("{:.1}%", metrics.acceptance_rate() * 100.0),
+                speedup = %format!("{:.2}x", metrics.speedup_ratio()),
+                "speculative decoding complete"
+            );
+
+            Ok(output_tokens)
+        }
+    }
 }
 
 #[cfg(feature = "cuda")]
-pub use inner::{AbortQueue, GpuLLMEngine, PendingRequest, RequestQueue};
+pub use inner::{AbortQueue, GpuLLMEngine, GpuTargetModel, PendingRequest, RequestQueue};

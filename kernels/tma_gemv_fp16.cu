@@ -12,6 +12,7 @@
 //   Shared mem: in_dim * sizeof(half) + 2 * RPB * TILE_K * sizeof(half) + RPB * sizeof(float)
 
 #include <cuda_fp16.h>
+#include <cstdint>
 
 #define TMA_THREADS 256
 #define TMA_RPB 8
