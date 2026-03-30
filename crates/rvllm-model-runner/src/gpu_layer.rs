@@ -350,7 +350,7 @@ mod inner {
                     let mut mlp_out = unsafe { self.stream.alloc::<f16>(hidden) }
                         .map_err(|e| LLMError::GpuError(format!("fp8 down alloc: {e}")))?;
                     let mlp_ptr = {
-                        let (p, _g) = DevicePtrMut::device_ptr_mut(&mut mlp_out, &self.stream);
+                        let p = { let (p, _g) = DevicePtrMut::device_ptr_mut(&mut mlp_out, &self.stream); p };
                         p
                     };
                     lt_ops.fp8_gemm_a_bt_raw(1, hidden, intermediate, fp8_scratch_ptr, d_w_ptr, mlp_ptr)?;
@@ -765,11 +765,11 @@ mod inner {
                         let mut ws = unsafe { self.stream.alloc::<u8>(ws_bytes.max(1)) }
                             .map_err(|e| LLMError::GpuError(format!("cutlass qkv ws alloc: {e}")))?;
                         let mut qkv_view = s.qkv.slice_mut(..num_tokens * qkv_dim);
-                        let (out_ptr, _g0) = DevicePtrMut::device_ptr_mut(&mut qkv_view, &self.stream);
-                        let (in_ptr, _g1) = DevicePtr::device_ptr(&*s.normed, &self.stream);
+                        let out_ptr = { let (p, _g) = DevicePtrMut::device_ptr_mut(&mut qkv_view, &self.stream); p };
+                        let in_ptr = { let (p, _g) = DevicePtr::device_ptr(&*s.normed, &self.stream); p };
                         let (w_ptr, _g2) = DevicePtr::device_ptr(fused_qkv, &self.stream);
                         let (b_ptr, _g3) = DevicePtr::device_ptr(bias, &self.stream);
-                        let (ws_ptr, _g4) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream);
+                        let ws_ptr = { let (p, _g) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream); p };
                         let stream_ptr = self.stream.cu_stream() as u64;
                         ck.qkv_bias_gemm(out_ptr, in_ptr, w_ptr, b_ptr, m, n, k, ws_ptr, ws_bytes, stream_ptr)
                             .map_err(|e| LLMError::GpuError(e))?;
@@ -873,11 +873,11 @@ mod inner {
                     let ws_bytes = ck.oproj_residual_workspace_size(m, n, k);
                     let mut ws = unsafe { self.stream.alloc::<u8>(ws_bytes.max(1)) }
                         .map_err(|e| LLMError::GpuError(format!("cutlass oproj ws alloc: {e}")))?;
-                    let (out_ptr, _g0) = DevicePtrMut::device_ptr_mut(&mut *s.o_proj, &self.stream);
-                    let (in_ptr, _g1) = DevicePtr::device_ptr(&attn_out, &self.stream);
+                    let out_ptr = { let (p, _g) = DevicePtrMut::device_ptr_mut(&mut *s.o_proj, &self.stream); p };
+                    let in_ptr = { let (p, _g) = DevicePtr::device_ptr(&attn_out, &self.stream); p };
                     let (w_ptr, _g2) = DevicePtr::device_ptr(weights.o_proj, &self.stream);
                     let (r_ptr, _g3) = DevicePtr::device_ptr(residual_ref, &self.stream);
-                    let (ws_ptr, _g4) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream);
+                    let ws_ptr = { let (p, _g) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream); p };
                     let stream_ptr = self.stream.cu_stream() as u64;
                     ck.oproj_residual_gemm(out_ptr, in_ptr, w_ptr, r_ptr, m, n, k, ws_ptr, ws_bytes, stream_ptr)
                         .map_err(|e| LLMError::GpuError(e))?;
@@ -907,10 +907,10 @@ mod inner {
                         let ws_bytes = ck.gateup_silu_workspace_size(m, n, k);
                         let mut ws = unsafe { self.stream.alloc::<u8>(ws_bytes.max(1)) }
                             .map_err(|e| LLMError::GpuError(format!("cutlass gateup ws alloc: {e}")))?;
-                        let (out_ptr, _g0) = DevicePtrMut::device_ptr_mut(&mut *s.silu_out, &self.stream);
-                        let (in_ptr, _g1) = DevicePtr::device_ptr(&*s.normed, &self.stream);
+                        let out_ptr = { let (p, _g) = DevicePtrMut::device_ptr_mut(&mut *s.silu_out, &self.stream); p };
+                        let in_ptr = { let (p, _g) = DevicePtr::device_ptr(&*s.normed, &self.stream); p };
                         let (w_ptr, _g2) = DevicePtr::device_ptr(fused_gate_up, &self.stream);
-                        let (ws_ptr, _g3) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream);
+                        let ws_ptr = { let (p, _g) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream); p };
                         let stream_ptr = self.stream.cu_stream() as u64;
                         ck.gateup_silu(out_ptr, in_ptr, w_ptr, m, n, k, ws_ptr, ws_bytes, stream_ptr)
                             .map_err(|e| LLMError::GpuError(e))?;
@@ -993,11 +993,11 @@ mod inner {
                         .map_err(|e| LLMError::GpuError(format!("cutlass qkv ws alloc: {e}")))?;
                     let mut qkv_out = unsafe { self.stream.alloc::<f16>(num_tokens * qkv_dim) }
                         .map_err(|e| LLMError::GpuError(format!("cutlass qkv alloc: {e}")))?;
-                    let (out_ptr, _g0) = DevicePtrMut::device_ptr_mut(&mut qkv_out, &self.stream);
-                    let (in_ptr, _g1) = DevicePtr::device_ptr(&normed, &self.stream);
+                    let out_ptr = { let (p, _g) = DevicePtrMut::device_ptr_mut(&mut qkv_out, &self.stream); p };
+                    let in_ptr = { let (p, _g) = DevicePtr::device_ptr(&normed, &self.stream); p };
                     let (w_ptr, _g2) = DevicePtr::device_ptr(fused_qkv, &self.stream);
                     let (b_ptr, _g3) = DevicePtr::device_ptr(bias, &self.stream);
-                    let (ws_ptr, _g4) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream);
+                    let ws_ptr = { let (p, _g) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream); p };
                     let stream_ptr = self.stream.cu_stream() as u64;
                     ck.qkv_bias_gemm(out_ptr, in_ptr, w_ptr, b_ptr, m, n, k, ws_ptr, ws_bytes, stream_ptr)
                         .map_err(|e| LLMError::GpuError(e))?;
@@ -1108,11 +1108,11 @@ mod inner {
                     .map_err(|e| LLMError::GpuError(format!("cutlass oproj ws alloc: {e}")))?;
                 let mut oproj_out = unsafe { self.stream.alloc::<f16>(num_tokens * hidden) }
                     .map_err(|e| LLMError::GpuError(format!("cutlass oproj alloc: {e}")))?;
-                let (out_ptr, _g0) = DevicePtrMut::device_ptr_mut(&mut oproj_out, &self.stream);
-                let (in_ptr, _g1) = DevicePtr::device_ptr(&attn_out, &self.stream);
+                let out_ptr = { let (p, _g) = DevicePtrMut::device_ptr_mut(&mut oproj_out, &self.stream); p };
+                let in_ptr = { let (p, _g) = DevicePtr::device_ptr(&attn_out, &self.stream); p };
                 let (w_ptr, _g2) = DevicePtr::device_ptr(weights.o_proj, &self.stream);
                 let (r_ptr, _g3) = DevicePtr::device_ptr(residual_ref, &self.stream);
-                let (ws_ptr, _g4) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream);
+                let ws_ptr = { let (p, _g) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream); p };
                 let stream_ptr = self.stream.cu_stream() as u64;
                 ck.oproj_residual_gemm(out_ptr, in_ptr, w_ptr, r_ptr, m, n, k, ws_ptr, ws_bytes, stream_ptr)
                     .map_err(|e| LLMError::GpuError(e))?;
@@ -1141,10 +1141,10 @@ mod inner {
                         .map_err(|e| LLMError::GpuError(format!("cutlass gateup ws alloc: {e}")))?;
                     let mut fused_out = unsafe { self.stream.alloc::<f16>(num_tokens * intermediate) }
                         .map_err(|e| LLMError::GpuError(format!("cutlass gateup alloc: {e}")))?;
-                    let (out_ptr, _g0) = DevicePtrMut::device_ptr_mut(&mut fused_out, &self.stream);
-                    let (in_ptr, _g1) = DevicePtr::device_ptr(&normed2, &self.stream);
+                    let out_ptr = { let (p, _g) = DevicePtrMut::device_ptr_mut(&mut fused_out, &self.stream); p };
+                    let in_ptr = { let (p, _g) = DevicePtr::device_ptr(&normed2, &self.stream); p };
                     let (w_ptr, _g2) = DevicePtr::device_ptr(fused_gate_up, &self.stream);
-                    let (ws_ptr, _g3) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream);
+                    let ws_ptr = { let (p, _g) = DevicePtrMut::device_ptr_mut(&mut ws, &self.stream); p };
                     let stream_ptr = self.stream.cu_stream() as u64;
                     ck.gateup_silu(out_ptr, in_ptr, w_ptr, m, n, k, ws_ptr, ws_bytes, stream_ptr)
                         .map_err(|e| LLMError::GpuError(e))?;
