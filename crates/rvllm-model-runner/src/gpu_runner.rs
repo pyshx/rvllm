@@ -527,6 +527,8 @@ mod cuda_impl {
                 }
                 let max_ws = self.autotuned_algos.values().map(|(_, ws)| *ws).max().unwrap_or(0);
                 if max_ws > 0 { self.autotune_workspace = Some(unsafe { self.stream.alloc::<u8>(max_ws) }.map_err(|e| LLMError::GpuError(format!("ws: {e}")))?); }
+                // Push autotuned algos into CublasLtOps for use in hgemm_a_bt
+                lt_ops.set_autotuned(&self.autotuned_algos);
                 tracing::info!(shapes = self.autotuned_algos.len(), max_ws, "autotuning complete");
             }
             self.alloc_scratch()?;
