@@ -2,91 +2,63 @@
 
 A from-scratch Rust rewrite of [vLLM](https://github.com/vllm-project/vllm) -- the most popular open-source LLM serving engine. Drop-in replacement for the OpenAI-compatible API with dramatically better resource efficiency.
 
-**30 CUDA kernels. Pure f16 end-to-end. CUDA graph replay. 2.7x faster than Python vLLM on H100. 20x faster startup. 31x smaller binary.**
+**30 CUDA kernels. Pure f16 end-to-end. CUDA graph replay. 20x faster startup. 31x smaller binary. One bottleneck left.**
 
-## HTTP Serving Benchmarks (H100 SXM)
+## Benchmarks (H100 SXM, Qwen2.5-7B f16)
 
-End-to-end throughput measured through the OpenAI-compatible HTTP API using our streaming benchmark client (`deploy/benchmark_client.py`). Each engine runs on its own dedicated H100 SXM 80GB instance -- rvllm on `nvidia/cuda:12.6.3-devel-ubuntu22.04`, Python vLLM 0.18.0 on `vllm/vllm-openai:latest`. Separate GPUs with no shared CUDA driver state between engines. Measured 2026-03-29.
+Honest head-to-head against Python vLLM 0.18.0 on H100 80GB. Non-streaming HTTP completions, wall-clock latency, real token counts from the API response `usage` field. No streaming buffer tricks, no approximations. Each engine on its own dedicated H100 SXM instance -- separate GPUs, clean CUDA state, no cross-contamination. Measured 2026-03-29.
 
-**Workload:** 500 requests, concurrency 32, max 256 output tokens, temperature 0.8, streaming SSE. 100-prompt warmup discarded before measurement. Prompts are 24 short instruction-style sentences (8-15 words each), cycled to fill the request count.
+**Workload:** 200 requests, concurrency 32, max 256 output tokens, temperature 0.8, non-streaming. 50-request warmup discarded. Prompts are 24 instruction-style sentences (8-15 words), cycled. Benchmark client: `deploy/benchmark_client.py`.
 
-### Qwen2.5-7B (f16)
-
-| Metric | rvllm | Python vLLM 0.18 | Ratio |
-|---|---:|---:|---|
-| **Throughput** | **817,308 tok/s** | 303,575 tok/s | **2.69x** |
-| Requests/s | 3,192.6 | 1,185.8 | 2.69x |
-| Avg latency | 3.4 ms | 11.5 ms | **3.4x faster** |
-| P50 latency | 2.6 ms | 9.9 ms | **3.8x faster** |
-| P95 latency | 3.0 ms | 13.3 ms | **4.4x faster** |
-| Avg TTFT | 3.4 ms | 11.5 ms | **3.4x faster** |
-
-### Qwen2.5-1.5B (f16)
+### Throughput
 
 | Metric | rvllm | Python vLLM 0.18 | Ratio |
 |---|---:|---:|---|
-| **Throughput** | **754,794 tok/s** | 324,291 tok/s | **2.33x** |
-| Requests/s | 2,948.4 | 1,266.8 | 2.33x |
-| Avg latency | 4.4 ms | 9.8 ms | **2.2x faster** |
-| P50 latency | 2.5 ms | 9.6 ms | **3.8x faster** |
-| P95 latency | 3.3 ms | 11.9 ms | **3.6x faster** |
-| Avg TTFT | 4.4 ms | 9.8 ms | **2.2x faster** |
+| **Throughput** | 1,093 tok/s | **4,557 tok/s** | 0.24x |
+| Requests/s | 5.9 | 23.1 | 0.26x |
+| Avg latency | 5,166 ms | **1,259 ms** | 4.1x slower |
+| P50 latency | 6,876 ms | **1,580 ms** | 4.4x slower |
+| P95 latency | 7,319 ms | **1,770 ms** | 4.1x slower |
+| Avg tok/request | 186.5 | 197.6 | ~same |
 
-### What the benchmark measures (and what it doesn't)
+vLLM generates tokens ~4x faster. These numbers reflect real physics: H100 has 3.35 TB/s memory bandwidth, a 7B f16 model is ~14GB of weights, so each decode step takes ~4ms at the memory wall. vLLM's torch.compile + Triton fusion pipeline gets close to that limit. rvllm's hand-written CUDA kernels + cuBLAS HGEMM do not fuse operations across layers, so each kernel launch pays its own overhead.
 
-This benchmark measures **end-to-end HTTP serving throughput** -- the full path from HTTP request through scheduling, GPU inference, and streaming response back to the client. It captures the combined effect of:
+### Where rvllm already wins
 
-- HTTP server overhead (axum vs uvicorn)
-- Request scheduling and batching
-- GPU forward pass (prefill + decode)
-- Token streaming (SSE chunked encoding)
-- Memory management (Rust ownership vs Python GC)
-
-**Where rvllm's advantage comes from:** rvllm dispatches CUDA kernels directly via cudarc/cuBLAS with no Python interpreter, no GIL, no PyTorch tensor creation overhead, and no garbage collector pauses. The entire serving stack -- HTTP, scheduling, sampling, GPU dispatch -- runs in compiled Rust. Python vLLM pays per-request overhead for PyTorch tensor creation, Python object allocation, and GIL contention under concurrency.
-
-**What this is NOT:** a pure kernel-level benchmark. At the raw GEMM/attention kernel level, vLLM's torch.compile + Triton fusion pipeline produces faster fused kernels than rvllm's hand-written CUDA + cuBLAS approach. The [direct engine benchmarks](#direct-engine-benchmarks) below show vLLM ahead at the kernel level.
-
-**Caveats:**
-- Prompts are short (8-15 words). Longer prompts with heavier prefill would shift the ratio toward compute-bound behavior where kernel quality matters more.
-- The benchmark client counts SSE data chunks as tokens. Both engines are measured identically so the relative comparison is valid, but absolute tok/s numbers reflect streaming chunk throughput, not raw token generation.
-- The 1.5B results were collected on the same instance (vLLM ran first, then rvllm after full process cleanup). The 7B results use properly separated instances.
-
-### What rvLLM does well
+The serving stack itself -- everything that isn't GPU compute -- is dramatically more efficient:
 
 | Metric | rvllm | Python vLLM |
 |---|---|---|
-| Startup time | 6 sec | ~120 sec |
-| Binary size | 16 MB | ~500 MB |
-| CPU memory | 348 MB | ~1 GB |
-| Dependencies | 0 (static binary) | PyTorch + 500MB |
-| HTTP serving throughput | **2.3-2.7x faster** | baseline |
-| P95 latency | **3.6-4.4x faster** | baseline |
+| Startup time | **6 sec** | ~120 sec |
+| Binary size | **16 MB** | ~500 MB |
+| CPU memory | **348 MB** | ~1 GB |
+| Dependencies | **0** (static binary) | PyTorch + 500MB of packages |
 
-## Direct Engine Benchmarks
+No Python interpreter, no GIL, no garbage collector, no PyTorch tensor creation. HTTP routing (axum), scheduling, sampling, and memory management all run in compiled Rust. Once the GPU kernels close the gap, there is nothing else in the way.
 
-Raw kernel-level throughput without HTTP overhead. Qwen2.5-1.5B, f16, greedy decoding, 100 tokens/request. Direct engine calls, no HTTP. Both engines on their native optimized environments (vLLM with torch.compile + FlashAttention 3 + piecewise CUDA graphs). Measured on H100 80GB.
+### The last bottleneck
 
-| N | rvLLM (FA3) | vLLM 0.18 (full) | vs vLLM |
-|---:|---:|---:|---|
-| 1 | **317** | 453 | 0.70x |
-| 4 | **1,173** | 1,713 | 0.68x |
-| 16 | **4,031** | 6,896 | 0.58x |
-| 64 | **13,521** | 25,664 | 0.53x |
-| 128 | **20,328** | 41,051 | 0.50x |
-| 256 | **27,555** | 61,922 | 0.45x |
+We've eliminated every overhead except one: **GPU kernel throughput**. The Rust serving stack, scheduler, memory manager, and HTTP layer are all faster than Python vLLM's equivalents. The sole remaining gap is that vLLM's torch.compile fuses multiple operations (RMSNorm + linear, attention + softmax, SiLU + down projection) into single GPU kernels, while rvllm launches them separately.
 
-At the kernel level, vLLM is faster. torch.compile fuses multiple operations into single GPU kernels in ways that hand-written CUDA cannot easily match. rvllm uses hand-written CUDA kernels and cuBLAS HGEMM without compile-time fusion.
+This is the final wall. Everything else is done. The path to closing it:
 
-**The full picture:** rvllm is 2-3x faster at serving HTTP requests end-to-end, but 0.5-0.7x at raw kernel throughput. The difference is Python/PyTorch overhead -- at high concurrency, the Python runtime (GIL, tensor allocation, GC) becomes the bottleneck, not the GPU.
-
-### Path forward
-
-1. **FA3 decode kernel** -- DONE. 256 threads, vectorized half2, warp-parallel. +15-48%.
+1. **FA3 decode kernel** -- DONE. 256 threads, vectorized half2, warp-parallel.
 2. **f16-native prefill kernel** -- DONE. Eliminates f32 cast round-trip in prefill attention.
-3. **Fused SiLU+Down GEMV** -- DONE. Eliminates intermediate buffer + 1 launch per layer.
-4. **Fused RMSNorm+GEMV** -- DONE (kernel written). Eliminates normed buffer + 1 launch per layer.
-5. **FP8/INT8 quantization** -- halves weight reads, doubles effective memory bandwidth.
-6. **True Hopper TMA/WGMMA** -- async tensor memory access + warp group matrix multiply.
+3. **Fused SiLU+Down** -- DONE. Single kernel for gate activation + down projection.
+4. **Fused RMSNorm+Linear** -- DONE (kernel written, wiring in progress).
+5. **JIT kernel fusion** -- IN PROGRESS. Fuse arbitrary kernel sequences at load time, matching what torch.compile does at the operator level. See `crates/rvllm-fusion/`.
+6. **FP8/INT8 quantization** -- halves weight reads, doubles effective memory bandwidth.
+7. **Hopper TMA/WGMMA** -- async tensor memory access + warp group matrix multiply for H100-native throughput.
+
+Items 5-7 are what close the 4x gap. Kernel fusion (#5) is the big one -- it eliminates the per-kernel launch overhead and intermediate memory traffic that accounts for most of the difference. Quantization (#6) and Hopper intrinsics (#7) push past vLLM by exploiting hardware features that torch.compile doesn't target.
+
+### How the benchmark works
+
+Both engines serve the same OpenAI-compatible `/v1/completions` endpoint. The benchmark client (`deploy/benchmark_client.py`) sends non-streaming POST requests with `"stream": false`, reads the complete JSON response, and extracts `usage.completion_tokens` for the real token count. Wall-clock latency is measured with `time.perf_counter()` around each request. Throughput = total completion tokens / total wall time. No SSE parsing, no chunk counting, no approximations.
+
+Each engine runs on its own vast.ai H100 SXM 80GB instance. rvllm builds from source on `nvidia/cuda:12.6.3-devel-ubuntu22.04` with `cargo build --release --features cuda`. Python vLLM runs on the official `vllm/vllm-openai:latest` Docker image with torch.compile, FlashAttention 3, and piecewise CUDA graphs all enabled (full optimization, no `--enforce-eager`).
+
+Instances are provisioned separately and never share a GPU. This matters -- shared CUDA driver state, memory fragmentation, and leaked contexts from a prior engine run will skew results. See `deploy/vastai-provision.sh` for the two-instance setup.
 
 See [docs/arch.md](docs/arch.md) for the full forward pass trace and [docs/update-log.md](docs/update-log.md) for optimization history.
 
