@@ -13,8 +13,9 @@
 //      Full producer/consumer warp specialization would reduce occupancy on this
 //      memory-bound kernel (2 blocks/SM -> 1), so cooperative is better.
 //
-// Shared memory: 2x KV tile buffers (stride=head_dim, 16-byte aligned for cp.async),
-// scores array, warp reduction scratch.
+// Shared memory: 1x KV tile buffer (stride=head_dim, 16-byte aligned for cp.async),
+// scores array, warp reduction scratch. Single-buffered to minimize smem footprint
+// (~18KB vs 34KB double-buffered) -- critical for L1 cache at high occupancy.
 //
 // GQA kernel:   grid(num_seqs, num_kv_heads, num_splits), block(256)
 // Non-GQA:      grid(num_seqs, num_heads, num_splits), block(256)
@@ -212,16 +213,13 @@ fa3_v3_decode_gqa_kernel(
         return;
     }
 
-    // ---- Shared memory: double-buffered KV + scores + warp scratch ----
-    // buf[0]: V3_BC * head_dim half
-    // buf[1]: V3_BC * head_dim half
-    // scores: HPG * SCORE_STRIDE float
-    // warp:   WARPS float
+    // ---- Shared memory: single KV buffer + scores + warp scratch ----
+    // Single-buffered to keep smem footprint ~18KB (same as v2), preserving
+    // L1 cache partition at high occupancy. cp.async still benefits from
+    // 128-bit bulk copies and register bypass.
     extern __shared__ char smem_raw[];
-    __half* s_kv[2];
-    s_kv[0] = (__half*)smem_raw;
-    s_kv[1] = s_kv[0] + V3_BC * head_dim;
-    float* s_scores = (float*)(s_kv[1] + V3_BC * head_dim);
+    __half* s_kv = (__half*)smem_raw;
+    float* s_scores = (float*)(s_kv + V3_BC * head_dim);
     float* s_warp   = s_scores + V3_GQA_MAX_HPG * V3_SCORE_STRIDE;
 
     // ---- Pre-load Q vectors for all heads in group ----
@@ -253,32 +251,22 @@ fa3_v3_decode_gqa_kernel(
         for (int r = 0; r < 4; r++) head_acc[g][r] = 0.0f;
     }
 
-    // ---- Async load first K tile into buf[0] ----
-    {
-        int ts = start_tile * V3_BC;
-        int tl = min(V3_BC, context_len - ts);
-        v3_async_load_tile(s_kv[0], key_cache, block_tables, seq_idx, max_blocks_per_seq,
-                           ts, tl, num_kv_heads, kv_head_idx, head_dim, block_size, tid);
-        v3_cp_async_commit();
-        v3_cp_async_wait_all();
-        __syncthreads();
-    }
-
-    int cur_buf = 0;
-
     for (int tile = start_tile; tile < end_tile; tile++) {
         const int tile_start = tile * V3_BC;
         const int tile_len = min(V3_BC, context_len - tile_start);
-        const bool has_next = (tile + 1 < end_tile);
 
-        __half* cur = s_kv[cur_buf];
-        __half* nxt = s_kv[1 - cur_buf];
+        // ---- Async load K tile via cp.async (128-bit bulk, register bypass) ----
+        v3_async_load_tile(s_kv, key_cache, block_tables, seq_idx, max_blocks_per_seq,
+                           tile_start, tile_len, num_kv_heads, kv_head_idx,
+                           head_dim, block_size, tid);
+        v3_cp_async_commit();
+        v3_cp_async_wait_all();
+        __syncthreads();
 
-        // ---- Per-head QK^T + online softmax (K from cur) ----
+        // ---- Per-head QK^T + online softmax (K from s_kv) ----
         for (int g = 0; g < heads_per_group && g < V3_GQA_MAX_HPG; g++) {
             float* g_scores = s_scores + g * V3_SCORE_STRIDE;
 
-            // Warp-parallel QK^T: 8 positions per round
             for (int base_t = 0; base_t < tile_len; base_t += V3_WARPS) {
                 int t = base_t + warp_id;
                 if (t < tile_len) {
@@ -287,11 +275,11 @@ fa3_v3_decode_gqa_kernel(
                     for (int r = 0; r < half2_iters && r < 2; r++) {
                         int d = lane_id * 2 + r * 64;
                         if (d + 1 < head_dim) {
-                            __half2 kv = *reinterpret_cast<const __half2*>(&cur[t * head_dim + d]);
+                            __half2 kv = *reinterpret_cast<const __half2*>(&s_kv[t * head_dim + d]);
                             dot += q_regs[g][r*2]   * __half2float(kv.x);
                             dot += q_regs[g][r*2+1] * __half2float(kv.y);
                         } else if (d < head_dim) {
-                            dot += q_regs[g][r*2] * __half2float(cur[t * head_dim + d]);
+                            dot += q_regs[g][r*2] * __half2float(s_kv[t * head_dim + d]);
                         }
                     }
                     dot = v3_warp_sum(dot);
@@ -300,7 +288,6 @@ fa3_v3_decode_gqa_kernel(
             }
             __syncthreads();
 
-            // Online softmax
             float tile_max = v3_block_reduce_max(
                 (tid < tile_len) ? g_scores[tid] : -FLT_MAX,
                 tid, lane_id, warp_id, s_warp);
@@ -320,51 +307,27 @@ fa3_v3_decode_gqa_kernel(
             head_row_sum[g] += v3_block_reduce_sum(my_exp, tid, lane_id, warp_id, s_warp);
         }
 
-        // ---- K consumed. Async load V[tile] into cur, prefetch K[tile+1] into nxt ----
-        // V load overlaps with any remaining softmax barrier latency.
-        // K prefetch overlaps with PV accumulation below.
-
-        v3_async_load_tile(cur, value_cache, block_tables, seq_idx, max_blocks_per_seq,
+        // ---- Async load V tile (K consumed, reuses same buffer) ----
+        v3_async_load_tile(s_kv, value_cache, block_tables, seq_idx, max_blocks_per_seq,
                            tile_start, tile_len, num_kv_heads, kv_head_idx,
                            head_dim, block_size, tid);
-        v3_cp_async_commit();  // commit group: V
-
-        if (has_next) {
-            int next_start = (tile + 1) * V3_BC;
-            int next_len = min(V3_BC, context_len - next_start);
-            v3_async_load_tile(nxt, key_cache, block_tables, seq_idx, max_blocks_per_seq,
-                               next_start, next_len, num_kv_heads, kv_head_idx,
-                               head_dim, block_size, tid);
-            v3_cp_async_commit();  // commit group: K_next
-        }
-
-        // Wait for V (K_next may still be in flight)
-        if (has_next)
-            v3_cp_async_wait_one();  // V done, K_next pending
-        else
-            v3_cp_async_wait_all();
+        v3_cp_async_commit();
+        v3_cp_async_wait_all();
         __syncthreads();
 
-        // ---- P@V with V reuse across heads (V from cur) ----
+        // ---- P@V with V reuse across heads ----
         #pragma unroll
         for (int r = 0; r < acc_dims && r < 4; r++) {
             int d = tid + r * V3_THREADS;
             if (d < head_dim) {
                 for (int t = 0; t < tile_len; t++) {
-                    float v = __half2float(cur[t * head_dim + d]);
+                    float v = __half2float(s_kv[t * head_dim + d]);
                     for (int g = 0; g < heads_per_group && g < V3_GQA_MAX_HPG; g++)
                         head_acc[g][r] += s_scores[g * V3_SCORE_STRIDE + t] * v;
                 }
             }
         }
-
-        // Wait for K[tile+1] prefetch before swapping buffers
-        if (has_next) {
-            v3_cp_async_wait_all();
-        }
         __syncthreads();
-
-        cur_buf = 1 - cur_buf;
     }
 
     // ---- Write output ----
@@ -466,12 +429,10 @@ fa3_v3_decode_kernel(
         return;
     }
 
-    // Shared memory: 2x KV buf + scores + warp scratch
+    // Shared memory: 1x KV buf + scores + warp scratch
     extern __shared__ char smem_raw[];
-    __half* s_kv[2];
-    s_kv[0] = (__half*)smem_raw;
-    s_kv[1] = s_kv[0] + V3_BC * head_dim;
-    float* s_score = (float*)(s_kv[1] + V3_BC * head_dim);
+    __half* s_kv = (__half*)smem_raw;
+    float* s_score = (float*)(s_kv + V3_BC * head_dim);
     float* s_warp  = s_score + V3_BC;
 
     // Load Q into registers
@@ -498,26 +459,17 @@ fa3_v3_decode_kernel(
     #pragma unroll
     for (int r = 0; r < 4; r++) acc[r] = 0.0f;
 
-    // Async load first K tile
-    {
-        int ts = start_tile * V3_BC;
-        int tl = min(V3_BC, context_len - ts);
-        v3_async_load_tile(s_kv[0], key_cache, block_tables, seq_idx, max_blocks_per_seq,
-                           ts, tl, num_kv_heads, kv_head_idx, head_dim, block_size, tid);
-        v3_cp_async_commit();
-        v3_cp_async_wait_all();
-        __syncthreads();
-    }
-
-    int cur_buf = 0;
-
     for (int tile = start_tile; tile < end_tile; tile++) {
         const int tile_start = tile * V3_BC;
         const int tile_len = min(V3_BC, context_len - tile_start);
-        const bool has_next = (tile + 1 < end_tile);
 
-        __half* cur = s_kv[cur_buf];
-        __half* nxt = s_kv[1 - cur_buf];
+        // Async load K tile
+        v3_async_load_tile(s_kv, key_cache, block_tables, seq_idx, max_blocks_per_seq,
+                           tile_start, tile_len, num_kv_heads, kv_head_idx,
+                           head_dim, block_size, tid);
+        v3_cp_async_commit();
+        v3_cp_async_wait_all();
+        __syncthreads();
 
         // Warp-parallel QK^T
         for (int base_t = 0; base_t < tile_len; base_t += V3_WARPS) {
@@ -528,11 +480,11 @@ fa3_v3_decode_kernel(
                 for (int r = 0; r < half2_iters && r < 2; r++) {
                     int d = lane_id * 2 + r * 64;
                     if (d + 1 < head_dim) {
-                        __half2 kv = *reinterpret_cast<const __half2*>(&cur[t * head_dim + d]);
+                        __half2 kv = *reinterpret_cast<const __half2*>(&s_kv[t * head_dim + d]);
                         dot += q_reg[r*2]   * __half2float(kv.x);
                         dot += q_reg[r*2+1] * __half2float(kv.y);
                     } else if (d < head_dim) {
-                        dot += q_reg[r*2] * __half2float(cur[t * head_dim + d]);
+                        dot += q_reg[r*2] * __half2float(s_kv[t * head_dim + d]);
                     }
                 }
                 dot = v3_warp_sum(dot);
@@ -560,25 +512,12 @@ fa3_v3_decode_kernel(
         if (tid < tile_len) s_score[tid] = my_exp;
         row_sum += v3_block_reduce_sum(my_exp, tid, lane_id, warp_id, s_warp);
 
-        // K consumed -- async load V, prefetch K_next
-        v3_async_load_tile(cur, value_cache, block_tables, seq_idx, max_blocks_per_seq,
+        // Async load V tile (K consumed, reuses same buffer)
+        v3_async_load_tile(s_kv, value_cache, block_tables, seq_idx, max_blocks_per_seq,
                            tile_start, tile_len, num_kv_heads, kv_head_idx,
                            head_dim, block_size, tid);
         v3_cp_async_commit();
-
-        if (has_next) {
-            int next_start = (tile + 1) * V3_BC;
-            int next_len = min(V3_BC, context_len - next_start);
-            v3_async_load_tile(nxt, key_cache, block_tables, seq_idx, max_blocks_per_seq,
-                               next_start, next_len, num_kv_heads, kv_head_idx,
-                               head_dim, block_size, tid);
-            v3_cp_async_commit();
-        }
-
-        if (has_next)
-            v3_cp_async_wait_one();
-        else
-            v3_cp_async_wait_all();
+        v3_cp_async_wait_all();
         __syncthreads();
 
         // P @ V
@@ -588,17 +527,11 @@ fa3_v3_decode_kernel(
             if (d < head_dim) {
                 float v_acc = 0.0f;
                 for (int t = 0; t < tile_len; t++)
-                    v_acc += s_score[t] * __half2float(cur[t * head_dim + d]);
+                    v_acc += s_score[t] * __half2float(s_kv[t * head_dim + d]);
                 acc[r] += v_acc;
             }
         }
-
-        if (has_next) {
-            v3_cp_async_wait_all();
-        }
         __syncthreads();
-
-        cur_buf = 1 - cur_buf;
     }
 
     // Write output

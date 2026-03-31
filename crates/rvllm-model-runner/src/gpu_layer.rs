@@ -1947,8 +1947,8 @@ mod inner {
                     const V3_MAX_HPG: usize = 8;
                     const V3_SCORE_STRIDE: usize = V3_BC + 1;
 
-                    // Double-buffered smem: 2 * BC * hd * sizeof(half) + scores + warp
-                    let smem = 2 * V3_BC * head_dim * std::mem::size_of::<u16>()
+                    // Single-buffered smem: BC * hd * sizeof(half) + scores + warp
+                    let smem = V3_BC * head_dim * std::mem::size_of::<u16>()
                              + V3_MAX_HPG * V3_SCORE_STRIDE * std::mem::size_of::<f32>()
                              + 8 * std::mem::size_of::<f32>();
                     let shared_mem_bytes = smem as u32;
@@ -2035,7 +2035,7 @@ mod inner {
                 if let Ok(v3_kernel) = loader.get_func("flash_attention_3_v3", "fa3_v3_decode_kernel") {
                     const V3_BC: usize = 64;
                     const V3_THREADS: u32 = 256;
-                    let smem = 2 * V3_BC * head_dim * std::mem::size_of::<u16>()
+                    let smem = V3_BC * head_dim * std::mem::size_of::<u16>()
                              + (V3_BC + 8) * std::mem::size_of::<f32>();
                     let shared_mem_bytes = smem as u32;
 
