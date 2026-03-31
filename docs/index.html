@@ -164,6 +164,28 @@ footer a:hover{color:#999}
 </section>
 
 <section>
+<h2>Direct Engine: rvLLM vs Python vLLM</h2>
+<p class="section-sub">H100 SXM 80GB, Qwen2.5-7B f16, no HTTP, 128 tok/req</p>
+<div class="tbl">
+<table>
+<thead><tr><th class="r">N</th><th class="r">rvLLM (tok/s)</th><th class="r">vLLM 0.18 (tok/s)</th><th>Ratio</th></tr></thead>
+<tbody>
+<tr><td class="r">1</td><td class="r">98</td><td class="r">170</td><td>0.58x</td></tr>
+<tr><td class="r">4</td><td class="r">548</td><td class="r">665</td><td>0.82x</td></tr>
+<tr><td class="r">16</td><td class="r">2,122</td><td class="r">2,202</td><td>0.96x</td></tr>
+<tr><td class="r">32</td><td class="r">3,957</td><td class="r">4,585</td><td>0.86x</td></tr>
+<tr><td class="r">64</td><td class="r">7,451</td><td class="r">7,888</td><td>0.94x</td></tr>
+<tr class="peak"><td class="r">128</td><td class="r">12,312</td><td class="r">14,528</td><td>0.85x</td></tr>
+</tbody>
+</table>
+</div>
+<div class="note">
+  Direct engine bypasses HTTP/networking overhead on both sides. Gap narrows to <strong>0.82--0.96x</strong>
+  (vs 0.67--0.88x via HTTP), with near-parity at N=16 and N=64.
+</div>
+</section>
+
+<section>
 <h2>Qwen2.5-1.5B (H100)</h2>
 <p class="section-sub">Direct engine, 512 tok/req</p>
 <div class="tbl">

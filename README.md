@@ -2,7 +2,7 @@
 
 A from-scratch Rust rewrite of [vLLM](https://github.com/vllm-project/vllm) -- the most popular open-source LLM serving engine. Drop-in replacement for the OpenAI-compatible API with dramatically better resource efficiency.
 
-**12,312 tok/s at 128 concurrent streams (direct engine). 50 CUDA kernels. FA3 v3 cp.async + split-KV attention. No-fallback kernel validation. Rust PTX compiler with 2-7.5x faster codegen than nvcc. cuBLAS autotuning. CUDA graph replay. FP8 inference. 20x faster startup. 31x smaller binary.**
+**12,312 tok/s at 128 concurrent streams (0.85x vLLM direct engine). 50 CUDA kernels. FA3 v3 cp.async + split-KV attention. No-fallback kernel validation. Rust PTX compiler with 2-7.5x faster codegen than nvcc. cuBLAS autotuning. CUDA graph replay. FP8 inference. 20x faster startup. 31x smaller binary.**
 
 ## rvLLM vs Python vLLM -- Head-to-Head
 
@@ -12,14 +12,14 @@ All measurements on H100 SXM 80GB, Qwen2.5-7B f16, separate GPU instances per en
 
 Direct engine (no HTTP overhead), Qwen2.5-7B f16, 128 tok/req:
 
-| N | tok/s |
-|---:|---:|
-| 1 | 98 |
-| 4 | 548 |
-| 16 | 2,122 |
-| 32 | 3,957 |
-| 64 | 7,451 |
-| 128 | 12,312 |
+| N | rvLLM (tok/s) | vLLM 0.18 (tok/s) | Ratio |
+|---:|---:|---:|---|
+| 1 | 98 | 170 | 0.58x |
+| 4 | 548 | 665 | 0.82x |
+| 16 | 2,122 | 2,202 | 0.96x |
+| 32 | 3,957 | 4,585 | 0.86x |
+| 64 | 7,451 | 7,888 | 0.94x |
+| 128 | 12,312 | 14,528 | 0.85x |
 
 HTTP steady-state comparison (apples-to-apples):
 
@@ -185,7 +185,7 @@ Note: Phase 5d and earlier numbers used 512 tok/req. Phase 6 uses 128 tok/req (s
 
 ### What Differs from vLLM
 
-The gap is 1.14x at N=16 and 1.50x at N=128 (HTTP). Root causes, in order of impact:
+Direct engine gap is 0.82-0.96x (near parity at N=16/64). HTTP gap is 0.67-0.88x. Root causes, in order of impact:
 
 1. **GEMM tuning**: vLLM uses Triton autotuned GEMMs + torch.compile; we use stock cuBLAS heuristics. This is the dominant remaining gap at high concurrency.
 2. **Attention**: vLLM uses FlashAttention-3 (Tri Dao's official CUDA, heavily optimized with TMA, warp specialization, pipelining); our FA3 v3 uses cp.async and split-KV but still lacks TMA and full warp specialization.
