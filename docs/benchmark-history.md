@@ -2,6 +2,35 @@
 
 All results greedy decoding, 512 tokens/request unless noted. (Prior to 2026-03-30: 32 tokens/request.)
 
+## Phase 5b (2026-03-31) -- cublasLt build fix + vLLM comparison (H100 SXM 80GB)
+
+Binary built with `--features cuda,cublaslt`. Fixed cublaslt_raw module registration,
+FFI type mismatches, RefCell plan cache. Direct engine benchmark.
+
+NOTE: CUTE JIT kernels failed (missing cute/tensor.hpp on instance), so rvLLM ran
+non-fused fallback paths. This explains the ~2x gap vs vLLM.
+
+### Qwen2.5-7B f16 -- rvLLM vs vLLM 0.18 (512 tok/req, same H100)
+
+| N | rvLLM | vLLM 0.18 (eager) | ratio |
+|---|---|---|---|
+| 16 | 863 | 1,612 | vLLM 1.87x |
+| 24 | 1,291 | 2,614 | vLLM 2.02x |
+| 32 | 1,669 | 3,231 | vLLM 1.94x |
+| 48 | 2,426 | 5,014 | vLLM 2.07x |
+| 64 | 3,192 | 6,417 | vLLM 2.01x |
+| 96 | 4,193 | 9,611 | vLLM 2.29x |
+| 128 | 5,137 | 12,132 | vLLM 2.36x |
+
+vLLM using enforce_eager=True (no CUDA graphs, no torch.compile -- compilation
+crashed due to torch version mismatch). With graphs+compile vLLM would be faster still.
+
+### Qwen2.5-1.5B f16 (128 tok/req)
+
+| N | tok/s |
+|---|---|
+| 128 | 19,551 |
+
 ## Phase 5 (2026-03-30) -- Kernel fusion swarm (H100 SXM 80GB)
 
 Direct engine benchmark (no HTTP). Fused kernels: add+norm+QKV GEMV, add+norm+gateup GEMV,
