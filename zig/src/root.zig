@@ -23,6 +23,12 @@ export fn rvz_temperature_scale(logits: [*]f32, n: usize, inv_temp: f32) void {
     simd_math.scale(logits[0..n], inv_temp);
 }
 
+export fn rvz_argmax_logprob(data: [*]const f32, n: usize, out_idx: *u32, out_logprob: *f32) void {
+    const result = simd_math.argmaxLogprob(data[0..n]);
+    out_idx.* = result.idx;
+    out_logprob.* = result.logprob;
+}
+
 // ---- C ABI: Weight conversion ------------------------------------------------
 
 export fn rvz_bf16_to_f16(src: [*]const u16, dst: [*]u16, n: usize) void {
@@ -93,6 +99,16 @@ test "f32 to f16" {
     weight_convert.f32ToF16(&src, &dst);
     try testing.expectEqual(dst[0], 0x3C00);
     try testing.expectEqual(dst[1], 0x4000);
+}
+
+test "argmax_logprob fused" {
+    const logits = [_]f32{ 1.0, 5.0, 3.0, 2.0 };
+    const result = simd_math.argmaxLogprob(&logits);
+    try testing.expectEqual(result.idx, 1);
+    // logprob of argmax should match log_softmax[argmax]
+    var lsm: [4]f32 = undefined;
+    simd_math.logSoftmax(&logits, &lsm);
+    try testing.expectApproxEqAbs(result.logprob, lsm[1], 1e-5);
 }
 
 test "log_softmax matches softmax" {

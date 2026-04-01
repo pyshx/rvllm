@@ -95,6 +95,36 @@ No Python interpreter, no GIL, no garbage collector, no PyTorch tensor allocatio
 | **FP8 weight support** | Yes (cublasLt) | Yes |
 | **FP8 KV cache** | Yes | Yes |
 
+### Zig SIMD Acceleration
+
+Hot-path sampling primitives and weight conversion use a Zig SIMD backend (`rvllm-zig`). `@Vector(16, f32)` maps to NEON on aarch64 and AVX-512 on x86_64 servers. Benchmarked on Apple M5 (128K vocab = LLaMA-3 scale):
+
+| Operation | Zig SIMD | Rust (scalar) | Speedup |
+|---|---:|---:|---|
+| softmax (128K) | 111 us | 169 us | **1.52x** |
+| argmax (128K) | 9.0 us | 60.4 us | **6.73x** |
+| scale (128K) | 6.9 us | 6.9 us | 1.0x (memory-bound) |
+| bf16->f16 (16M) | 710 us | -- | -- |
+| f32->f16 (16M) | 1.22 ms | -- | -- |
+
+End-to-end sampling improvement (criterion, 128K vocab):
+
+| Sampler | Change |
+|---|---|
+| greedy | **-12%** |
+| top-k | **-9%** |
+| top-p | **-5%** |
+| repetition penalty | **-13%** |
+
+Weight conversion throughput (16M elements = one 4096x4096 weight matrix):
+
+| Conversion | Throughput |
+|---|---|
+| bf16 -> f16 | 47.9 GB/s |
+| f32 -> f16 | 56.3 GB/s |
+
+Zig is a hard build dependency -- no fallbacks.
+
 ### CPU-Side Operations
 
 Operations between GPU forward passes, measured on Apple M5 and Xeon:
@@ -228,6 +258,7 @@ What rvLLM does better:
 | `rvllm-gpu` | CUDA abstractions, cuBLAS, kernel loader, vendored cublaslt |
 | `rvllm-fusion` | JIT kernel compiler, PTX emitter, LLVM NVPTX backend |
 | **`rtriton`** | **Triton-style GPU kernel compiler + cuBLAS integration** |
+| `rvllm-zig` | Zig SIMD backend (softmax, argmax, weight conversion) |
 | `rvllm-kv-cache` | Paged KV cache (f16 + FP8) |
 | `rvllm-attention` | Attention backends (FA3 v3 cp.async + split-KV, GQA) |
 | `rvllm-speculative` | Speculative decoding (self-draft) |

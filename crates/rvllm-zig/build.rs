@@ -24,13 +24,20 @@ fn main() {
     let lib_path = out_dir.join("librvllm_zig.a");
 
     // Build object file
-    let status = Command::new("zig")
-        .arg("build-obj")
+    let mut cmd = Command::new("zig");
+    cmd.arg("build-obj")
         .arg("src/root.zig")
         .arg("-OReleaseFast")
         .arg("-target")
         .arg(zig_target)
-        .arg(format!("-femit-bin={}", obj_path.display()))
+        .arg(format!("-femit-bin={}", obj_path.display()));
+
+    // Enable AVX-512 on x86_64 targets (H100/A100 host CPUs are SPR/Genoa)
+    if target_arch == "x86_64" {
+        cmd.arg("-mcpu=x86_64_v4");
+    }
+
+    let status = cmd
         .current_dir(&zig_dir)
         .status()
         .expect("rvllm-zig: zig not found on PATH");

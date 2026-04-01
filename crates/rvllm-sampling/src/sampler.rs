@@ -90,18 +90,15 @@ impl Sampler {
 
         // Sample + compute logprob of selected token.
         let (token_id, logprob) = if is_greedy {
-            let tid = math::greedy_sample(&work);
-            // Only compute log_softmax if logprobs requested or we need the value.
-            let lp = if needs_logprobs {
+            if needs_logprobs {
+                // Need full log-softmax for top_logprobs anyway
+                let tid = math::greedy_sample(&work);
                 let log_probs = math::log_softmax(&work);
-                log_probs[tid as usize]
+                (tid, log_probs[tid as usize])
             } else {
-                // Fast path: compute just this token's log-prob from max-shifted softmax.
-                let max = work.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let sum: f32 = work.iter().map(|x| (x - max).exp()).sum();
-                (work[tid as usize] - max) - sum.ln()
-            };
-            (tid, lp)
+                // Fused argmax + logprob: 2 passes instead of 4
+                rvllm_zig::argmax_logprob(&work)
+            }
         } else {
             let probs = math::softmax(&work);
             let tid = math::multinomial_sample(&probs, rng);

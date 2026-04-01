@@ -90,16 +90,17 @@ pub fn apply_top_p(logits: &mut [f32], p: f32) {
 }
 
 /// Min-p filter: discard tokens whose probability is below min_p * max_prob.
+/// Uses logit-space threshold to avoid softmax allocation:
+/// softmax(x_i) >= min_p * softmax(x_max) simplifies to x_i >= max + ln(min_p).
 #[inline]
 pub fn apply_min_p(logits: &mut [f32], min_p: f32) {
     if min_p <= 0.0 || min_p >= 1.0 {
         return;
     }
-    let probs = crate::math::softmax(logits);
-    let max_prob = probs.iter().cloned().fold(0.0_f32, f32::max);
-    let threshold = min_p * max_prob;
-    for (i, l) in logits.iter_mut().enumerate() {
-        if probs[i] < threshold {
+    let max_logit = rvllm_zig::max_f32(logits);
+    let threshold = max_logit + min_p.ln();
+    for l in logits.iter_mut() {
+        if *l < threshold {
             *l = f32::NEG_INFINITY;
         }
     }

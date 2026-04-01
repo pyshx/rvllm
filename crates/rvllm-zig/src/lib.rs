@@ -9,6 +9,7 @@ extern "C" {
     fn rvz_argmax_f32(data: *const f32, n: usize) -> u32;
     fn rvz_max_f32(data: *const f32, n: usize) -> f32;
     fn rvz_temperature_scale(logits: *mut f32, n: usize, inv_temp: f32);
+    fn rvz_argmax_logprob(data: *const f32, n: usize, out_idx: *mut u32, out_logprob: *mut f32);
     fn rvz_bf16_to_f16(src: *const u16, dst: *mut u16, n: usize);
     fn rvz_f32_to_f16(src: *const f32, dst: *mut u16, n: usize);
 }
@@ -33,6 +34,16 @@ pub fn argmax(logits: &[f32]) -> u32 {
 #[inline]
 pub fn max_f32(data: &[f32]) -> f32 {
     unsafe { rvz_max_f32(data.as_ptr(), data.len()) }
+}
+
+/// Fused argmax + log-probability in 2 passes.
+/// Returns (token_id, logprob).
+#[inline]
+pub fn argmax_logprob(logits: &[f32]) -> (u32, f32) {
+    let mut idx: u32 = 0;
+    let mut logprob: f32 = 0.0;
+    unsafe { rvz_argmax_logprob(logits.as_ptr(), logits.len(), &mut idx, &mut logprob) }
+    (idx, logprob)
 }
 
 #[inline]

@@ -161,6 +161,68 @@ pub fn maxVal(data: []const f32) f32 {
     return best;
 }
 
+// -- argmax + logprob (fused) -------------------------------------------------
+
+/// Fused argmax + log-probability in 2 passes (instead of 4 separate).
+/// Pass 1: max + argmax. Pass 2: sum(exp(x - max)).
+/// Returns (argmax_index, logprob_of_argmax).
+pub fn argmaxLogprob(data: []const f32) struct { idx: u32, logprob: f32 } {
+    const n = data.len;
+    if (n == 0) return .{ .idx = 0, .logprob = 0.0 };
+
+    // Pass 1: simultaneous max + argmax
+    var best_vals: Vec = @splat(neg_inf);
+    var best_idxs: IdxVec = @splat(0);
+    var base_idx: IdxVec = undefined;
+    inline for (0..V) |j| {
+        base_idx[j] = @intCast(j);
+    }
+    const stride: IdxVec = @splat(V);
+
+    var i: usize = 0;
+    while (i + V <= n) : (i += V) {
+        const v: Vec = data[i..][0..V].*;
+        const mask = v > best_vals;
+        best_vals = @select(f32, mask, v, best_vals);
+        best_idxs = @select(u32, mask, base_idx, best_idxs);
+        base_idx += stride;
+    }
+
+    var best_val: f32 = neg_inf;
+    var best_idx: u32 = 0;
+    inline for (0..V) |j| {
+        if (best_vals[j] > best_val) {
+            best_val = best_vals[j];
+            best_idx = best_idxs[j];
+        }
+    }
+    while (i < n) : (i += 1) {
+        if (data[i] > best_val) {
+            best_val = data[i];
+            best_idx = @intCast(i);
+        }
+    }
+
+    // Pass 2: sum(exp(x - max))
+    const mx_vec: Vec = @splat(best_val);
+    var sum_vec: Vec = @splat(@as(f32, 0));
+    i = 0;
+    while (i + V <= n) : (i += V) {
+        const v: Vec = data[i..][0..V].*;
+        sum_vec += @exp(v - mx_vec);
+    }
+    var sum_tail: f32 = 0;
+    while (i < n) : (i += 1) {
+        sum_tail += @exp(data[i] - best_val);
+    }
+    const total = @reduce(.Add, sum_vec) + sum_tail;
+
+    // logprob = (x[idx] - max) - ln(sum) = 0 - ln(sum) = -ln(sum)
+    const logprob = -@log(total);
+
+    return .{ .idx = best_idx, .logprob = logprob };
+}
+
 // -- scale --------------------------------------------------------------------
 
 /// In-place multiply by scalar (temperature scaling: inv_temp = 1/T).
