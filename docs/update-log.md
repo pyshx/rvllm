@@ -4,6 +4,54 @@ Chronological record of all optimization work, benchmarks, and architecture chan
 
 ---
 
+## 2026-04-01: Phase 7 -- Architecture Hardening + INT4 GEMV
+
+**Goal:** Audit and fix correctness issues across the inference stack, improve model portability, add INT4 quantization kernel, and provide multiple decode path options.
+
+**Kernel count:** 50 -> 54 CUDA kernels. Codebase: 241 Rust source files, ~138K lines.
+
+### Correctness fixes
+
+1. **RoPE table cap 8K -> 32K**: Precomputed cos/sin tables were limited to 8192 positions. Any context beyond 8K silently read zero-initialized memory for positional embeddings, causing gradual output degradation. Qwen2.5 supports 131K context via YaRN; raised to 32768 for current workloads.
+
+2. **Megakernel hidden_size parameter**: The megakernel had `hidden_size=3584` hardcoded (Qwen2.5-7B specific). Now passed as a kernel parameter, enabling Llama 3.1 (4096), Mistral (4096), and other architectures without kernel recompilation.
+
+3. **FA3 GQA overflow guard**: `V3_GQA_MAX_HPG` constant raised from 8 to 16. At 8, models with exactly 8 heads/group (Llama 3.1) could overflow internal arrays due to loop unrolling. Qwen2.5-7B (7 heads/group) was borderline safe but had no margin.
+
+4. **Scheduler preemption cap**: Added cap of 4 preemptions per scheduler call with push_back re-queuing. Without this, high-concurrency workloads could enter thrashing loops where the scheduler repeatedly preempted and re-scheduled the same sequences, starving forward progress.
+
+### New decode paths
+
+- **CublasGemvDecode** (`RVLLM_CUBLAS_DECODE=1`): Separate RMSNorm + cuBLAS HGEMM. Achieves 84% HBM bandwidth utilization in standalone cuBLAS calls, 118 tok/s end-to-end. Added in commit de1c7e8.
+
+- **Tensor-core GEMV kernel** (commit b266f8b): m16n8k16 MMA instructions with cp.async double-buffered weight loading. Part of the FusedDecode path.
+
+- **128-bit vectorized loads** (commit 25b1037): INT4 (4xfloat4) vectorized loads applied to all 5 GEMV kernels, improving memory coalescing.
+
+### N=1 decode results (H100 SXM 80GB, Qwen2.5-7B f16, 128 tok/req)
+
+| Decode Path | tok/s |
+|---|---:|
+| FusedDecode (default) | 121 |
+| CublasGemvDecode | 118 |
+| MegakernelDecode | ~50 |
+| PersistentDecode | ~51 |
+| Theoretical ceiling | 222 |
+
+N=1 improved from 98 (Phase 6) to 121 tok/s. High-concurrency numbers unchanged (12,312 tok/s at N=128).
+
+### INT4/W4A16 GEMV kernel
+
+Added `gemv_int4.cu` with 4 variants: standalone, fused QKV, fused gateup, fused silu+down. Per-group asymmetric quantization (group_size=128, zero-point + scale per group). Kernel compiles and passes unit tests. Rust dispatch wiring is TODO -- will be a new `INT4Decode` path activated via `RVLLM_INT4_DECODE=1`.
+
+Expected impact: halving weight memory bandwidth at N=1 should push from 121 toward ~180 tok/s (assuming similar kernel efficiency to f16 fused path).
+
+### Bandwidth analysis
+
+FusedDecode achieves 55% of theoretical HBM bandwidth (121/222 tok/s). The gap breaks down as: kernel launch overhead (~15%), norm/activation kernels (~10%), KV cache writes (~8%), attention (~7%), other (~5%). cuBLAS standalone achieves 84% BW util but loses to FusedDecode end-to-end because separate norm kernels add launch overhead and GMEM round-trips.
+
+---
+
 ## 2026-03-30: rTriton -- Unified Kernel Layer
 
 **Goal:** Replicate Triton's kernel fusion + our cuBLAS tricks in one standalone Rust crate.

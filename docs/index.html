@@ -86,7 +86,7 @@ footer a:hover{color:#999}
 
 <header>
   <h1>rvLLM</h1>
-  <p class="sub">High-performance LLM inference in Rust. 50 CUDA kernels. FA3 v3 cp.async + split-KV. JIT PTX compiler. 16 MB binary.</p>
+  <p class="sub">High-performance LLM inference in Rust. 54 CUDA kernels. FA3 v3 cp.async + split-KV. JIT PTX compiler. 16 MB binary.</p>
   <p class="links">
     <a href="https://github.com/m0at/rvllm">GitHub</a>
     <a href="paper/rvllm.pdf">Paper (color)</a>
@@ -105,7 +105,7 @@ footer a:hover{color:#999}
 <p class="section-sub">Andy Norris (m0at) -- San Francisco, March 31 2026</p>
 <p>
   rvLLM is a from-scratch Rust implementation of the vLLM inference engine for
-  OpenAI-compatible API serving with CUDA GPU acceleration. 50 hand-written CUDA kernels,
+  OpenAI-compatible API serving with CUDA GPU acceleration. 54 hand-written CUDA kernels,
   a Rust-native PTX compiler that generates fused kernels 2-7.5x faster than nvcc,
   FA3 v3 cp.async + split-KV attention, no-fallback kernel validation, cuBLAS algorithm
   autotuning, and CUDA graph replay across 35 batch sizes -- compiling to a single 16 MB static binary.
@@ -226,7 +226,7 @@ footer a:hover{color:#999}
 <p class="section-sub">JIT > Hand-written CUDA > cuBLAS</p>
 <ol>
 <li><strong>JIT fused kernels</strong> (fastest) -- Rust PTX emitter generates shape-specialized fused kernels at model load. 2-7.5x faster than hand-written CUDA for M=1 decode. Patterns: RMSNorm+GEMV, Add+RMSNorm+GEMV, SiLU*Mul+GEMV.</li>
-<li><strong>50 hand-written CUDA kernels</strong> -- fused decode (add+norm+QKV+bias, RoPE+cache, GQA attention, O-proj+gateup, silu+down), FP8 E4M3 variants, TMA async-prefetch GEMV, WGMMA tensor core GEMV, split-KV attention. No-fallback validation at startup ensures every kernel loads or the server fails fast.</li>
+<li><strong>54 hand-written CUDA kernels</strong> -- fused decode (add+norm+QKV+bias, RoPE+cache, GQA attention, O-proj+gateup, silu+down), FP8 E4M3 variants, TMA async-prefetch GEMV, WGMMA tensor core GEMV, split-KV attention, INT4 W4A16 GEMV (4 fused variants, pending Rust wiring). No-fallback validation at startup ensures every kernel loads or the server fails fast.</li>
 <li><strong>cuBLAS/cublasLt</strong> (batched M>1) -- autotuned algorithm selection with vendored type shim for cudarc 0.19. 32 candidates benchmarked per GEMM shape at startup.</li>
 </ol>
 <p>Plus an <strong>LLVM NVPTX backend</strong> (experimental) -- full compiler pipeline: Fusion IR -> LLVM IR -> NVPTX -> PTX via inkwell. Same backend as Triton.</p>
@@ -280,6 +280,7 @@ footer a:hover{color:#999}
 <tr><td>7</td><td>JIT compiler (2-7.5x kernels)</td><td class="r">wiring</td><td>Mar 30</td></tr>
 <tr><td>5d</td><td>FA3 v2 warp-parallel attention</td><td class="r">8,652</td><td>Mar 31</td></tr>
 <tr class="peak"><td>6</td><td>FA3 v3 cp.async + split-KV + no-fallback</td><td class="r">12,312</td><td>Mar 31</td></tr>
+<tr><td>7</td><td>Architecture hardening + INT4 kernel</td><td class="r">12,312</td><td>Apr 1</td></tr>
 </tbody>
 </table>
 </div>
@@ -287,7 +288,7 @@ footer a:hover{color:#999}
 
 <section>
 <h2>Architecture</h2>
-<p class="section-sub">11 crates, 50 CUDA kernels, JIT compiler</p>
+<p class="section-sub">11 crates, 54 CUDA kernels, JIT compiler</p>
 <pre>rvllm-server (16 MB)
   +-- rvllm-engine         async engine, continuous batching
   |     +-- rvllm-worker   GPU worker, CUDA graph management
@@ -299,7 +300,15 @@ footer a:hover{color:#999}
   +-- rvllm-fusion         JIT compiler, PTX emitter, LLVM backend
   +-- rvllm-gpu            CUDA, cuBLAS, kernel loader, vendored cublaslt
   +-- rvllm-tp             tensor parallelism (NCCL, Megatron sharding)
-  +-- rvllm-tokenizer      HuggingFace tokenizers</pre>
+  +-- rvllm-tokenizer      HuggingFace tokenizers
+
+Decode paths (N=1):
+  FusedDecode .......... 121 tok/s  (JIT fused norm+GEMV)
+  CublasGemvDecode ..... 118 tok/s  (separate norm + cuBLAS HGEMM, 84% BW)
+  Megakernel ............ 50 tok/s  (single-launch hidden_size param)
+  Persistent ............ 51 tok/s  (resident thread blocks)
+  Fp8Decode ............. --        (FP8 E4M3 weights)
+  Theoretical f16 ceiling: 222 tok/s</pre>
 </section>
 
 <section>

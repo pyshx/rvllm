@@ -2,7 +2,7 @@
 
 A from-scratch Rust rewrite of [vLLM](https://github.com/vllm-project/vllm) -- the most popular open-source LLM serving engine. Drop-in replacement for the OpenAI-compatible API with dramatically better resource efficiency.
 
-**12,312 tok/s at 128 concurrent streams (0.85x vLLM direct engine). 50 CUDA kernels. FA3 v3 cp.async + split-KV attention. No-fallback kernel validation. Rust PTX compiler with 2-7.5x faster codegen than nvcc. cuBLAS autotuning. CUDA graph replay. FP8 inference. 20x faster startup. 31x smaller binary.**
+**12,312 tok/s at 128 concurrent streams (0.85x vLLM direct engine). 54 CUDA kernels. FA3 v3 cp.async + split-KV attention. No-fallback kernel validation. Rust PTX compiler with 2-7.5x faster codegen than nvcc. cuBLAS autotuning. CUDA graph replay. FP8 inference. INT4/W4A16 GEMV kernel. 20x faster startup. 31x smaller binary.**
 
 ## rvLLM vs Python vLLM -- Head-to-Head
 
@@ -14,7 +14,7 @@ Direct engine (no HTTP overhead), Qwen2.5-7B f16, 128 tok/req:
 
 | N | rvLLM (tok/s) | vLLM 0.18 (tok/s) | Ratio |
 |---:|---:|---:|---|
-| 1 | 98 | 170 | 0.58x |
+| 1 | 121 | 170 | 0.71x |
 | 4 | 548 | 665 | 0.82x |
 | 16 | 2,122 | 2,202 | 0.96x |
 | 32 | 3,957 | 4,585 | 0.86x |
@@ -41,6 +41,20 @@ FA3 v3 adds cp.async bulk global-to-shared copies (128-bit, bypasses registers/L
 | 32 | 3,020 | 3,957 | +31% |
 | 64 | 5,447 | 7,451 | +37% |
 | 128 | 8,652 | 12,312 | +42% |
+
+### N=1 Decode Paths
+
+Multiple decode paths are now available, each with different trade-offs:
+
+| Decode Path | N=1 tok/s | Notes |
+|---|---:|---|
+| FusedDecode (default) | 121 | Fused f16 GEMV kernels, 55% HBM BW utilization |
+| CublasGemvDecode | 118 | Separate norm + cuBLAS HGEMM, 84% BW util standalone |
+| MegakernelDecode | ~50 | All 28 layers in 1 kernel launch |
+| PersistentDecode | ~51 | Cooperative kernel per layer |
+| Fp8Decode | auto | cublasLt FP8 GEMMs (when FP8 weights present) |
+| INT4 (planned) | -- | W4A16 GEMV kernel ready, Rust wiring TODO |
+| Theoretical ceiling | 222 | 100% HBM BW, f16 weights |
 
 ### JIT Compiler: Our Fused Kernels vs Hand-Written CUDA
 
@@ -100,7 +114,7 @@ Operations between GPU forward passes, measured on Apple M5 and Xeon:
 | Install | `cargo install rvllm` | `pip install vllm` (+ PyTorch) |
 | Container image | ~50 MB | ~15 GB |
 | Build from source | 35 sec | N/A |
-| Kernel compilation | 30 sec (44 PTX via nvcc) + 0 sec (JIT at runtime) | 0 or ~60s (torch.compile) |
+| Kernel compilation | 30 sec (54 PTX via nvcc) + 0 sec (JIT at runtime) | 0 or ~60s (torch.compile) |
 | GPU architectures | sm_80, sm_86, sm_89, sm_90 | Same + ROCm |
 
 ## Architecture
@@ -151,7 +165,7 @@ A single decode step at c=128 concurrency:
 - Patterns: RMSNorm+GEMV, Add+RMSNorm+GEMV, SiLU*Mul+GEMV
 - No nvcc dependency -- pure Rust string-based PTX generation
 
-**Tier 2: Hand-written CUDA kernels (50 kernels)**
+**Tier 2: Hand-written CUDA kernels (54 kernels)**
 - Fused decode: add+norm+QKV+bias, RoPE+cache, GQA attention, O-proj+gateup, silu+down
 - FP8 E4M3 variants for all projections
 - TMA async-prefetch GEMV, WGMMA tensor core GEMV
@@ -180,17 +194,18 @@ A single decode step at c=128 concurrency:
 | 7 | JIT compiler (2-7.5x faster kernels) | wiring | Mar 30 |
 | 5d | FA3 v2 (warp-parallel attention rewrite) | 8,652 | Mar 31 |
 | 6 | FA3 v3 (cp.async + split-KV) + no-fallback | 12,312 | Mar 31 |
+| 7 | Architecture hardening + INT4 kernel | 12,312 | Apr 1 |
 
-Note: Phase 5d and earlier numbers used 512 tok/req. Phase 6 uses 128 tok/req (same model, same hardware). The Phase 6 improvement comes from FA3 v3 cp.async attention, CUTLASS header integration, and killing all silent kernel fallback paths that were masking missing fused kernels.
+Note: Phase 5d and earlier numbers used 512 tok/req. Phase 6+ uses 128 tok/req (same model, same hardware). The Phase 6 improvement comes from FA3 v3 cp.async attention, CUTLASS header integration, and killing all silent kernel fallback paths that were masking missing fused kernels. Phase 7 focused on correctness and portability (RoPE 32K, megakernel param fix, FA3 overflow guard, scheduler anti-thrashing) plus adding INT4 GEMV and cuBLAS decode paths.
 
 ### What Differs from vLLM
 
-Direct engine gap is 0.82-0.96x (near parity at N=16/64). HTTP gap is 0.67-0.88x. Root causes, in order of impact:
+Direct engine gap is 0.71-0.96x (near parity at N=16/64). HTTP gap is 0.67-0.88x. Root causes, in order of impact:
 
 1. **GEMM tuning**: vLLM uses Triton autotuned GEMMs + torch.compile; we use stock cuBLAS heuristics. This is the dominant remaining gap at high concurrency.
 2. **Attention**: vLLM uses FlashAttention-3 (Tri Dao's official CUDA, heavily optimized with TMA, warp specialization, pipelining); our FA3 v3 uses cp.async and split-KV but still lacks TMA and full warp specialization.
 3. **Scheduler**: vLLM has mature continuous batching with sophisticated prefill/decode interleaving, chunked prefill, and priority preemption. Ours is simpler.
-4. **Quantization**: vLLM supports GPTQ, AWQ, SqueezeLLM, Marlin, FP8, etc. We have FP8 only.
+4. **Quantization**: vLLM supports GPTQ, AWQ, SqueezeLLM, Marlin, FP8, etc. We have FP8 and INT4/W4A16 (kernel ready, dispatch wiring in progress).
 
 What rvLLM does better:
 
@@ -200,6 +215,7 @@ What rvLLM does better:
 4. **5.6x tighter P95 latency** -- no GIL, no GC pauses, no JIT recompilations
 5. **Zero dependencies** -- single static binary, ~50 MB container image
 6. **JIT fused kernels 2-7.5x faster** than hand-written CUDA for N=1 decode
+7. **Multiple decode paths** -- cuBLAS GEMV (84% BW util), fused GEMV, megakernel, persistent, FP8, INT4 planned
 
 ### What's Inside
 
@@ -259,6 +275,14 @@ RVLLM_FP8_WEIGHTS=1 rvllm serve --model Qwen/Qwen2.5-7B --dtype half
 ```bash
 RVLLM_FP8_KV=1 rvllm serve --model Qwen/Qwen2.5-7B --dtype half
 ```
+
+**cuBLAS GEMV Decode** (`RVLLM_CUBLAS_DECODE=1`): Uses separate RMSNorm + cuBLAS HGEMM for N=1 decode instead of fused GEMV kernels. Achieves 84% HBM bandwidth utilization in standalone cuBLAS calls, 118 tok/s end-to-end. Slightly slower than FusedDecode (121 tok/s) due to extra kernel launch overhead, but useful for profiling and as a reference baseline.
+
+```bash
+RVLLM_CUBLAS_DECODE=1 rvllm serve --model Qwen/Qwen2.5-7B --dtype half
+```
+
+**INT4 Decode** (`RVLLM_INT4_DECODE=1`, planned): W4A16 GEMV decode path using per-group asymmetric INT4 quantization. The CUDA kernel (`gemv_int4.cu`, 4 variants: standalone, fused QKV, fused gateup, fused silu+down) is written but not yet wired to Rust dispatch. Will halve weight memory bandwidth vs f16.
 
 **Speculative Decoding** (`RVLLM_SPECULATIVE=1`): Self-draft speculative decoding using the first N layers of the target model as a draft. Produces multiple tokens per step when the draft is accepted. Primarily beneficial for large models (70B+) where single-token decode latency is high enough that the draft+verify overhead is worthwhile. For 7B models, the acceptance rate with self-draft at 1/4 depth is too low to overcome the verify prefill cost. Requires a proper draft KV cache for production use (currently experimental).
 

@@ -2,6 +2,50 @@
 
 All results greedy decoding, 512 tokens/request unless noted. (Prior to 2026-03-30: 32 tokens/request.)
 
+## Phase 7 (2026-04-01) -- Architecture hardening + INT4 GEMV (H100 SXM 80GB)
+
+Focus: correctness fixes, portability, and new quantization kernel. No throughput regression at high concurrency (12,312 tok/s N=128 unchanged). N=1 improved from 98 to 121 tok/s via fused GEMV + 128-bit vectorized loads.
+
+### N=1 decode path comparison (Qwen2.5-7B f16, 128 tok/req, H100 SXM 80GB)
+
+| Decode Path | N=1 tok/s | HBM BW util | Env var |
+|---|---:|---:|---|
+| FusedDecode (default) | 121 | 55% | -- |
+| CublasGemvDecode | 118 | 84% (standalone) | RVLLM_CUBLAS_DECODE=1 |
+| MegakernelDecode | ~50 | -- | RVLLM_MEGAKERNEL=1 |
+| PersistentDecode | ~51 | -- | RVLLM_PERSISTENT=1 |
+| Theoretical ceiling (f16) | 222 | 100% | -- |
+
+FusedDecode wins end-to-end despite cuBLAS achieving higher standalone BW utilization (84% vs 55%) because the fused kernels eliminate kernel launch overhead and GMEM round-trips between norm and GEMV.
+
+### Correctness and portability fixes
+
+1. **RoPE table cap 8K -> 32K**: RoPE cos/sin precomputed tables were capped at 8192 positions. Qwen2.5 supports 131K context via YaRN, so any sequence beyond 8K silently read zeroed memory for positional embeddings. Raised cap to 32768 (sufficient for all current workloads, dynamic allocation TODO for 131K).
+2. **Megakernel portability**: `hidden_size=3584` was hardcoded in the megakernel. Now passed as a kernel parameter, enabling non-Qwen models (Llama 3.1 hidden_size=4096, etc.).
+3. **FA3 GQA overflow guard**: `V3_GQA_MAX_HPG` raised from 8 to 16. Qwen2.5-7B has 7 heads/group, Llama 3.1 has 8 -- both fit in 8, but the constant was also used as an array size and was 1 short of the actual max when accounting for loop unrolling. Raising to 16 prevents silent overflow.
+4. **Scheduler anti-thrashing**: Preemption capped at 4 sequences per scheduler call with push_back (re-queue at end). Previously, at high concurrency the scheduler could preempt and re-schedule the same sequences in a tight loop, burning CPU without making forward progress.
+
+### INT4/W4A16 GEMV kernel
+
+Added `gemv_int4.cu` with 4 fused variants:
+- Standalone INT4 GEMV
+- Fused QKV (add+norm+INT4 GEMV)
+- Fused gateup (add+norm+INT4 GEMV)
+- Fused silu+down (silu*mul+INT4 GEMV)
+
+Per-group asymmetric quantization (group_size=128, zero-point + scale per group). Not yet wired to Rust dispatch -- kernel compilation and unit tests only. Will halve weight memory bandwidth vs f16 at N=1.
+
+### Bandwidth analysis
+
+| Path | N=1 tok/s | BW util | Notes |
+|---|---:|---:|---|
+| FusedDecode | 121 | 55% | Fused norm+GEMV, 128-bit loads |
+| cuBLAS standalone | -- | 84% | HGEMM only (no norm overhead) |
+| cuBLAS end-to-end | 118 | ~53% | Separate norm adds launch overhead |
+| Theoretical f16 | 222 | 100% | 14GB weights / 3.35 TB/s HBM BW |
+
+The 55% BW utilization gap (vs theoretical 222 tok/s) comes from: kernel launch overhead (~15%), norm/activation kernels (~10%), KV cache writes (~8%), attention kernel (~7%), other (~5%). INT4 would halve the weight read bottleneck, potentially reaching ~180 tok/s at N=1.
+
 ## Phase 5d (2026-03-31) -- FA3 v2 kernel optimization (H100 SXM 80GB)
 
 Rewrote FlashAttention-3 decode kernels (both non-GQA and GQA):

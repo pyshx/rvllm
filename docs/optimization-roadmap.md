@@ -1,32 +1,31 @@
 # rvLLM Optimization Roadmap
 
-## Current State (March 28, 2026)
+## Current State (April 1, 2026)
 
-Verified coherent: **8,578 tok/s** peak on A100 80GB SXM4, Qwen2.5-1.5B, FP16, greedy decoding.
+Verified coherent: **12,312 tok/s** at N=128 on H100 SXM 80GB, Qwen2.5-7B f16, direct engine.
 
-### Throughput Scaling Curve (A100 80GB, 512 tok/req)
+54 hand-written CUDA kernels. 5 decode paths: FusedDecode (121 tok/s), CublasGemvDecode (118 tok/s, 84% BW util), Megakernel (50), Persistent (51), Fp8Decode. Theoretical N=1 f16 ceiling: 222 tok/s.
 
-```
-N=1:    101 tok/s    -- single request, latency-bound
-N=16:   697 tok/s    -- GPU severely underutilized
-N=32:   925 tok/s    -- still underutilized
-N=64:   4,063 tok/s  -- inflection point, GPU starts saturating
-N=128:  6,360 tok/s  -- production sweet spot
-N=256:  8,316 tok/s  -- approaching peak
-N=512:  8,528 tok/s  -- near peak
-N=768:  8,539 tok/s  -- plateau
-N=1024: 8,578 tok/s  -- peak
-```
-
-### Python vLLM 0.18 Comparison (same hardware)
+### Direct Engine Scaling (H100 SXM 80GB, Qwen2.5-7B f16, 128 tok/req)
 
 ```
-N=1:    69 tok/s     -- rvLLM 1.5x faster
-N=64:   3,828 tok/s  -- rvLLM 1.06x faster
-N=128:  6,400 tok/s  -- roughly matched
-N=256:  9,437 tok/s  -- vLLM 1.13x faster
-N=512:  10,771 tok/s -- vLLM 1.26x faster
-N=1024: 12,740 tok/s -- vLLM 1.49x faster
+N=1:    98 tok/s     -- single request, latency-bound
+N=4:    548 tok/s    -- low-batch regime
+N=16:   2,122 tok/s  -- near parity with vLLM (0.96x)
+N=32:   3,957 tok/s  -- 0.86x vLLM
+N=64:   7,451 tok/s  -- 0.94x vLLM
+N=128:  12,312 tok/s -- 0.85x vLLM, production sweet spot
+```
+
+### Python vLLM 0.18 Comparison (H100, direct engine)
+
+```
+N=1:    170 tok/s    -- vLLM 1.73x faster
+N=4:    665 tok/s    -- vLLM 1.21x faster
+N=16:   2,202 tok/s  -- near parity (0.96x)
+N=32:   4,585 tok/s  -- vLLM 1.16x faster
+N=64:   7,888 tok/s  -- near parity (0.94x)
+N=128:  14,528 tok/s -- vLLM 1.18x faster
 ```
 
 ## Bottleneck Analysis by Batch Size Region
@@ -161,6 +160,8 @@ This would match or beat vLLM (12,740) across the full batch range.
 | cudarc 0.19 + sm_120 | 20-agent swarm | 8,339 | Mar 28, 2026 |
 | Kernel optimizations | 17-agent swarm | 8,578 (coherent) | Mar 28, 2026 |
 | CUDA graph fix reverted | Bisected bug | 8,578 | Mar 28, 2026 |
+| FA3 v3 + split-KV + no-fallback | Phase 6 | 12,312 | Mar 31, 2026 |
+| Architecture hardening + INT4 kernel | Phase 7 | 12,312 | Apr 1, 2026 |
 
 ## rTriton: Unified Kernel Layer
 
@@ -193,3 +194,47 @@ The single largest remaining optimization is **CUDA graph capture/replay done co
 5. Validate output coherency on every change
 
 The graph infrastructure exists in `crates/rvllm-worker/src/graph_runner.rs`. The capture/replay pool with padded batch sizes {1, 2, 4, 8, 16, 32} is implemented. What broke was the metadata update path -- block tables and positions need to be updated in the captured graph's input buffers, not in newly allocated buffers.
+
+## Phase 7: Architecture Hardening (April 1, 2026)
+
+Phase 7 focused on robustness, kernel coverage, and N=1 decode path diversity. No throughput regression at N=128 (still 12,312 tok/s).
+
+### Changes
+
+- **RoPE cap 8K -> 32K** -- extended rotary position embedding maximum from 8K to 32K context length
+- **Megakernel hidden_size param** -- parameterized hidden dimension instead of compile-time constant, enabling multi-model support
+- **FA3 MAX_HPG 8 -> 16** -- doubled maximum heads-per-group in FlashAttention3, supporting wider GQA ratios
+- **Scheduler anti-thrash** -- hysteresis in the continuous batching scheduler to prevent rapid prefill/decode mode switching
+- **INT4 W4A16 GEMV kernel** (`gemv_int4.cu`) -- 4 fused variants for weight-only INT4 quantized inference. Not yet wired to Rust engine; CUDA kernels validated standalone
+- **cuBLAS GEMV decode path** -- separate norm + cuBLAS HGEMM achieving 84% HBM bandwidth utilization at N=1
+
+### Five Decode Paths (N=1)
+
+| Path | tok/s | Notes |
+|---|---|---|
+| FusedDecode | 121 | JIT fused norm+GEMV, fastest path |
+| CublasGemvDecode | 118 | Separate norm + cuBLAS HGEMM, 84% BW util |
+| Megakernel | 50 | Single-launch, hidden_size parameterized |
+| Persistent | 51 | Resident thread blocks, work queue |
+| Fp8Decode | -- | FP8 E4M3 weight path |
+
+Theoretical N=1 f16 ceiling on H100: **222 tok/s** (3.35 TB/s effective BW / 15.1 GB model weights).
+
+### Kernel Count: 50 -> 54
+
+New kernels added in Phase 7:
+1. `gemv_int4.cu` -- 4 fused INT4 W4A16 GEMV variants (norm+gemv, gemv, silu_mul+gemv, add+norm+gemv)
+
+## What's Next
+
+### Near-term (Phase 8)
+
+- **Wire INT4 GEMV to Rust** -- integrate `gemv_int4.cu` kernels into the model runner decode path, enabling W4A16 quantized serving
+- **L2 persistence** -- pin hot layer weights in H100 L2 cache (50 MB) using `cudaAccessPolicyWindow` to reduce HBM reads for repeated decode steps
+- **Swap preemption** -- evict low-priority sequences to host memory under memory pressure, re-prefetch on demand, enabling longer context without OOM
+
+### Medium-term
+
+- **Close N=1 gap** -- FusedDecode at 121 tok/s vs theoretical 222 tok/s leaves 45% headroom; profile and eliminate remaining bottlenecks
+- **INT4 + FP8 mixed precision** -- combine W4A16 GEMV for projections with FP8 KV cache for maximum memory efficiency
+- **Multi-model megakernel** -- leverage parameterized hidden_size to serve multiple model architectures from a single binary
