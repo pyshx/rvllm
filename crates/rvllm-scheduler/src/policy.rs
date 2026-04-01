@@ -13,7 +13,7 @@ pub enum PreemptionMode {
 
 impl Default for PreemptionMode {
     fn default() -> Self {
-        Self::Swap
+        Self::Recompute
     }
 }
 

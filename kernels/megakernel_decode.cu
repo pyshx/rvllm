@@ -616,11 +616,10 @@ megakernel_decode_f16(
     const float*         __restrict__ rope_sin,
     int*                 __restrict__ output_token,
     int                               block_size,
-    int                               max_context_len,
-    int                               hidden_size
+    int                               max_context_len
 ) {
     extern __shared__ float smem[];
-    float* s_scratch = smem + hidden_size; // warp reduction scratch after hidden_size floats
+    float* s_scratch = smem + 3584; // after hidden_size floats
 
     // Instruction interpreter loop
     for (int pc = 0; pc < num_instructions; pc++) {

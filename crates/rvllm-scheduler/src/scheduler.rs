@@ -100,7 +100,7 @@ impl Default for SchedulerConfig {
             max_num_seqs: 256,
             max_num_batched_tokens: 8192,
             max_paddings: 256,
-            preemption_mode: PreemptionMode::Swap,
+            preemption_mode: PreemptionMode::Recompute,
             policy: SchedulerPolicy::Fcfs,
             max_prefill_chunk: 0,
         }
