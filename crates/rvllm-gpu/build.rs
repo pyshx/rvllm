@@ -148,7 +148,7 @@ fn compile_kernels(nvcc: &Path, kernel_dir: &Path, out_dir: &Path) {
                 };
                 let cubin_path = ptx_dir.join(&cubin_name);
                 let mut nvcc_cmd = Command::new(nvcc);
-                nvcc_cmd.args(["-cubin", &arch_flag, "-O3", "-rdc=true", "--use_fast_math"]);
+                nvcc_cmd.args(["-cubin", &arch_flag, "-O3", "--use_fast_math"]);
                 nvcc_cmd.arg("-Xptxas");
                 nvcc_cmd.arg("-v");
                 nvcc_cmd.arg("-o").arg(&cubin_path).arg(&path);

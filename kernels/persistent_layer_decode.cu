@@ -6,8 +6,8 @@
 //   - Parallelized RoPE: all blocks participate (vs block 0 only)
 //   - L2 weight prefetch: idle blocks prefetch O-proj weights during attention
 //
-// Requires: cooperative launch (cuLaunchCooperativeKernel) for co-residency
-// Compile: nvcc -cubin -arch=sm_90 -O3 --use_fast_math -rdc=true
+// Requires: grid fits on GPU (256 blocks <= 132 SMs x 8 blocks/SM = 1056)
+// Compile: nvcc -cubin -arch=sm_90 -O3 --use_fast_math
 //
 // Grid: (256, 1, 1) -- all blocks must be co-resident
 // Block: (256, 1, 1)
@@ -21,7 +21,6 @@
 //   5: Add + RMSNorm + GateUp GEMV
 //   6: SiLU + Down GEMV
 
-#include <cooperative_groups.h>
 #include <cuda_fp16.h>
 #include <float.h>
 

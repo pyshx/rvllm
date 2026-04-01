@@ -64,7 +64,7 @@ else
         stem=\$(basename "\$cu" .cu)
         if [[ "\$stem" == "persistent_layer_decode" ]]; then
             echo "  \$stem -> cubin"
-            nvcc -cubin -arch=\$ARCH -O3 --use_fast_math -rdc=true -Xptxas -v \
+            nvcc -cubin -arch=\$ARCH -O3 --use_fast_math -Xptxas -v \
                 -o "kernels/\$ARCH/\${stem}.cubin" "\$cu" 2>&1 | grep -E "registers|spill" || true
         elif [[ "\$stem" == cutlass_* ]]; then
             echo "  \$stem -> skip (needs CUTLASS headers)"
