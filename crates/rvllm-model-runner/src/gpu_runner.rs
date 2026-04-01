@@ -52,14 +52,24 @@ mod cuda_impl {
     use super::ForwardOutput;
 
     /// Reusable GPU buffer that grows as needed, eliminating per-step CUDA
-    /// allocations on the hot decode path.
+    /// allocations on the hot decode path. Once `freeze()` is called (after
+    /// CUDA graph capture pre-allocation), the buffer will never reallocate --
+    /// preventing stale-pointer bugs in captured graphs.
     struct ReusableGpuBuf {
         buf: Option<CudaSlice<i32>>,
+        frozen: bool,
     }
 
     impl ReusableGpuBuf {
         fn new() -> Self {
-            Self { buf: None }
+            Self { buf: None, frozen: false }
+        }
+
+        /// Lock the buffer at its current size. After this, upload() will
+        /// panic if data exceeds the allocated capacity rather than silently
+        /// reallocating (which would invalidate CUDA graph pointers).
+        fn freeze(&mut self) {
+            self.frozen = true;
         }
 
         /// Upload `data` into the reusable buffer. If the existing GPU allocation
@@ -72,7 +82,6 @@ mod cuda_impl {
         ) -> std::result::Result<(), cudarc::driver::result::DriverError> {
             let need = data.len();
             if need == 0 {
-                // Ensure we have at least a 1-element buffer so references are valid.
                 if self.buf.is_none() {
                     self.buf = Some(stream.alloc_zeros::<i32>(1)?);
                 }
@@ -80,7 +89,11 @@ mod cuda_impl {
             }
             let have = self.buf.as_ref().map_or(0, |b| b.len());
             if have < need {
-                // Grow with 2x headroom to amortize future resizes.
+                assert!(
+                    !self.frozen,
+                    "ReusableGpuBuf: overflow after freeze (need {need}, have {have}). \
+                     Pre-allocation in prepare_for_graph_capture() is too small."
+                );
                 let cap = need.max(have * 2).max(64);
                 self.buf = Some(stream.alloc_zeros::<i32>(cap)?);
             }
@@ -108,6 +121,74 @@ mod cuda_impl {
         pub down_a: CudaSlice<f16>,       // [max_tokens * hidden]
         pub residual_b: CudaSlice<f16>,   // [max_tokens * hidden]
         pub down_b: CudaSlice<f16>,       // [max_tokens * hidden]
+    }
+
+    /// Quantize f16 weight matrix to INT4 with per-group asymmetric scales/zeros.
+    /// Returns (packed_u32, scales_f16, zeros_f16).
+    fn quantize_int4_group(
+        data: &[half::f16], rows: usize, cols: usize, group_size: usize,
+    ) -> (Vec<u32>, Vec<half::f16>, Vec<half::f16>) {
+        assert_eq!(data.len(), rows * cols);
+        assert!(cols % 8 == 0, "cols must be divisible by 8 for int4 packing");
+        let num_groups = (cols + group_size - 1) / group_size;
+        let packed_cols = cols / 8;
+        let mut packed = vec![0u32; rows * packed_cols];
+        let mut scales = vec![half::f16::ZERO; rows * num_groups];
+        let mut zeros = vec![half::f16::ZERO; rows * num_groups];
+
+        for r in 0..rows {
+            let row = &data[r * cols..(r + 1) * cols];
+            for g in 0..num_groups {
+                let start = g * group_size;
+                let end = (start + group_size).min(cols);
+                let group = &row[start..end];
+
+                let mut min_val = f32::MAX;
+                let mut max_val = f32::MIN;
+                for &v in group {
+                    let f = v.to_f32();
+                    min_val = min_val.min(f);
+                    max_val = max_val.max(f);
+                }
+
+                let range = max_val - min_val;
+                let s = if range > 1e-10 { range / 15.0 } else { 1.0 };
+                let z = -min_val / s;
+
+                scales[r * num_groups + g] = half::f16::from_f32(s);
+                zeros[r * num_groups + g] = half::f16::from_f32(z);
+
+                // Quantize and pack
+                for k in start..end {
+                    let f = row[k].to_f32();
+                    let q = ((f / s + z).round().clamp(0.0, 15.0)) as u32;
+                    let packed_idx = k / 8;
+                    let nibble = k % 8;
+                    packed[r * packed_cols + packed_idx] |= q << (nibble * 4);
+                }
+            }
+        }
+        (packed, scales, zeros)
+    }
+
+    fn upload_u32(
+        stream: &Arc<CudaStream>, data: &[u32],
+    ) -> Result<CudaSlice<u32>> {
+        let mut buf = unsafe { stream.alloc::<u32>(data.len()) }
+            .map_err(|e| LLMError::GpuError(format!("int4 u32 alloc: {e}")))?;
+        stream.memcpy_htod(data, &mut buf)
+            .map_err(|e| LLMError::GpuError(format!("int4 u32 htod: {e}")))?;
+        Ok(buf)
+    }
+
+    fn upload_f16(
+        stream: &Arc<CudaStream>, data: &[half::f16],
+    ) -> Result<CudaSlice<half::f16>> {
+        let mut buf = unsafe { stream.alloc::<half::f16>(data.len()) }
+            .map_err(|e| LLMError::GpuError(format!("int4 f16 alloc: {e}")))?;
+        stream.memcpy_htod(data, &mut buf)
+            .map_err(|e| LLMError::GpuError(format!("int4 f16 htod: {e}")))?;
+        Ok(buf)
     }
 
     /// Element offsets into the packed metadata GPU buffer.
@@ -179,6 +260,21 @@ mod cuda_impl {
         fp8_down_proj_scale: Vec<CudaSlice<half::f16>>,
         /// FP8 input scratch buffer for cublasLt FP8 GEMM (reused across layers).
         fp8_input_scratch: Option<CudaSlice<u8>>,
+        /// INT4 (W4A16) quantized weights per layer: packed uint32 + per-group scales/zeros.
+        /// Populated by quantize_int4() or loaded from GPTQ/AWQ checkpoints.
+        int4_fused_qkv: Vec<CudaSlice<u32>>,
+        int4_fused_qkv_scales: Vec<CudaSlice<half::f16>>,
+        int4_fused_qkv_zeros: Vec<CudaSlice<half::f16>>,
+        int4_o_proj: Vec<CudaSlice<u32>>,
+        int4_o_proj_scales: Vec<CudaSlice<half::f16>>,
+        int4_o_proj_zeros: Vec<CudaSlice<half::f16>>,
+        int4_fused_gate_up: Vec<CudaSlice<u32>>,
+        int4_fused_gate_up_scales: Vec<CudaSlice<half::f16>>,
+        int4_fused_gate_up_zeros: Vec<CudaSlice<half::f16>>,
+        int4_down_proj: Vec<CudaSlice<u32>>,
+        int4_down_proj_scales: Vec<CudaSlice<half::f16>>,
+        int4_down_proj_zeros: Vec<CudaSlice<half::f16>>,
+        int4_group_size: usize,
         /// Pre-allocated scratch buffers for the forward pass (RefCell for interior mutability).
         f16_scratch: RefCell<Option<F16LayerScratch>>,
     }
@@ -247,7 +343,7 @@ mod cuda_impl {
 
             // Precompute RoPE cos/sin tables
             let head_dim = config.head_dim;
-            let max_pos = config.max_position.min(8192);
+            let max_pos = config.max_position;
             let half_dim = head_dim / 2;
             let rope_theta = config.rope_theta;
             let mut cos_table = vec![0.0f32; max_pos * half_dim];
@@ -308,6 +404,12 @@ mod cuda_impl {
                 loaded
             };
 
+            // Configure L2 cache: reserve 75% for persisting accesses.
+            // On H100 this gives ~37.5 MB for KV cache pages, RoPE tables, norm weights.
+            if let Err(e) = rvllm_gpu::l2_cache::configure_l2_persisting_cache(0.75) {
+                tracing::warn!("L2 persist config failed (non-fatal): {e}");
+            }
+
             Ok(Self {
                 weights,
                 cache,
@@ -344,6 +446,19 @@ mod cuda_impl {
                 fp8_down_proj: Vec::new(),
                 fp8_down_proj_scale: Vec::new(),
                 fp8_input_scratch: None,
+                int4_fused_qkv: Vec::new(),
+                int4_fused_qkv_scales: Vec::new(),
+                int4_fused_qkv_zeros: Vec::new(),
+                int4_o_proj: Vec::new(),
+                int4_o_proj_scales: Vec::new(),
+                int4_o_proj_zeros: Vec::new(),
+                int4_fused_gate_up: Vec::new(),
+                int4_fused_gate_up_scales: Vec::new(),
+                int4_fused_gate_up_zeros: Vec::new(),
+                int4_down_proj: Vec::new(),
+                int4_down_proj_scales: Vec::new(),
+                int4_down_proj_zeros: Vec::new(),
+                int4_group_size: 128,
                 f16_scratch: RefCell::new(None),
             })
         }
@@ -510,6 +625,65 @@ mod cuda_impl {
                 self.fp8_input_scratch = Some(unsafe { self.stream.alloc::<u8>(max_k) }
                     .map_err(|e| LLMError::GpuError(format!("fp8 input scratch: {e}")))?);
                 info!(num_layers, "FP8 weight quantization complete (all projections)");
+            }
+
+            // INT4 weight quantization (when RVLLM_INT4_DECODE=1)
+            // Asymmetric per-group: each group of 128 elements gets a scale and zero_point.
+            // Halves the already-halved FP8 bandwidth -> 4x total reduction vs f16.
+            if std::env::var("RVLLM_INT4_DECODE").map_or(false, |v| v == "1") {
+                let group_size = std::env::var("RVLLM_INT4_GROUP_SIZE")
+                    .ok().and_then(|v| v.parse().ok()).unwrap_or(128usize);
+                self.int4_group_size = group_size;
+                info!(group_size, "quantizing weights to INT4 (W4A16, per-group scales)...");
+
+                let q_dim = self.config.num_heads * self.config.head_dim;
+                let intermediate = self.config.intermediate_size;
+                let gate_up_dim = intermediate * 2;
+
+                for i in 0..num_layers {
+                    // QKV: [qkv_dim, hidden]
+                    let mut host = vec![half::f16::ZERO; self.fused_qkv_weights[i].len()];
+                    self.stream.memcpy_dtoh(&self.fused_qkv_weights[i], &mut host)
+                        .map_err(|e| LLMError::GpuError(format!("int4 dtoh qkv: {e}")))?;
+                    let (packed, scales, zeros) = quantize_int4_group(&host, qkv_dim, hidden, group_size);
+                    self.int4_fused_qkv.push(upload_u32(&self.stream, &packed)?);
+                    self.int4_fused_qkv_scales.push(upload_f16(&self.stream, &scales)?);
+                    self.int4_fused_qkv_zeros.push(upload_f16(&self.stream, &zeros)?);
+
+                    // O-proj: [hidden, q_dim]
+                    let o_name = format!("model.layers.{i}.self_attn.o_proj.weight");
+                    let o_w = self.weights.get(&o_name)
+                        .ok_or_else(|| LLMError::GpuError(format!("missing {o_name}")))?;
+                    let mut host = vec![half::f16::ZERO; o_w.len()];
+                    self.stream.memcpy_dtoh(o_w, &mut host)
+                        .map_err(|e| LLMError::GpuError(format!("int4 dtoh o: {e}")))?;
+                    let (packed, scales, zeros) = quantize_int4_group(&host, hidden, q_dim, group_size);
+                    self.int4_o_proj.push(upload_u32(&self.stream, &packed)?);
+                    self.int4_o_proj_scales.push(upload_f16(&self.stream, &scales)?);
+                    self.int4_o_proj_zeros.push(upload_f16(&self.stream, &zeros)?);
+
+                    // Gate+up: [gate_up_dim, hidden]
+                    let mut host = vec![half::f16::ZERO; self.fused_gate_up_weights[i].len()];
+                    self.stream.memcpy_dtoh(&self.fused_gate_up_weights[i], &mut host)
+                        .map_err(|e| LLMError::GpuError(format!("int4 dtoh gu: {e}")))?;
+                    let (packed, scales, zeros) = quantize_int4_group(&host, gate_up_dim, hidden, group_size);
+                    self.int4_fused_gate_up.push(upload_u32(&self.stream, &packed)?);
+                    self.int4_fused_gate_up_scales.push(upload_f16(&self.stream, &scales)?);
+                    self.int4_fused_gate_up_zeros.push(upload_f16(&self.stream, &zeros)?);
+
+                    // Down: [hidden, intermediate]
+                    let d_name = format!("model.layers.{i}.mlp.down_proj.weight");
+                    let d_w = self.weights.get(&d_name)
+                        .ok_or_else(|| LLMError::GpuError(format!("missing {d_name}")))?;
+                    let mut host = vec![half::f16::ZERO; d_w.len()];
+                    self.stream.memcpy_dtoh(d_w, &mut host)
+                        .map_err(|e| LLMError::GpuError(format!("int4 dtoh down: {e}")))?;
+                    let (packed, scales, zeros) = quantize_int4_group(&host, hidden, intermediate, group_size);
+                    self.int4_down_proj.push(upload_u32(&self.stream, &packed)?);
+                    self.int4_down_proj_scales.push(upload_f16(&self.stream, &scales)?);
+                    self.int4_down_proj_zeros.push(upload_f16(&self.stream, &zeros)?);
+                }
+                info!(num_layers, group_size, "INT4 weight quantization complete");
             }
 
             self.alloc_scratch()?;
@@ -1277,6 +1451,13 @@ mod cuda_impl {
                 {
                     return ForwardPath::Fp8Decode;
                 }
+                // INT4 decode: 4x less weight bandwidth
+                // Enable with RVLLM_INT4_DECODE=1 (requires int4-quantized weights)
+                if std::env::var("RVLLM_INT4_DECODE").map_or(false, |v| v == "1")
+                    && !self.int4_fused_qkv.is_empty()
+                {
+                    return ForwardPath::Int4Decode;
+                }
                 ForwardPath::FusedDecode
             } else {
                 ForwardPath::Batched
@@ -1305,7 +1486,8 @@ mod cuda_impl {
             let dummy = vec![0i32; max_meta];
             meta.upload(&dummy, &self.stream)
                 .map_err(|e| LLMError::GpuError(format!("pre-alloc meta: {e}")))?;
-            info!(max_meta, "pre-allocated packed metadata buffer for graph stability");
+            meta.freeze();
+            info!(max_meta, "pre-allocated and frozen packed metadata buffer for graph stability");
             // Pre-allocate graph output buffer too (same reason -- stable pointer).
             {
                 let mut out = self.graph_output.borrow_mut();
@@ -1765,6 +1947,7 @@ mod cuda_impl {
             let p_output     = DevicePtr::device_ptr(&output_gpu, &self.stream).0;
             let i_block_size = block_size as i32;
             let i_max_ctx    = max_context_len as i32;
+            let i_hidden     = hidden as i32;
 
             // smem: hidden_size * 4 + scratch (match attention needs)
             let smem = std::cmp::max(
@@ -1773,7 +1956,7 @@ mod cuda_impl {
             );
 
             #[allow(clippy::cast_ptr_alignment)]
-            let mut args: [*mut c_void; 16] = [
+            let mut args: [*mut c_void; 17] = [
                 &p_tape          as *const u64 as *mut c_void,
                 &num_instructions as *const i32 as *mut c_void,
                 &p_wptrs         as *const u64 as *mut c_void,
@@ -1790,6 +1973,7 @@ mod cuda_impl {
                 &p_output        as *const u64 as *mut c_void,
                 &i_block_size    as *const i32 as *mut c_void,
                 &i_max_ctx       as *const i32 as *mut c_void,
+                &i_hidden        as *const i32 as *mut c_void,
             ];
 
             if smem > 49152 {
@@ -1853,6 +2037,19 @@ mod cuda_impl {
                 fused_gate_up_fp8_scale: self.fp8_fused_gate_up_scale.get(i),
                 down_proj_fp8: self.fp8_down_proj.get(i),
                 down_proj_fp8_scale: self.fp8_down_proj_scale.get(i),
+                fused_qkv_int4: self.int4_fused_qkv.get(i),
+                fused_qkv_int4_scales: self.int4_fused_qkv_scales.get(i),
+                fused_qkv_int4_zeros: self.int4_fused_qkv_zeros.get(i),
+                o_proj_int4: self.int4_o_proj.get(i),
+                o_proj_int4_scales: self.int4_o_proj_scales.get(i),
+                o_proj_int4_zeros: self.int4_o_proj_zeros.get(i),
+                fused_gate_up_int4: self.int4_fused_gate_up.get(i),
+                fused_gate_up_int4_scales: self.int4_fused_gate_up_scales.get(i),
+                fused_gate_up_int4_zeros: self.int4_fused_gate_up_zeros.get(i),
+                down_proj_int4: self.int4_down_proj.get(i),
+                down_proj_int4_scales: self.int4_down_proj_scales.get(i),
+                down_proj_int4_zeros: self.int4_down_proj_zeros.get(i),
+                int4_group_size: self.int4_group_size,
             })
         }
 

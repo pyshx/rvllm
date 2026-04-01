@@ -173,6 +173,145 @@ impl GpuTransformerLayer {
     }
 
     // ================================================================
+    // PATH 5: INT4 (W4A16) GEMV decode (T=1)
+    // ================================================================
+
+    pub(crate) fn forward_int4_decode(
+        &self,
+        input: &GpuLayerInput<'_>,
+        weights: &GpuLayerWeights<'_>,
+        blas: &CublasHandle,
+        lt: Option<&crate::CublasLtRef>,
+        prev_mlp_out: Option<&CudaSlice<f16>>,
+    ) -> Result<(CudaSlice<f16>, CudaSlice<f16>)> {
+        let cfg = &self.config;
+        let hidden = cfg.hidden_size;
+        let num_heads = cfg.num_heads;
+        let num_kv_heads = cfg.num_kv_heads;
+        let head_dim = cfg.head_dim;
+        let intermediate = cfg.intermediate_size;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let qkv_dim = q_dim + kv_dim + kv_dim;
+        let gate_up_dim = intermediate * 2;
+
+        let qkv_int4 = weights.fused_qkv_int4
+            .ok_or_else(|| LLMError::GpuError("Int4Decode requires fused_qkv_int4".into()))?;
+        let qkv_scales = weights.fused_qkv_int4_scales
+            .ok_or_else(|| LLMError::GpuError("Int4Decode requires fused_qkv_int4_scales".into()))?;
+        let qkv_zeros = weights.fused_qkv_int4_zeros
+            .ok_or_else(|| LLMError::GpuError("Int4Decode requires fused_qkv_int4_zeros".into()))?;
+        let gu_int4 = weights.fused_gate_up_int4
+            .ok_or_else(|| LLMError::GpuError("Int4Decode requires fused_gate_up_int4".into()))?;
+        let gu_scales = weights.fused_gate_up_int4_scales
+            .ok_or_else(|| LLMError::GpuError("Int4Decode requires fused_gate_up_int4_scales".into()))?;
+        let gu_zeros = weights.fused_gate_up_int4_zeros
+            .ok_or_else(|| LLMError::GpuError("Int4Decode requires fused_gate_up_int4_zeros".into()))?;
+        let down_int4 = weights.down_proj_int4
+            .ok_or_else(|| LLMError::GpuError("Int4Decode requires down_proj_int4".into()))?;
+        let down_scales = weights.down_proj_int4_scales
+            .ok_or_else(|| LLMError::GpuError("Int4Decode requires down_proj_int4_scales".into()))?;
+        let down_zeros = weights.down_proj_int4_zeros
+            .ok_or_else(|| LLMError::GpuError("Int4Decode requires down_proj_int4_zeros".into()))?;
+
+        let group_size = weights.int4_group_size;
+
+        // Step 1-2: Fused add + RMSNorm + INT4 QKV GEMV
+        let smem = (hidden * 4 + 8 * 4) as u32; // hidden_size floats + RPB scratch
+        let grid_qkv = ((qkv_dim + 7) / 8) as u32;
+        let eps = cfg.rms_norm_eps;
+
+        let mut qkv = unsafe { self.stream.alloc::<f16>(qkv_dim) }
+            .map_err(|e| LLMError::GpuError(format!("int4 qkv alloc: {e}")))?;
+        let residual_ref = unsafe { self.stream.alloc::<f16>(hidden) }
+            .map_err(|e| LLMError::GpuError(format!("int4 res alloc: {e}")))?;
+
+        if let Some(prev_mlp) = prev_mlp_out {
+            self.loader.launch(
+                "gemv_int4", "fused_add_norm_int4_qkv_gemv",
+                LaunchConfig { grid_dim: (grid_qkv, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: smem },
+                (&mut qkv, &residual_ref, input.hidden_states, prev_mlp,
+                 weights.input_layernorm, qkv_int4, qkv_scales, qkv_zeros,
+                 eps, hidden as i32, qkv_dim as i32, group_size as i32),
+            )?;
+        } else {
+            // First layer: no add, just norm + GEMV (use standalone norm + int4 gemv)
+            let normed = Self::rms_norm_f16(&self.stream, &self.loader,
+                input.hidden_states, weights.input_layernorm, hidden)?;
+            // Copy input to residual
+            self.stream.memcpy_dtod(input.hidden_states, &mut qkv.slice_mut(..0)) // no-op placeholder
+                .ok();
+            // Standalone INT4 GEMV
+            let packed_k = hidden / 8;
+            let num_groups = (hidden + group_size - 1) / group_size;
+            self.loader.launch(
+                "gemv_int4", "gemv_int4_kernel",
+                LaunchConfig { grid_dim: (grid_qkv, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 32 },
+                (&mut qkv, &normed, qkv_int4, qkv_scales, qkv_zeros,
+                 qkv_dim as i32, hidden as i32, group_size as i32),
+            )?;
+            // residual = input (copy)
+            self.stream.memcpy_dtod(input.hidden_states, &mut qkv.slice_mut(..0)).ok();
+        }
+
+        // Step 3: QKV bias (if present)
+        if let Some(bias) = weights.qkv_bias {
+            let mut qkv_view = qkv.slice_mut(..qkv_dim);
+            Self::add_bias_f16_view(&self.stream, &self.loader, &mut qkv_view, bias, 1, qkv_dim)?;
+        }
+
+        // Step 4: Fused RoPE + KV cache write
+        Self::fused_rope_cache_write(&self.stream, &self.loader, &mut qkv,
+            input, q_dim, kv_dim, num_heads, num_kv_heads, head_dim, 1)?;
+
+        // Step 5: Attention (FA3) -- same as f16 path
+        let attn_out = Self::decode_attention_f16io(
+            &self.stream, &self.loader,
+            &qkv.slice(..q_dim),
+            input.key_cache, input.value_cache,
+            &input.block_tables, &input.context_lens,
+            1, input.num_seqs, num_heads, num_kv_heads, head_dim,
+            input.max_context_len, input.block_size)?;
+
+        // Step 6: O-proj via cuBLAS (still f16 -- o_proj is small relative to QKV+MLP)
+        let attn_proj = Self::hgemm_dispatch(&self.stream, blas, lt, &attn_out, weights.o_proj, 1, hidden, q_dim, &self.loader)?;
+
+        // Step 7: Post-attention fused residual add + RMSNorm
+        let (normed2, residual2) = Self::fused_residual_rmsnorm_f16(
+            &self.stream, &self.loader, &residual_ref, &attn_proj,
+            weights.post_attention_layernorm, cfg.rms_norm_eps, 1, hidden)?;
+
+        // Step 8: GateUp via INT4 GEMV
+        let grid_gu = ((gate_up_dim + 7) / 8) as u32;
+        let mut gate_up = unsafe { self.stream.alloc::<f16>(gate_up_dim) }
+            .map_err(|e| LLMError::GpuError(format!("int4 gu alloc: {e}")))?;
+        let residual2_dummy = unsafe { self.stream.alloc::<f16>(hidden) }
+            .map_err(|e| LLMError::GpuError(format!("int4 res2 alloc: {e}")))?;
+
+        self.loader.launch(
+            "gemv_int4", "fused_add_norm_int4_gateup_gemv",
+            LaunchConfig { grid_dim: (grid_gu, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: smem },
+            (&mut gate_up, &residual2_dummy, &residual2, &attn_proj,
+             weights.post_attention_layernorm, gu_int4, gu_scales, gu_zeros,
+             cfg.rms_norm_eps, hidden as i32, gate_up_dim as i32, group_size as i32),
+        )?;
+
+        // Steps 9-10: Fused SiLU + INT4 down-proj GEMV
+        let grid_down = ((hidden + 7) / 8) as u32;
+        let mut mlp_out = unsafe { self.stream.alloc::<f16>(hidden) }
+            .map_err(|e| LLMError::GpuError(format!("int4 mlp alloc: {e}")))?;
+
+        self.loader.launch(
+            "gemv_int4", "fused_silu_int4_down_gemv",
+            LaunchConfig { grid_dim: (grid_down, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 32 },
+            (&mut mlp_out, &gate_up, down_int4, down_scales, down_zeros,
+             hidden as i32, intermediate as i32, group_size as i32),
+        )?;
+
+        Ok((residual2, mlp_out))
+    }
+
+    // ================================================================
     // PATH 2: Fused f16 GEMV decode (T=1)
     // ================================================================
 

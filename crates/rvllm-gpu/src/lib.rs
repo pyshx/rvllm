@@ -29,6 +29,8 @@ pub mod fp8_quantize;
 #[cfg(feature = "cuda")]
 pub mod cooperative;
 #[cfg(feature = "cuda")]
+pub mod l2_cache;
+#[cfg(feature = "cuda")]
 pub mod kernel_loader;
 #[cfg(all(feature = "mock-gpu", not(feature = "cuda")))]
 pub mod mock;

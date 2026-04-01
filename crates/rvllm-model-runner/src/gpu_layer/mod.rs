@@ -59,6 +59,20 @@ mod inner {
         pub fused_gate_up_fp8_scale: Option<&'a CudaSlice<f16>>,
         pub down_proj_fp8: Option<&'a CudaSlice<u8>>,
         pub down_proj_fp8_scale: Option<&'a CudaSlice<f16>>,
+        // INT4 (W4A16) quantized weights: packed uint32 + per-group scales/zeros
+        pub fused_qkv_int4: Option<&'a CudaSlice<u32>>,
+        pub fused_qkv_int4_scales: Option<&'a CudaSlice<f16>>,
+        pub fused_qkv_int4_zeros: Option<&'a CudaSlice<f16>>,
+        pub o_proj_int4: Option<&'a CudaSlice<u32>>,
+        pub o_proj_int4_scales: Option<&'a CudaSlice<f16>>,
+        pub o_proj_int4_zeros: Option<&'a CudaSlice<f16>>,
+        pub fused_gate_up_int4: Option<&'a CudaSlice<u32>>,
+        pub fused_gate_up_int4_scales: Option<&'a CudaSlice<f16>>,
+        pub fused_gate_up_int4_zeros: Option<&'a CudaSlice<f16>>,
+        pub down_proj_int4: Option<&'a CudaSlice<u32>>,
+        pub down_proj_int4_scales: Option<&'a CudaSlice<f16>>,
+        pub down_proj_int4_zeros: Option<&'a CudaSlice<f16>>,
+        pub int4_group_size: usize,
     }
 
     /// Metadata needed for a single layer forward pass.
@@ -117,6 +131,9 @@ mod inner {
         /// All 28 layers + LM head in ONE kernel launch via interpreter.
         /// Enable with RVLLM_MEGAKERNEL=1.
         MegakernelDecode,
+        /// T=1 decode with INT4 (W4A16) GEMV kernels -- 4x less weight bandwidth.
+        /// Enable with RVLLM_INT4_DECODE=1 and int4-quantized weights.
+        Int4Decode,
         /// T>=1 batched decode or prefill with cuBLAS/CUTLASS GEMMs.
         /// Always requires scratch buffers.
         Batched,
@@ -186,6 +203,9 @@ mod inner {
                 }
                 ForwardPath::MegakernelDecode => {
                     Err(LLMError::GpuError("MegakernelDecode is handled at the runner level, not per-layer".into()))
+                }
+                ForwardPath::Int4Decode => {
+                    Ok(Some(self.forward_int4_decode(input, weights, blas, lt, prev_mlp_out)?))
                 }
                 ForwardPath::Batched => {
                     let scratch = scratch.expect("Batched path requires scratch buffers");
