@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>rvLLM -- Git Activity</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html{font-size:17px;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
+body{background:#000;color:#d4d4d4;font-family:Helvetica Neue,Helvetica,Arial,sans-serif;font-weight:300;line-height:1.65;letter-spacing:-0.01em}
+a{color:#d4d4d4;text-decoration:none}
+a:hover{color:#fff}
+::selection{background:#333;color:#fff}
+
+.container{max-width:740px;margin:0 auto;padding:0 2rem}
+
+header{padding:3rem 0 2rem}
+header h1{font-size:2.6rem;font-weight:700;letter-spacing:-0.04em;color:#fff;margin-bottom:0.3rem}
+header .sub{font-size:1rem;color:#888;font-weight:300;margin-bottom:0.5rem}
+header .links{font-size:0.8rem;color:#777;letter-spacing:0.04em}
+header .links a{color:#999;margin-right:1.2rem}
+header .links a:hover{color:#fff}
+
+section{padding:2rem 0;border-bottom:1px solid #111}
+section:last-of-type{border-bottom:none}
+
+h2{font-size:1.3rem;font-weight:600;letter-spacing:-0.03em;color:#fff;margin-bottom:0.3rem}
+.section-sub{color:#888;font-size:0.72rem;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:1.8rem;font-weight:400}
+h3{font-size:0.75rem;text-transform:uppercase;letter-spacing:0.1em;color:#888;font-weight:500;margin:2rem 0 0.8rem}
+
+p{margin-bottom:0.8rem;font-size:1rem;color:#ccc}
+strong{font-weight:500;color:#ccc}
+
+.tbl{overflow-x:auto;margin:0.6rem 0 1.4rem}
+table{width:100%;border-collapse:collapse;font-size:0.92rem;font-variant-numeric:tabular-nums}
+thead th{padding:0.5rem 0.7rem;text-align:left;font-size:0.68rem;text-transform:uppercase;letter-spacing:0.06em;color:#888;font-weight:500;border-bottom:1px solid #222}
+th.r,td.r{text-align:right}
+tbody td{padding:0.4rem 0.7rem;color:#ccc;border-bottom:1px solid #0d0d0d}
+tbody tr:hover{background:#0a0a0a}
+tr.peak td{color:#fff;font-weight:500}
+
+code{font-family:SF Mono,Menlo,Consolas,monospace;font-size:0.85em;color:#b0b0b0}
+
+/* Stats row */
+.stats-row{display:flex;gap:2rem;margin:1.5rem 0 0.5rem}
+.stat{text-align:center;flex:1}
+.stat .val{font-size:2.4rem;font-weight:700;color:#fff;letter-spacing:-0.04em;line-height:1.1}
+.stat .lbl{font-size:0.68rem;text-transform:uppercase;letter-spacing:0.08em;color:#888;font-weight:400;margin-top:0.15rem}
+
+/* Bar chart */
+.bar-chart{display:flex;align-items:flex-end;gap:3px;height:160px;margin:1rem 0}
+.bar-col{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%}
+.bar{width:100%;border-radius:1px 1px 0 0;transition:height 1.2s cubic-bezier(0.16,1,0.3,1);background:#d4d4d4}
+.bar-label{font-size:0.6rem;color:#888;margin-top:0.4rem;letter-spacing:0.02em}
+.bar-val{font-size:0.6rem;color:#888;margin-bottom:0.2rem}
+
+/* Lang bars */
+.lang-row{display:flex;align-items:center;margin-bottom:0.5rem;font-size:0.82rem}
+.lang-name{width:110px;text-align:right;padding-right:1rem;color:#888;flex-shrink:0;font-size:0.78rem}
+.lang-bar-bg{flex:1;height:18px;background:#0a0a0a;overflow:hidden}
+.lang-bar-fill{height:100%;transition:width 1.2s cubic-bezier(0.16,1,0.3,1)}
+.lang-loc{width:70px;text-align:right;padding-left:0.8rem;color:#888;font-size:0.78rem;font-variant-numeric:tabular-nums;flex-shrink:0}
+
+/* Composition bar */
+.comp-bar{height:18px;display:flex;overflow:hidden;margin:0.8rem 0 0.6rem}
+.comp-seg{height:100%;transition:width 1.2s cubic-bezier(0.16,1,0.3,1)}
+.comp-seg:hover{opacity:0.7}
+.legend{display:flex;gap:1rem;flex-wrap:wrap;font-size:0.7rem;color:#888}
+.legend-item{display:flex;align-items:center;gap:0.3rem}
+.legend-dot{width:8px;height:8px}
+
+/* Dual bar chart (ins/del) */
+.dual-bar-chart{display:flex;align-items:flex-end;gap:6px;height:140px;margin:1rem 0}
+.dual-col{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%}
+.dual-pair{width:100%;display:flex;gap:2px;align-items:flex-end}
+.dual-pair .bar{flex:1}
+.bar.ins{background:#ccc}
+.bar.del{background:#555}
+
+/* Commit log */
+.commit-entry{display:flex;align-items:baseline;padding:0.35rem 0;border-bottom:1px solid #0d0d0d;font-family:SF Mono,Menlo,Consolas,monospace;font-size:0.72rem}
+.commit-entry:last-child{border-bottom:none}
+.commit-hash{color:#888;margin-right:0.8rem;flex-shrink:0}
+.commit-msg{color:#ccc;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+footer{padding:2rem 0 4rem;text-align:center}
+footer p{font-size:0.72rem;color:#666;letter-spacing:0.02em}
+footer a{color:#666}
+footer a:hover{color:#999}
+
+.fade-in{opacity:0;transform:translateY(12px);animation:fadeUp 0.6s forwards}
+@keyframes fadeUp{to{opacity:1;transform:translateY(0)}}
+
+@media(max-width:600px){
+  html{font-size:13px}
+  header h1{font-size:2rem}
+  .stats-row{gap:1rem}
+  .stat .val{font-size:1.8rem}
+  .container{padding:0 1.2rem}
+}
+</style>
+</head>
+<body>
+<div class="container">
+
+<header>
+  <h1>rvLLM</h1>
+  <p class="sub">Git activity and lines of code.</p>
+  <p class="links">
+    <a href="https://github.com/m0at/rvllm">GitHub</a>
+    <a href="index.html">Benchmarks</a>
+  </p>
+</header>
+
+<section class="fade-in">
+  <div class="stats-row">
+    <div class="stat"><div class="val">230</div><div class="lbl">Commits</div></div>
+    <div class="stat"><div class="val">78.0K</div><div class="lbl">Total LOC</div></div>
+    <div class="stat"><div class="val">61.9K</div><div class="lbl">Rust</div></div>
+    <div class="stat"><div class="val">8.0K</div><div class="lbl">CUDA</div></div>
+    <div class="stat"><div class="val">5</div><div class="lbl">Days</div></div>
+  </div>
+</section>
+
+<section class="fade-in" style="animation-delay:0.1s">
+  <h2>Code Composition</h2>
+  <p class="section-sub">Lines of code by language</p>
+  <div class="comp-bar" id="compBar"></div>
+  <div class="legend" id="compLegend"></div>
+  <h3>Breakdown</h3>
+  <div id="langBars"></div>
+</section>
+
+<section class="fade-in" style="animation-delay:0.2s">
+  <h2>Daily Commits</h2>
+  <p class="section-sub">Commits per day</p>
+  <div class="bar-chart" id="dailyChart"></div>
+</section>
+
+<section class="fade-in" style="animation-delay:0.3s">
+  <h2>Lines Changed</h2>
+  <p class="section-sub">Insertions (light) and deletions (dark) per day</p>
+  <div class="dual-bar-chart" id="locChart"></div>
+</section>
+
+<section class="fade-in" style="animation-delay:0.4s">
+  <h2>Hour of Day</h2>
+  <p class="section-sub">Commit distribution by hour (UTC)</p>
+  <div class="bar-chart" id="hourChart" style="height:120px"></div>
+</section>
+
+<section class="fade-in" style="animation-delay:0.5s">
+  <h2>Recent Commits</h2>
+  <p class="section-sub">Last 20</p>
+  <div id="commitLog"></div>
+</section>
+
+<footer>
+<p>generated 2026-03-31 -- run <code>./gen-viz.sh</code> to update</p>
+</footer>
+
+</div>
+<script>
+const langs = [{name:"Rust",loc:61892,color:"#fff"},{name:"CUDA",loc:8011,color:"#ccc"},{name:"Bourne Shell",loc:3373,color:"#aaa"},{name:"Python",loc:2560,color:"#888"},{name:"Markdown",loc:941,color:"#777"},{name:"TOML",loc:760,color:"#666"},{name:"HTML",loc:216,color:"#555"}];
+const daily = [{date:"2026-03-27",commits:30,ins:80413,del:9856},{date:"2026-03-28",commits:82,ins:21159,del:8973},{date:"2026-03-29",commits:70,ins:21602,del:6064},{date:"2026-03-30",commits:39,ins:17094,del:2668},{date:"2026-03-31",commits:9,ins:8515,del:972}];
+const hours = [9,19,5,6,4,3,17,7,15,6,10,13,11,12,4,14,14,12,11,0,5,13,11,9];
+const commits = [["39053df","c Add 10 optimization research documents for beating vLLM"],["49c7d33","9 Add 0.85x vLLM direct engine ratio to papers, index.html, headline"],["b563572","2 Add direct engine vLLM comparison: 0.85x at N=128, 0.96x at N=16"],["c8055f6","1 Update docs, papers, GitHub Pages for FA3 v3: 12,312 tok/s"],["e4aad33","a Kill all silent kernel fallbacks, add startup validation"],["1b65c25","3 FA3 v3: switch to single-buffered cp.async, fix N=128 regression"],["49e45b2","0 FA3 v3: split-KV + cp.async double-buffered decode attention"],["09d73e2","8 Update benchmarks for FA3 v2 warp-parallel attention: 8,652 tok/s, closes gap to 0.67-0.88x vLLM"],["224a543","1 FA3 v2: warp-parallel QK^T + parallel softmax, closes 60% of vLLM gap"],["ac62c54","8 Add setup_instance.sh for clean deploys, confirm 2x gap vs vLLM is real (not missing headers)"],["4af4bb2","3 Add 7B rvLLM vs vLLM 0.18 comparison on H100 (2x gap, fused kernels disabled)"],["11f2ea8","f Fix cublaslt build: register cublaslt_raw module, fix FFI types, RefCell for plan cache"],["b7c26ce","5 Document FP8 and speculative decoding as optional features with caveats"],["ef63322","a Warn that FP8 weights only help single-stream, not batched throughput"],["fc179a2","e Cache FP8 cublasLt plans: eliminate per-call descriptor + heuristic overhead"],["08dbe5d","b Double-buffer scratch: zero alloc, zero copy for 27/28 layers (+17% conc=128)"],["ffee229","2 Gate FP8 mega kernel on O-proj L2 fit, fix 100x regression on 7B+"],["5ce6ae1","0 Fix fused QKV layout for T>1, disable persistent kernel, +97% single-stream perf"],["52ccf75","8 Merge pull request #24 from gracee3/feature/responses-conversation-state"],["a03efb5","7 Merge pull request #19 from gracee3/feature/responses-api-followups"]];
+
+// Composition bar + legend
+const compBar = document.getElementById('compBar');
+const compLegend = document.getElementById('compLegend');
+const codeTotal = langs.reduce((s,l) => s+l.loc, 0);
+langs.forEach(l => {
+  const seg = document.createElement('div');
+  seg.className = 'comp-seg';
+  seg.style.width = '0%';
+  seg.dataset.width = (l.loc / codeTotal * 100) + '%';
+  seg.style.background = l.color;
+  seg.title = l.name + ': ' + l.loc.toLocaleString();
+  compBar.appendChild(seg);
+  const li = document.createElement('div');
+  li.className = 'legend-item';
+  li.innerHTML = '<div class="legend-dot" style="background:'+l.color+'"></div>'+l.name+' '+(l.loc/codeTotal*100).toFixed(1)+'%';
+  compLegend.appendChild(li);
+});
+
+// Language bars
+const barContainer = document.getElementById('langBars');
+langs.forEach(l => {
+  const pct = l.loc / langs[0].loc * 100;
+  const row = document.createElement('div');
+  row.className = 'lang-row';
+  row.innerHTML = '<span class="lang-name">'+l.name+'</span><div class="lang-bar-bg"><div class="lang-bar-fill" style="width:0%;background:'+l.color+';" data-width="'+pct+'%"></div></div><span class="lang-loc">'+l.loc.toLocaleString()+'</span>';
+  barContainer.appendChild(row);
+});
+
+// Daily commits
+const maxCommits = Math.max(...daily.map(d => d.commits));
+const dailyChart = document.getElementById('dailyChart');
+daily.forEach(d => {
+  const col = document.createElement('div');
+  col.className = 'bar-col';
+  col.innerHTML = '<div class="bar-val">'+d.commits+'</div><div class="bar" style="height:0%" data-height="'+(d.commits/maxCommits*90)+'%"></div><div class="bar-label">'+d.date+'</div>';
+  dailyChart.appendChild(col);
+});
+
+// LOC chart (insertions + deletions)
+const maxLoc = Math.max(...daily.map(d => Math.max(d.ins, d.del)));
+const locChart = document.getElementById('locChart');
+daily.forEach(d => {
+  const col = document.createElement('div');
+  col.className = 'dual-col';
+  const insH = d.ins / maxLoc * 85;
+  const delH = d.del / maxLoc * 85;
+  col.innerHTML = '<div class="bar-val" style="font-size:0.55rem">+'+(d.ins/1000).toFixed(1)+'K / -'+(d.del/1000).toFixed(1)+'K</div><div class="dual-pair"><div class="bar ins" style="height:0%" data-height="'+insH+'%"></div><div class="bar del" style="height:0%" data-height="'+delH+'%"></div></div><div class="bar-label">'+d.date+'</div>';
+  locChart.appendChild(col);
+});
+
+// Hour chart
+const maxHour = Math.max(...hours);
+const hourChart = document.getElementById('hourChart');
+hours.forEach((h, i) => {
+  const col = document.createElement('div');
+  col.className = 'bar-col';
+  const pct = h / maxHour * 85;
+  col.innerHTML = (h > 0 ? '<div class="bar-val">'+h+'</div>' : '<div class="bar-val"></div>') +
+    '<div class="bar" style="height:0%;background:#888" data-height="'+pct+'%"></div>' +
+    '<div class="bar-label">'+String(i).padStart(2,'0')+'</div>';
+  hourChart.appendChild(col);
+});
+
+// Commit log
+const log = document.getElementById('commitLog');
+commits.forEach(([hash, msg]) => {
+  const entry = document.createElement('div');
+  entry.className = 'commit-entry';
+  entry.innerHTML = '<span class="commit-hash">'+hash+'</span><span class="commit-msg">'+msg+'</span>';
+  log.appendChild(entry);
+});
+
+// Animate
+setTimeout(() => {
+  document.querySelectorAll('[data-width]').forEach(el => { el.style.width = el.dataset.width; });
+  document.querySelectorAll('[data-height]').forEach(el => { el.style.height = el.dataset.height; });
+}, 200);
+</script>
+</body>
+</html>

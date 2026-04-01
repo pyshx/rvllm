@@ -226,32 +226,36 @@ impl GpuTransformerLayer {
         let residual_ref = unsafe { self.stream.alloc::<f16>(hidden) }
             .map_err(|e| LLMError::GpuError(format!("int4 res alloc: {e}")))?;
 
+        let i_hidden = hidden as i32;
+        let i_qkv_dim = qkv_dim as i32;
+        let i_group = group_size as i32;
+
         if let Some(prev_mlp) = prev_mlp_out {
-            self.loader.launch(
-                "gemv_int4", "fused_add_norm_int4_qkv_gemv",
-                LaunchConfig { grid_dim: (grid_qkv, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: smem },
-                (&mut qkv, &residual_ref, input.hidden_states, prev_mlp,
-                 weights.input_layernorm, qkv_int4, qkv_scales, qkv_zeros,
-                 eps, hidden as i32, qkv_dim as i32, group_size as i32),
-            )?;
+            let fk = self.loader.get_func("gemv_int4", "fused_add_norm_int4_qkv_gemv")?;
+            if smem > 49152 {
+                fk.set_attribute(cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32)
+                    .map_err(|e| LLMError::GpuError(format!("int4 smem attr: {e}")))?;
+            }
+            unsafe {
+                self.stream.launch_builder(&fk)
+                    .arg(&mut qkv).arg(&residual_ref).arg(input.hidden_states).arg(prev_mlp)
+                    .arg(weights.input_layernorm).arg(qkv_int4).arg(qkv_scales).arg(qkv_zeros)
+                    .arg(&eps).arg(&i_hidden).arg(&i_qkv_dim).arg(&i_group)
+                    .launch(LaunchConfig { grid_dim: (grid_qkv, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: smem })
+                    .map_err(|e| LLMError::GpuError(format!("int4 qkv gemv: {e}")))?;
+            }
         } else {
-            // First layer: no add, just norm + GEMV (use standalone norm + int4 gemv)
+            // First layer: standalone norm + int4 gemv
             let normed = Self::rms_norm_f16(&self.stream, &self.loader,
-                input.hidden_states, weights.input_layernorm, hidden)?;
-            // Copy input to residual
-            self.stream.memcpy_dtod(input.hidden_states, &mut qkv.slice_mut(..0)) // no-op placeholder
-                .ok();
-            // Standalone INT4 GEMV
-            let packed_k = hidden / 8;
-            let num_groups = (hidden + group_size - 1) / group_size;
-            self.loader.launch(
-                "gemv_int4", "gemv_int4_kernel",
-                LaunchConfig { grid_dim: (grid_qkv, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 32 },
-                (&mut qkv, &normed, qkv_int4, qkv_scales, qkv_zeros,
-                 qkv_dim as i32, hidden as i32, group_size as i32),
-            )?;
-            // residual = input (copy)
-            self.stream.memcpy_dtod(input.hidden_states, &mut qkv.slice_mut(..0)).ok();
+                input.hidden_states, weights.input_layernorm, eps, 1, hidden)?;
+            let fk = self.loader.get_func("gemv_int4", "gemv_int4_kernel")?;
+            unsafe {
+                self.stream.launch_builder(&fk)
+                    .arg(&mut qkv).arg(&normed).arg(qkv_int4).arg(qkv_scales).arg(qkv_zeros)
+                    .arg(&i_qkv_dim).arg(&i_hidden).arg(&i_group)
+                    .launch(LaunchConfig { grid_dim: (grid_qkv, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 32 })
+                    .map_err(|e| LLMError::GpuError(format!("int4 qkv gemv standalone: {e}")))?;
+            }
         }
 
         // Step 3: QKV bias (if present)
@@ -288,25 +292,39 @@ impl GpuTransformerLayer {
         let residual2_dummy = unsafe { self.stream.alloc::<f16>(hidden) }
             .map_err(|e| LLMError::GpuError(format!("int4 res2 alloc: {e}")))?;
 
-        self.loader.launch(
-            "gemv_int4", "fused_add_norm_int4_gateup_gemv",
-            LaunchConfig { grid_dim: (grid_gu, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: smem },
-            (&mut gate_up, &residual2_dummy, &residual2, &attn_proj,
-             weights.post_attention_layernorm, gu_int4, gu_scales, gu_zeros,
-             cfg.rms_norm_eps, hidden as i32, gate_up_dim as i32, group_size as i32),
-        )?;
+        {
+            let i_gu_dim = gate_up_dim as i32;
+            let fk = self.loader.get_func("gemv_int4", "fused_add_norm_int4_gateup_gemv")?;
+            if smem > 49152 {
+                fk.set_attribute(cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32)
+                    .map_err(|e| LLMError::GpuError(format!("int4 gu smem: {e}")))?;
+            }
+            unsafe {
+                self.stream.launch_builder(&fk)
+                    .arg(&mut gate_up).arg(&residual2_dummy).arg(&residual2).arg(&attn_proj)
+                    .arg(weights.post_attention_layernorm).arg(gu_int4).arg(gu_scales).arg(gu_zeros)
+                    .arg(&cfg.rms_norm_eps).arg(&i_hidden).arg(&i_gu_dim).arg(&i_group)
+                    .launch(LaunchConfig { grid_dim: (grid_gu, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: smem })
+                    .map_err(|e| LLMError::GpuError(format!("int4 gateup gemv: {e}")))?;
+            }
+        }
 
         // Steps 9-10: Fused SiLU + INT4 down-proj GEMV
         let grid_down = ((hidden + 7) / 8) as u32;
         let mut mlp_out = unsafe { self.stream.alloc::<f16>(hidden) }
             .map_err(|e| LLMError::GpuError(format!("int4 mlp alloc: {e}")))?;
 
-        self.loader.launch(
-            "gemv_int4", "fused_silu_int4_down_gemv",
-            LaunchConfig { grid_dim: (grid_down, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 32 },
-            (&mut mlp_out, &gate_up, down_int4, down_scales, down_zeros,
-             hidden as i32, intermediate as i32, group_size as i32),
-        )?;
+        {
+            let i_inter = intermediate as i32;
+            let fk = self.loader.get_func("gemv_int4", "fused_silu_int4_down_gemv")?;
+            unsafe {
+                self.stream.launch_builder(&fk)
+                    .arg(&mut mlp_out).arg(&gate_up).arg(down_int4).arg(down_scales).arg(down_zeros)
+                    .arg(&i_hidden).arg(&i_inter).arg(&i_group)
+                    .launch(LaunchConfig { grid_dim: (grid_down, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 32 })
+                    .map_err(|e| LLMError::GpuError(format!("int4 down gemv: {e}")))?;
+            }
+        }
 
         Ok((residual2, mlp_out))
     }

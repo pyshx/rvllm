@@ -1,0 +1,21 @@
+# Lightweight image for local build validation without a GPU.
+# Installs Rust + CUDA toolkit (nvcc) + CUTLASS headers.
+# Source is mounted at runtime -- image only needs rebuilding
+# when toolchains change.
+FROM nvidia/cuda:13.0.1-devel-ubuntu24.04
+
+# Rust toolchain
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        curl build-essential pkg-config libssl-dev git ca-certificates && \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && \
+    rm -rf /var/lib/apt/lists/*
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# CUTLASS headers (for cutlass_* kernels)
+RUN git clone --depth 1 --branch v3.8.0 https://github.com/NVIDIA/cutlass.git /opt/cutlass
+
+ENV CUTLASS_DIR=/opt/cutlass
+ENV CARGO_TARGET_DIR=/tmp/rvllm-target
+
+WORKDIR /src
