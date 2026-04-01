@@ -14,16 +14,22 @@ fn main() {
         ("x86_64", "linux") => "x86_64-linux-gnu",
         ("aarch64", "linux") => "aarch64-linux-gnu",
         ("x86_64", "macos") => "x86_64-macos",
-        _ => panic!(
-            "rvllm-zig: unsupported target {}-{}",
-            target_arch, target_os
-        ),
+        _ => {
+            eprintln!("rvllm-zig: unsupported target {target_arch}-{target_os}, skipping");
+            return;
+        }
     };
+
+    // Check if zig is available
+    let zig_available = Command::new("zig").arg("version").output().is_ok();
+    if !zig_available {
+        eprintln!("rvllm-zig: zig not on PATH, skipping (use --features zig only when zig is installed)");
+        return;
+    }
 
     let obj_path = out_dir.join("rvllm_zig.o");
     let lib_path = out_dir.join("librvllm_zig.a");
 
-    // Build object file
     let mut cmd = Command::new("zig");
     cmd.arg("build-obj")
         .arg("src/root.zig")
@@ -32,7 +38,6 @@ fn main() {
         .arg(zig_target)
         .arg(format!("-femit-bin={}", obj_path.display()));
 
-    // Enable AVX-512 on x86_64 targets (H100/A100 host CPUs are SPR/Genoa)
     if target_arch == "x86_64" {
         cmd.arg("-mcpu=x86_64_v4");
     }
@@ -40,11 +45,10 @@ fn main() {
     let status = cmd
         .current_dir(&zig_dir)
         .status()
-        .expect("rvllm-zig: zig not found on PATH");
+        .expect("rvllm-zig: failed to run zig");
 
     assert!(status.success(), "rvllm-zig: zig build-obj failed");
 
-    // Create archive with proper alignment
     let _ = std::fs::remove_file(&lib_path);
     let status = Command::new("ar")
         .arg("rcs")
