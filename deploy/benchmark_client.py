@@ -18,57 +18,37 @@ import argparse
 import sys
 
 PROMPTS = [
-    "Explain the theory of relativity in simple terms.",
-    "Write a Python function to sort a list of integers.",
-    "What are the main differences between TCP and UDP?",
-    "Describe the process of photosynthesis step by step.",
-    "Write a short story about a robot learning to paint.",
-    "Explain how a transformer neural network works.",
-    "What are the advantages of Rust over C++?",
-    "Describe the water cycle in detail.",
-    "Write a haiku about machine learning.",
-    "Explain the concept of recursion with an example.",
-    "What is the difference between a stack and a queue?",
-    "Describe how HTTPS encryption works.",
-    "Write a SQL query to find duplicate records in a table.",
-    "Explain the CAP theorem in distributed systems.",
-    "What are the main principles of object-oriented programming?",
-    "Describe the architecture of a modern CPU.",
-    "Write a regular expression to validate email addresses.",
-    "Explain how garbage collection works in Java.",
-    "What is the difference between concurrency and parallelism?",
-    "Describe the MapReduce programming model.",
-    "Explain how a B-tree index works in databases.",
-    "What are the trade-offs between microservices and monoliths?",
-    "Describe the process of DNS resolution.",
-    "Write pseudocode for the A* pathfinding algorithm.",
+    "Continue the following sequence of lowercase letters separated by spaces, with no punctuation and no explanation:\nalpha beta gamma delta epsilon",
+    "Continue this comma-separated list with more common nouns only, no period and no explanation:\nchair, table, window, door, floor",
+    "Continue writing short lowercase words separated by spaces. Do not stop early:\nred blue green yellow",
+    "Write more entries in this numbered list, continuing the format exactly:\n1. one\n2. two\n3. three\n4.",
+    "Repeat the word token separated by spaces. Keep going:\ntoken token token token",
 ]
+
+JSON_HEADERS = {
+    "Content-Type": "application/json",
+    "Connection": "keep-alive",
+}
 
 
 async def send_request(
     session,
     url,
-    prompt,
-    max_tokens=128,
-    model="default",
-    temperature=0.0,
-    top_p=1.0,
+    payload_bytes,
 ):
     """Send a non-streaming completion request and measure wall-clock latency."""
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "top_p": top_p,
-        "stream": False,
-    }
-
     start = time.perf_counter()
     try:
-        async with session.post(f"{url}/v1/completions", json=payload) as resp:
-            result = await resp.json()
-    except Exception as e:
+        async with session.post(
+            f"{url}/v1/completions",
+            data=payload_bytes,
+            headers=JSON_HEADERS,
+        ) as resp:
+            body = await resp.read()
+            if resp.status != 200:
+                return None
+            result = json.loads(body)
+    except Exception:
         return None
 
     end = time.perf_counter()
@@ -99,32 +79,47 @@ async def run_benchmark(
     top_p=1.0,
 ):
     prompts = [PROMPTS[i % len(PROMPTS)] for i in range(num_prompts)]
-    semaphore = asyncio.Semaphore(concurrency)
     results = []
     errors = 0
+    payloads = [
+        json.dumps(
+            {
+                "model": model,
+                "prompt": prompt,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+                "top_p": top_p,
+                "stream": False,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        for prompt in prompts
+    ]
+    queue: asyncio.Queue[bytes] = asyncio.Queue()
+    for payload in payloads:
+        queue.put_nowait(payload)
 
-    async def limited_request(session, prompt):
+    async def worker(session):
         nonlocal errors
-        async with semaphore:
-            result = await send_request(
-                session,
-                url,
-                prompt,
-                max_tokens,
-                model,
-                temperature,
-                top_p,
-            )
+        while True:
+            try:
+                payload = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            result = await send_request(session, url, payload)
             if result is None:
                 errors += 1
             else:
                 results.append(result)
+            queue.task_done()
 
     start = time.perf_counter()
+    connector = aiohttp.TCPConnector(limit=0, limit_per_host=0, ttl_dns_cache=3600)
     async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=600)
+        timeout=aiohttp.ClientTimeout(total=600),
+        connector=connector,
     ) as session:
-        tasks = [limited_request(session, p) for p in prompts]
+        tasks = [worker(session) for _ in range(concurrency)]
         await asyncio.gather(*tasks)
     total_time = time.perf_counter() - start
 

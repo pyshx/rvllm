@@ -50,6 +50,11 @@ PROMPTS = [
     "Explain the concept of zero-knowledge proofs",
 ]
 
+JSON_HEADERS = {
+    "Content-Type": "application/json",
+    "Connection": "keep-alive",
+}
+
 
 class LoadTester:
     def __init__(self, url, concurrency, duration, max_tokens, temperature, model):
@@ -68,18 +73,13 @@ class LoadTester:
         self.end_time = 0
         self._lock = asyncio.Lock()
 
-    async def send_request(self, session, prompt):
+    async def send_request(self, session, payload_bytes):
         start = time.perf_counter()
         try:
             async with session.post(
                 f"{self.url}/v1/completions",
-                json={
-                    "model": self.model,
-                    "prompt": prompt,
-                    "max_tokens": self.max_tokens,
-                    "temperature": self.temperature,
-                    "stream": False,
-                },
+                data=payload_bytes,
+                headers=JSON_HEADERS,
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
@@ -88,7 +88,7 @@ class LoadTester:
                         self.error_details.append(f"HTTP {resp.status}: {body[:200]}")
                     return
 
-                data = await resp.json()
+                data = json.loads(await resp.read())
                 elapsed = time.perf_counter() - start
                 usage = data.get("usage", {})
                 completion_tokens = usage.get("completion_tokens", 0)
@@ -119,14 +119,35 @@ class LoadTester:
     async def worker(self, session, deadline):
         while time.perf_counter() < deadline:
             prompt = random.choice(PROMPTS)
-            await self.send_request(session, prompt)
+            payload = json.dumps(
+                {
+                    "model": self.model,
+                    "prompt": prompt,
+                    "max_tokens": self.max_tokens,
+                    "temperature": self.temperature,
+                    "stream": False,
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+            await self.send_request(session, payload)
 
     async def run(self):
         timeout = aiohttp.ClientTimeout(total=max(300, self.duration * 2))
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        connector = aiohttp.TCPConnector(limit=0, limit_per_host=0, ttl_dns_cache=3600)
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
             # Warmup: single request to prime model/caches
             print(f"Warming up...", end=" ", flush=True)
-            await self.send_request(session, PROMPTS[0])
+            warmup_payload = json.dumps(
+                {
+                    "model": self.model,
+                    "prompt": PROMPTS[0],
+                    "max_tokens": self.max_tokens,
+                    "temperature": self.temperature,
+                    "stream": False,
+                },
+                separators=(",", ":"),
+            ).encode("utf-8")
+            await self.send_request(session, warmup_payload)
             if self.results:
                 print(f"done ({self.results[0]['latency']*1000:.0f}ms)")
             else:
