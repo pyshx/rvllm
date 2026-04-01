@@ -106,26 +106,33 @@ fused_norm_gemv_f16_kernel(
 
     // --- Phase 2: GEMV dot product ---
     // output[row] = dot(proj_weight[row, :], s_normed[:])
-    const __half* w_row = proj_weight + (long long)row * hidden_size;
+    const int4* w4 = (const int4*)(proj_weight + (long long)row * hidden_size);
+    const int h8 = hidden_size / 8;
 
     float acc = 0.0f;
 
-    // Vectorized half2 loads for weight, scalar f32 loads for normed hidden (in smem)
-    const int h2 = hidden_size / 2;
-    const half2* w2 = (const half2*)w_row;
-
-    for (int i = tid; i < h2; i += FUSED_NORM_GEMV_THREADS) {
-        half2 w = w2[i];
-        int base = i * 2;
-        acc += __half2float(w.x) * s_normed[base];
-        acc += __half2float(w.y) * s_normed[base + 1];
+    // Vectorized int4 (128-bit) loads: 8 halfs per iteration
+    #pragma unroll 4
+    for (int i = tid; i < h8; i += FUSED_NORM_GEMV_THREADS) {
+        int4 packed = w4[i];
+        half2 w01 = *reinterpret_cast<half2*>(&packed.x);
+        half2 w23 = *reinterpret_cast<half2*>(&packed.y);
+        half2 w45 = *reinterpret_cast<half2*>(&packed.z);
+        half2 w67 = *reinterpret_cast<half2*>(&packed.w);
+        int base = i * 8;
+        acc += __half2float(w01.x) * s_normed[base]
+             + __half2float(w01.y) * s_normed[base + 1]
+             + __half2float(w23.x) * s_normed[base + 2]
+             + __half2float(w23.y) * s_normed[base + 3]
+             + __half2float(w45.x) * s_normed[base + 4]
+             + __half2float(w45.y) * s_normed[base + 5]
+             + __half2float(w67.x) * s_normed[base + 6]
+             + __half2float(w67.y) * s_normed[base + 7];
     }
 
-    // Handle odd hidden_size
-    if ((hidden_size & 1) && tid == 0) {
-        int last = hidden_size - 1;
-        acc += __half2float(w_row[last]) * s_normed[last];
-    }
+    // Handle remainder elements not covered by int4 loads
+    for (int i = h8 * 8 + tid; i < hidden_size; i += FUSED_NORM_GEMV_THREADS)
+        acc += __half2float(proj_weight[(long long)row * hidden_size + i]) * s_normed[i];
 
     // Warp-level reduction
     acc = warp_reduce_sum_fng(acc);
@@ -203,23 +210,33 @@ fused_norm_gemv_bias_f16_kernel(
     __syncthreads();
 
     // Phase 2: GEMV dot product + bias
-    const __half* w_row = proj_weight + (long long)row * hidden_size;
+    const int4* w4 = (const int4*)(proj_weight + (long long)row * hidden_size);
+    const int h8 = hidden_size / 8;
 
     float acc = 0.0f;
-    const int h2 = hidden_size / 2;
-    const half2* w2 = (const half2*)w_row;
 
-    for (int i = tid; i < h2; i += FUSED_NORM_GEMV_THREADS) {
-        half2 w = w2[i];
-        int base = i * 2;
-        acc += __half2float(w.x) * s_normed[base];
-        acc += __half2float(w.y) * s_normed[base + 1];
+    // Vectorized int4 (128-bit) loads: 8 halfs per iteration
+    #pragma unroll 4
+    for (int i = tid; i < h8; i += FUSED_NORM_GEMV_THREADS) {
+        int4 packed = w4[i];
+        half2 w01 = *reinterpret_cast<half2*>(&packed.x);
+        half2 w23 = *reinterpret_cast<half2*>(&packed.y);
+        half2 w45 = *reinterpret_cast<half2*>(&packed.z);
+        half2 w67 = *reinterpret_cast<half2*>(&packed.w);
+        int base = i * 8;
+        acc += __half2float(w01.x) * s_normed[base]
+             + __half2float(w01.y) * s_normed[base + 1]
+             + __half2float(w23.x) * s_normed[base + 2]
+             + __half2float(w23.y) * s_normed[base + 3]
+             + __half2float(w45.x) * s_normed[base + 4]
+             + __half2float(w45.y) * s_normed[base + 5]
+             + __half2float(w67.x) * s_normed[base + 6]
+             + __half2float(w67.y) * s_normed[base + 7];
     }
 
-    if ((hidden_size & 1) && tid == 0) {
-        int last = hidden_size - 1;
-        acc += __half2float(w_row[last]) * s_normed[last];
-    }
+    // Handle remainder elements not covered by int4 loads
+    for (int i = h8 * 8 + tid; i < hidden_size; i += FUSED_NORM_GEMV_THREADS)
+        acc += __half2float(proj_weight[(long long)row * hidden_size + i]) * s_normed[i];
 
     acc = warp_reduce_sum_fng(acc);
 

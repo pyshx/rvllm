@@ -113,20 +113,32 @@ fused_cute_add_norm_gateup_gemv(
     }
     __syncthreads();
 
-    // ---- Phase 2: GEMV -- warp-per-row, 8 warps = 8 rows in parallel ----
+    // ---- Phase 2: GEMV -- warp-per-row, 128-bit vectorized weight loads ----
     {
         const int row = block_row_base + warp_id;
         if (row < gate_up_dim) {
-            const half2* w2 = (const half2*)(proj_weight + (long long)row * hidden_size);
+            const int4* w4 = (const int4*)(proj_weight + (long long)row * hidden_size);
+            const int h8 = hidden_size / 8;
             float acc = 0.0f;
-            for (int i = lane_id; i < h2; i += 32) {
-                half2 w = w2[i];
-                acc += __half2float(w.x) * s_normed[i * 2] + __half2float(w.y) * s_normed[i * 2 + 1];
+            #pragma unroll 4
+            for (int i = lane_id; i < h8; i += 32) {
+                int4 packed = w4[i];
+                half2 w01 = *reinterpret_cast<half2*>(&packed.x);
+                half2 w23 = *reinterpret_cast<half2*>(&packed.y);
+                half2 w45 = *reinterpret_cast<half2*>(&packed.z);
+                half2 w67 = *reinterpret_cast<half2*>(&packed.w);
+                int base = i * 8;
+                acc += __half2float(w01.x) * s_normed[base]
+                     + __half2float(w01.y) * s_normed[base + 1]
+                     + __half2float(w23.x) * s_normed[base + 2]
+                     + __half2float(w23.y) * s_normed[base + 3]
+                     + __half2float(w45.x) * s_normed[base + 4]
+                     + __half2float(w45.y) * s_normed[base + 5]
+                     + __half2float(w67.x) * s_normed[base + 6]
+                     + __half2float(w67.y) * s_normed[base + 7];
             }
-            if ((hidden_size & 1) && lane_id == 0) {
-                int last = hidden_size - 1;
-                acc += __half2float(proj_weight[row * hidden_size + last]) * s_normed[last];
-            }
+            for (int i = h8 * 8 + lane_id; i < hidden_size; i += 32)
+                acc += __half2float(proj_weight[(long long)row * hidden_size + i]) * s_normed[i];
             acc = warp_reduce_sum_angv(acc);
             if (lane_id == 0) {
                 output[row] = __float2half(acc);

@@ -52,33 +52,45 @@ fused_cute_silu_down_gemv(
     const __half* w_row = weight + (long long)row * intermediate_size;
     float acc = 0.0f;
 
-    // Vectorized half2 loads: 2 elements per iteration per lane
-    const int k2 = intermediate_size / 2;
-    const half2* gate2 = (const half2*)gate;
-    const half2* up2   = (const half2*)up;
-    const half2* w2    = (const half2*)w_row;
+    // 128-bit vectorized loads: 8 f16 per load, 4x fewer instructions than half2
+    const int k8 = intermediate_size / 8;
+    const int4* gate4 = (const int4*)gate;
+    const int4* up4   = (const int4*)up;
+    const int4* w4    = (const int4*)w_row;
 
-    for (int i = lane_id; i < k2; i += CUTE_SILU_WARP_SIZE) {
-        half2 g = gate2[i];
-        half2 u = up2[i];
-        half2 w = w2[i];
+    #pragma unroll 4
+    for (int i = lane_id; i < k8; i += CUTE_SILU_WARP_SIZE) {
+        int4 gv = gate4[i];
+        int4 uv = up4[i];
+        int4 wv = w4[i];
 
-        float g0 = __half2float(g.x);
-        float g1 = __half2float(g.y);
-        float u0 = __half2float(u.x);
-        float u1 = __half2float(u.y);
-        float w0 = __half2float(w.x);
-        float w1 = __half2float(w.y);
+        half2 g01 = *reinterpret_cast<half2*>(&gv.x);
+        half2 g23 = *reinterpret_cast<half2*>(&gv.y);
+        half2 g45 = *reinterpret_cast<half2*>(&gv.z);
+        half2 g67 = *reinterpret_cast<half2*>(&gv.w);
+        half2 u01 = *reinterpret_cast<half2*>(&uv.x);
+        half2 u23 = *reinterpret_cast<half2*>(&uv.y);
+        half2 u45 = *reinterpret_cast<half2*>(&uv.z);
+        half2 u67 = *reinterpret_cast<half2*>(&uv.w);
+        half2 w01 = *reinterpret_cast<half2*>(&wv.x);
+        half2 w23 = *reinterpret_cast<half2*>(&wv.y);
+        half2 w45 = *reinterpret_cast<half2*>(&wv.z);
+        half2 w67 = *reinterpret_cast<half2*>(&wv.w);
 
-        acc += silu_f32_csg(g0) * u0 * w0;
-        acc += silu_f32_csg(g1) * u1 * w1;
+        acc += silu_f32_csg(__half2float(g01.x)) * __half2float(u01.x) * __half2float(w01.x);
+        acc += silu_f32_csg(__half2float(g01.y)) * __half2float(u01.y) * __half2float(w01.y);
+        acc += silu_f32_csg(__half2float(g23.x)) * __half2float(u23.x) * __half2float(w23.x);
+        acc += silu_f32_csg(__half2float(g23.y)) * __half2float(u23.y) * __half2float(w23.y);
+        acc += silu_f32_csg(__half2float(g45.x)) * __half2float(u45.x) * __half2float(w45.x);
+        acc += silu_f32_csg(__half2float(g45.y)) * __half2float(u45.y) * __half2float(w45.y);
+        acc += silu_f32_csg(__half2float(g67.x)) * __half2float(u67.x) * __half2float(w67.x);
+        acc += silu_f32_csg(__half2float(g67.y)) * __half2float(u67.y) * __half2float(w67.y);
     }
 
-    // Handle odd intermediate_size
-    if ((intermediate_size & 1) && lane_id == 0) {
-        int last = intermediate_size - 1;
-        float g = __half2float(gate[last]);
-        acc += silu_f32_csg(g) * __half2float(up[last]) * __half2float(w_row[last]);
+    // Handle remainder (intermediate_size not multiple of 8)
+    for (int i = k8 * 8 + lane_id; i < intermediate_size; i += CUTE_SILU_WARP_SIZE) {
+        float g = __half2float(gate[i]);
+        acc += silu_f32_csg(g) * __half2float(up[i]) * __half2float(w_row[i]);
     }
 
     // Warp-level reduction (no shared memory needed within a warp)

@@ -60,34 +60,36 @@ fused_silu_down_f16_kernel(
 
     float acc = 0.0f;
 
-    // Vectorized half2 loads: process 2 elements at a time
-    const int k2 = intermediate_size / 2;
-    const half2* gate2 = (const half2*)gate;
-    const half2* up2   = (const half2*)up;
-    const half2* w2    = (const half2*)w_row;
+    // Vectorized int4 loads: process 8 half elements (128 bits) at a time
+    const int k8 = intermediate_size / 8;
+    const int4* gate8 = (const int4*)gate;
+    const int4* up8   = (const int4*)up;
+    const int4* w8    = (const int4*)w_row;
 
-    for (int i = tid; i < k2; i += FUSED_SILU_DOWN_THREADS) {
-        half2 g = gate2[i];
-        half2 u = up2[i];
-        half2 w = w2[i];
+    for (int i = tid; i < k8; i += FUSED_SILU_DOWN_THREADS) {
+        int4 gv = gate8[i];
+        int4 uv = up8[i];
+        int4 wv = w8[i];
 
-        // silu(gate) * up * weight, computed in f32
-        float g0 = __half2float(g.x);
-        float g1 = __half2float(g.y);
-        float u0 = __half2float(u.x);
-        float u1 = __half2float(u.y);
-        float w0 = __half2float(w.x);
-        float w1 = __half2float(w.y);
+        // Unpack 4 half2 pairs from each int4 and accumulate
+        const half2* gh = (const half2*)&gv;
+        const half2* uh = (const half2*)&uv;
+        const half2* wh = (const half2*)&wv;
 
-        acc += silu_f32(g0) * u0 * w0;
-        acc += silu_f32(g1) * u1 * w1;
+        #pragma unroll
+        for (int p = 0; p < 4; p++) {
+            float glo = __half2float(gh[p].x);
+            float ghi = __half2float(gh[p].y);
+            acc += silu_f32(glo) * __half2float(uh[p].x) * __half2float(wh[p].x);
+            acc += silu_f32(ghi) * __half2float(uh[p].y) * __half2float(wh[p].y);
+        }
     }
 
-    // Handle odd intermediate_size
-    if ((intermediate_size & 1) && tid == 0) {
-        int last = intermediate_size - 1;
-        float g = __half2float(gate[last]);
-        acc += silu_f32(g) * __half2float(up[last]) * __half2float(w_row[last]);
+    // Handle remaining elements (up to 7)
+    const int tail_start = k8 * 8;
+    for (int idx = tail_start + tid; idx < intermediate_size; idx += FUSED_SILU_DOWN_THREADS) {
+        float g = __half2float(gate[idx]);
+        acc += silu_f32(g) * __half2float(up[idx]) * __half2float(w_row[idx]);
     }
 
     // Warp-level reduction
@@ -133,31 +135,34 @@ fused_silu_down_bias_f16_kernel(
 
     float acc = 0.0f;
 
-    const int k2 = intermediate_size / 2;
-    const half2* gate2 = (const half2*)gate;
-    const half2* up2   = (const half2*)up;
-    const half2* w2    = (const half2*)w_row;
+    // Vectorized int4 loads: process 8 half elements (128 bits) at a time
+    const int k8 = intermediate_size / 8;
+    const int4* gate8 = (const int4*)gate;
+    const int4* up8   = (const int4*)up;
+    const int4* w8    = (const int4*)w_row;
 
-    for (int i = tid; i < k2; i += FUSED_SILU_DOWN_THREADS) {
-        half2 g = gate2[i];
-        half2 u = up2[i];
-        half2 w = w2[i];
+    for (int i = tid; i < k8; i += FUSED_SILU_DOWN_THREADS) {
+        int4 gv = gate8[i];
+        int4 uv = up8[i];
+        int4 wv = w8[i];
 
-        float g0 = __half2float(g.x);
-        float g1 = __half2float(g.y);
-        float u0 = __half2float(u.x);
-        float u1 = __half2float(u.y);
-        float w0 = __half2float(w.x);
-        float w1 = __half2float(w.y);
+        const half2* gh = (const half2*)&gv;
+        const half2* uh = (const half2*)&uv;
+        const half2* wh = (const half2*)&wv;
 
-        acc += silu_f32(g0) * u0 * w0;
-        acc += silu_f32(g1) * u1 * w1;
+        #pragma unroll
+        for (int p = 0; p < 4; p++) {
+            float glo = __half2float(gh[p].x);
+            float ghi = __half2float(gh[p].y);
+            acc += silu_f32(glo) * __half2float(uh[p].x) * __half2float(wh[p].x);
+            acc += silu_f32(ghi) * __half2float(uh[p].y) * __half2float(wh[p].y);
+        }
     }
 
-    if ((intermediate_size & 1) && tid == 0) {
-        int last = intermediate_size - 1;
-        float g = __half2float(gate[last]);
-        acc += silu_f32(g) * __half2float(up[last]) * __half2float(w_row[last]);
+    const int tail_start = k8 * 8;
+    for (int idx = tail_start + tid; idx < intermediate_size; idx += FUSED_SILU_DOWN_THREADS) {
+        float g = __half2float(gate[idx]);
+        acc += silu_f32(g) * __half2float(up[idx]) * __half2float(w_row[idx]);
     }
 
     acc = warp_reduce_sum_fsd(acc);

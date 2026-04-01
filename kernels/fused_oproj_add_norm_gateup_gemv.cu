@@ -66,23 +66,34 @@ fused_cute_oproj_add_norm_gateup_gemv(
     // attn_out is small (q_dim * 2 bytes), will be cached in L1 after first pass.
     // o_weight rows are streamed; the full matrix fits in L2 for small models.
 
-    const int q2 = q_dim / 2;
-    const half2* attn2 = (const half2*)attn_out;
+    const int q8 = q_dim / 8;
+    const int4* attn4 = (const int4*)attn_out;
 
     for (int h = 0; h < hidden_size; h++) {
-        const half2* ow2 = (const half2*)(o_weight + (long long)h * q_dim);
+        const int4* ow4 = (const int4*)(o_weight + (long long)h * q_dim);
         float acc = 0.0f;
 
-        for (int i = tid; i < q2; i += THREADS) {
-            half2 a = attn2[i];
-            half2 w = ow2[i];
-            acc += __half2float(a.x) * __half2float(w.x)
-                 + __half2float(a.y) * __half2float(w.y);
+        #pragma unroll 4
+        for (int i = tid; i < q8; i += THREADS) {
+            int4 packed_w = ow4[i];
+            half2 w01 = *reinterpret_cast<half2*>(&packed_w.x);
+            half2 w23 = *reinterpret_cast<half2*>(&packed_w.y);
+            half2 w45 = *reinterpret_cast<half2*>(&packed_w.z);
+            half2 w67 = *reinterpret_cast<half2*>(&packed_w.w);
+
+            int4 packed_a = attn4[i];
+            half2 a01 = *reinterpret_cast<half2*>(&packed_a.x);
+            half2 a23 = *reinterpret_cast<half2*>(&packed_a.y);
+            half2 a45 = *reinterpret_cast<half2*>(&packed_a.z);
+            half2 a67 = *reinterpret_cast<half2*>(&packed_a.w);
+
+            acc += __half2float(w01.x) * __half2float(a01.x) + __half2float(w01.y) * __half2float(a01.y)
+                 + __half2float(w23.x) * __half2float(a23.x) + __half2float(w23.y) * __half2float(a23.y)
+                 + __half2float(w45.x) * __half2float(a45.x) + __half2float(w45.y) * __half2float(a45.y)
+                 + __half2float(w67.x) * __half2float(a67.x) + __half2float(w67.y) * __half2float(a67.y);
         }
-        // Handle odd q_dim
-        if ((q_dim & 1) && tid == 0) {
-            acc += __half2float(attn_out[q_dim - 1]) * __half2float(o_weight[(long long)h * q_dim + q_dim - 1]);
-        }
+        for (int i = q8 * 8 + tid; i < q_dim; i += THREADS)
+            acc += __half2float(o_weight[(long long)h * q_dim + i]) * __half2float(attn_out[i]);
 
         // Warp reduction
         acc = warp_reduce_sum_opag(acc);
@@ -153,33 +164,43 @@ fused_cute_oproj_add_norm_gateup_gemv(
 
     // ---- Phase 3: gate_up GEMV -- RPB=8 dot products per block ----
     const int rows_this_block = min(RPB, gate_up_dim - block_row_base);
+    const int h8 = hidden_size / 8;
 
     float acc[RPB];
     #pragma unroll
     for (int r = 0; r < RPB; r++) acc[r] = 0.0f;
 
-    for (int i = tid; i < h2; i += THREADS) {
-        float sn0 = s_hidden[i * 2];
-        float sn1 = s_hidden[i * 2 + 1];
+    #pragma unroll 4
+    for (int i = tid; i < h8; i += THREADS) {
+        int base = i * 8;
+        float s0 = s_hidden[base],     s1 = s_hidden[base+1],
+              s2 = s_hidden[base+2],   s3 = s_hidden[base+3],
+              s4 = s_hidden[base+4],   s5 = s_hidden[base+5],
+              s6 = s_hidden[base+6],   s7 = s_hidden[base+7];
         #pragma unroll
         for (int r = 0; r < RPB; r++) {
             if (r < rows_this_block) {
-                const half2* w2 = (const half2*)(gateup_weight + (long long)(block_row_base + r) * hidden_size);
-                half2 w = w2[i];
-                acc[r] += __half2float(w.x) * sn0 + __half2float(w.y) * sn1;
+                const int4* w4 = (const int4*)(gateup_weight + (long long)(block_row_base + r) * hidden_size);
+                int4 packed = w4[i];
+                half2 w01 = *reinterpret_cast<half2*>(&packed.x);
+                half2 w23 = *reinterpret_cast<half2*>(&packed.y);
+                half2 w45 = *reinterpret_cast<half2*>(&packed.z);
+                half2 w67 = *reinterpret_cast<half2*>(&packed.w);
+                acc[r] += __half2float(w01.x) * s0 + __half2float(w01.y) * s1
+                        + __half2float(w23.x) * s2 + __half2float(w23.y) * s3
+                        + __half2float(w45.x) * s4 + __half2float(w45.y) * s5
+                        + __half2float(w67.x) * s6 + __half2float(w67.y) * s7;
             }
         }
     }
 
-    // Handle odd hidden_size
-    if ((hidden_size & 1) && tid == 0) {
-        int last = hidden_size - 1;
-        float sn = s_hidden[last];
+    // Handle remainder elements
+    for (int i = h8 * 8 + tid; i < hidden_size; i += THREADS) {
+        float sn = s_hidden[i];
         #pragma unroll
         for (int r = 0; r < RPB; r++) {
             if (r < rows_this_block) {
-                const __half* w_row = gateup_weight + (long long)(block_row_base + r) * hidden_size;
-                acc[r] += __half2float(w_row[last]) * sn;
+                acc[r] += __half2float(gateup_weight[(long long)(block_row_base + r) * hidden_size + i]) * sn;
             }
         }
     }
