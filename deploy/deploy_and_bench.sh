@@ -217,14 +217,14 @@ fi
 # Step 2: Build Rust binary
 # ============================================================
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
-    step "Step 2: Build rvllm-server"
+    step "Step 2: Build rvllm"
     BUILD_START=$(date +%s)
 
     if command -v nvcc &>/dev/null; then
-        cargo build --release --features cuda,cublaslt -p rvllm-server \
+        cargo build --release --features cuda,cublaslt -p rvllm \
             --manifest-path "$REPO_DIR/Cargo.toml" 2>&1 | tail -5
     else
-        cargo build --release -p rvllm-server \
+        cargo build --release -p rvllm \
             --manifest-path "$REPO_DIR/Cargo.toml" 2>&1 | tail -5
     fi
 

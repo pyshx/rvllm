@@ -11,7 +11,7 @@ WORKDIR /build
 COPY . .
 
 # Build with CUDA support, release mode
-RUN cargo build --release --features cuda -p rvllm-server 2>&1 | tail -20
+RUN cargo build --release --features cuda -p rvllm 2>&1 | tail -20
 
 # Stage 2: Runtime image (smaller)
 FROM nvidia/cuda:13.0.1-runtime-ubuntu24.04

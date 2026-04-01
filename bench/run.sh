@@ -45,7 +45,7 @@ command -v curl >/dev/null 2>&1 || { err "curl not found."; exit 1; }
 nvidia-smi >/dev/null 2>&1 || { err "nvidia-smi failed. No GPU?"; exit 1; }
 
 # --- Step 1: Build ---
-log "Building rvllm-server with CUDA support..."
+log "Building rvllm with CUDA support..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="${SCRIPT_DIR}/.."
 if [ ! -f "${REPO_DIR}/Cargo.toml" ]; then
@@ -56,7 +56,7 @@ fi
 cd "$REPO_DIR"
 
 BUILD_START=$(date +%s%N)
-cargo build --release --features cuda -p rvllm-server 2>&1 | tail -3
+cargo build --release --features cuda -p rvllm 2>&1 | tail -3
 BUILD_END=$(date +%s%N)
 BUILD_TIME_MS=$(( (BUILD_END - BUILD_START) / 1000000 ))
 log "Build time: ${BUILD_TIME_MS}ms"

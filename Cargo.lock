@@ -2628,6 +2628,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
+name = "rvllm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rvllm-api",
+ "rvllm-config",
+ "rvllm-core",
+ "rvllm-engine",
+ "rvllm-gpu",
+ "rvllm-sequence",
+ "rvllm-telemetry",
+ "rvllm-tokenizer",
+ "serde_json",
+ "tempfile",
+ "tokenizers",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "rvllm-api"
 version = "0.1.0"
 dependencies = [
@@ -2907,29 +2930,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
-]
-
-[[package]]
-name = "rvllm-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "rvllm-api",
- "rvllm-config",
- "rvllm-core",
- "rvllm-engine",
- "rvllm-gpu",
- "rvllm-sequence",
- "rvllm-telemetry",
- "rvllm-tokenizer",
- "serde_json",
- "tempfile",
- "tokenizers",
- "tokio",
- "tokio-stream",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

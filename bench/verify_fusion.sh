@@ -90,11 +90,11 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
         warn "nvcc not found, skipping kernel compilation"
     fi
 
-    log "Building rvllm-server..."
+    log "Building rvllm..."
     if command -v nvcc &>/dev/null; then
-        cargo build --release --features cuda -p rvllm-server --manifest-path "$REPO_DIR/Cargo.toml" 2>&1 | tail -3
+        cargo build --release --features cuda -p rvllm --manifest-path "$REPO_DIR/Cargo.toml" 2>&1 | tail -3
     else
-        cargo build --release -p rvllm-server --manifest-path "$REPO_DIR/Cargo.toml" 2>&1 | tail -3
+        cargo build --release -p rvllm --manifest-path "$REPO_DIR/Cargo.toml" 2>&1 | tail -3
     fi
     ok "Build complete"
 else

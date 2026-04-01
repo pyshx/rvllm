@@ -88,8 +88,8 @@ fi
 
 # --- Step 3: Build rvllm ---
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
-    step "Step 3: Build rvllm-server"
-    cargo build --release --features cuda -p rvllm-server \
+    step "Step 3: Build rvllm"
+    cargo build --release --features cuda -p rvllm \
         --manifest-path "$REPO_DIR/Cargo.toml" 2>&1 | tail -5
 fi
 

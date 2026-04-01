@@ -156,7 +156,7 @@ fi
 bold "6/7 Build rvLLM (--features cuda,cublaslt)"
 
 cd "$REPO_DIR"
-cargo build --release --features cuda,cublaslt -p rvllm-server 2>&1 | tail -5
+cargo build --release --features cuda,cublaslt -p rvllm 2>&1 | tail -5
 
 BINARY="$REPO_DIR/target/release/rvllm"
 if [[ -x "$BINARY" ]]; then

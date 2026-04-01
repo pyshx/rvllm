@@ -51,11 +51,11 @@ command -v curl >/dev/null 2>&1 || { err "curl not found."; exit 1; }
 command -v jq >/dev/null 2>&1 || { err "jq not found."; exit 1; }
 
 # --- Build ---
-log "Building rvllm-server..."
+log "Building rvllm..."
 cd "$REPO_DIR"
-cargo build --release --features cuda -p rvllm-server 2>&1 | tail -3
+cargo build --release --features cuda -p rvllm 2>&1 | tail -3
 
-SERVER_BIN="$REPO_DIR/target/release/rvllm-server"
+SERVER_BIN="$REPO_DIR/target/release/rvllm"
 if [ ! -f "$SERVER_BIN" ]; then
     err "Server binary not found at $SERVER_BIN"
     exit 1

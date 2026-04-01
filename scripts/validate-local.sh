@@ -200,7 +200,7 @@ fi
 echo ""
 echo "=== Step 2: Cargo Check (CUDA features) ==="
 cd /src
-if CUDA_ARCH="${ARCH_LIST[0]}" cargo check --workspace --features rvllm-server/cuda 2>&1 | tail -5; then
+if CUDA_ARCH="${ARCH_LIST[0]}" cargo check --workspace --features rvllm/cuda 2>&1 | tail -5; then
     report "PASS" "cargo check --features cuda"
 else
     report "FAIL" "cargo check --features cuda"
@@ -219,7 +219,7 @@ fi
 if [ "$MODE" = "full" ]; then
     echo ""
     echo "=== Step 4: Release Build ==="
-    if CUDA_ARCH="${ARCH_LIST[0]}" cargo build --release --features cuda -p rvllm-server 2>&1 | tail -5; then
+    if CUDA_ARCH="${ARCH_LIST[0]}" cargo build --release --features cuda -p rvllm 2>&1 | tail -5; then
         report "PASS" "cargo build --release --features cuda"
     else
         report "FAIL" "cargo build --release --features cuda"

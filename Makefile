@@ -2,11 +2,11 @@
 
 # Local development (Mac, mock-gpu)
 build:
-	cargo build --release -p rvllm-server
+	cargo build --release -p rvllm
 
 # CUDA build (Linux + NVIDIA GPU)
 build-cuda:
-	cargo build --release --features cuda -p rvllm-server
+	cargo build --release --features cuda -p rvllm
 
 # Check workspace compiles (mock-gpu, Mac)
 check:
@@ -14,7 +14,7 @@ check:
 
 # Check workspace compiles with CUDA features (needs cudarc, OK to fail without CUDA toolkit)
 check-cuda:
-	cargo check --workspace --features rvllm-server/cuda
+	cargo check --workspace --features rvllm/cuda
 
 # Compile .cu kernels to .ptx (requires nvcc)
 kernels:
@@ -26,7 +26,7 @@ test:
 
 # Run tests with CUDA features
 test-cuda:
-	cargo test --workspace --features rvllm-server/cuda
+	cargo test --workspace --features rvllm/cuda
 
 # Run benchmarks (Rust)
 bench:

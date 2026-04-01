@@ -52,7 +52,7 @@ if ! curl -sf "${BASE_URL}/health" > /dev/null 2>&1; then
         BIN="${PROJECT_ROOT}/target/debug/rvllm"
     else
         echo "[smoke] building rvllm..."
-        (cd "$PROJECT_ROOT" && cargo build -p rvllm-server 2>&1)
+        (cd "$PROJECT_ROOT" && cargo build -p rvllm 2>&1)
         BIN="${PROJECT_ROOT}/target/debug/rvllm"
     fi
 

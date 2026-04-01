@@ -143,7 +143,7 @@ Operations between GPU forward passes, measured on Apple M5 and Xeon:
 
 | Metric | rvLLM | Python vLLM |
 |---|---|---|
-| Install | `cargo install rvllm` | `pip install vllm` (+ PyTorch) |
+| Install | `cargo install rvllm --features cuda,cublaslt` | `pip install vllm` (+ PyTorch) |
 | Container image | ~50 MB | ~15 GB |
 | Build from source | 35 sec | N/A |
 | Kernel compilation | 30 sec (54 PTX via nvcc) + 0 sec (JIT at runtime) | 0 or ~60s (torch.compile) |
@@ -251,7 +251,7 @@ What rvLLM does better:
 
 | Crate | Purpose |
 |---|---|
-| `rvllm-server` | HTTP API (axum), CLI |
+| `rvllm` | HTTP API (axum), CLI |
 | `rvllm-engine` | Async engine, continuous batching |
 | `rvllm-worker` | GPU worker, CUDA graph management |
 | `rvllm-model-runner` | Forward pass, weight loading, autotuning |
@@ -269,7 +269,7 @@ What rvLLM does better:
 
 ```bash
 # From crates.io
-cargo install rvllm
+cargo install rvllm --features cuda,cublaslt
 
 # From PyPI
 pip install rvllm

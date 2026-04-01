@@ -109,7 +109,7 @@ echo ""
 echo "=== Verifying rvLLM build ==="
 if [ -f "Cargo.toml" ]; then
     echo "Building (mock-gpu, no CUDA required)..."
-    cargo build --release -p rvllm-server 2>&1 | tail -3
+    cargo build --release -p rvllm 2>&1 | tail -3
     echo ""
     echo "[OK] rvLLM binary: $(ls -lh target/release/rvllm 2>/dev/null | awk '{print $5, $9}')"
 else
@@ -120,8 +120,8 @@ echo ""
 echo "=== Setup complete ==="
 echo ""
 echo "Next steps:"
-echo "  cargo build --release -p rvllm-server          # Build (mock-gpu)"
-echo "  cargo build --release --features cuda -p rvllm-server  # Build (CUDA)"
+echo "  cargo build --release -p rvllm                 # Build (mock-gpu)"
+echo "  cargo build --release --features cuda -p rvllm # Build (CUDA)"
 echo "  ./target/release/rvllm serve --model Qwen/Qwen2.5-1.5B"
 echo "  cargo test --workspace                          # Run tests"
 echo "  make bench-compare                              # Benchmark"

@@ -36,7 +36,7 @@ rsync -avz --exclude target --exclude .git --exclude '.claude/worktrees' \
 # 2. Build with CUDA
 ssh -p $PORT root@$HOST "
   export PATH=/root/.cargo/bin:\$PATH
-  cd /root/rvllm && cargo build --release --features cuda -p rvllm-server
+  cd /root/rvllm && cargo build --release --features cuda -p rvllm
 "
 
 # 3. Start server

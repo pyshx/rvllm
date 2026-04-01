@@ -68,9 +68,9 @@ kill_port() {
 log "Phase 1: rvLLM"
 
 # Build rvllm
-log "Building rvllm-server..."
+log "Building rvllm..."
 cd "$REPO_DIR"
-cargo build --release --features cuda -p rvllm-server 2>&1 | tail -3
+cargo build --release --features cuda -p rvllm 2>&1 | tail -3
 BINARY="./target/release/rvllm"
 [ -f "$BINARY" ] || { err "rvllm binary not found"; exit 1; }
 

@@ -23,7 +23,7 @@ CRATES=(
     rvllm-speculative
     rvllm-engine
     rvllm-api
-    rvllm-server
+    rvllm
 )
 
 for crate in "${CRATES[@]}"; do

@@ -38,9 +38,9 @@ python3 -c "import aiohttp" 2>/dev/null || {
 }
 
 # --- Build ---
-log "Building rvllm-server..."
+log "Building rvllm..."
 cd "$REPO_DIR"
-cargo build --release --features cuda -p rvllm-server 2>&1 | tail -3
+cargo build --release --features cuda -p rvllm 2>&1 | tail -3
 BINARY="./target/release/rvllm"
 [ -f "$BINARY" ] || { err "Binary not found at $BINARY"; exit 1; }
 ok "Built $(ls -lh "$BINARY" | awk '{print $5}')"

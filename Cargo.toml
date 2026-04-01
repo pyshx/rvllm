@@ -43,29 +43,29 @@ categories = ["science", "concurrency", "hardware-support"]
 
 [workspace.dependencies]
 # Internal crates
-rvllm-core = { path = "crates/rvllm-core" }
-rvllm-config = { path = "crates/rvllm-config" }
-rvllm-gpu = { path = "crates/rvllm-gpu" }
-rvllm-memory = { path = "crates/rvllm-memory" }
-rvllm-block-manager = { path = "crates/rvllm-block-manager" }
-rvllm-kv-cache = { path = "crates/rvllm-kv-cache" }
-rvllm-attention = { path = "crates/rvllm-attention" }
-rvllm-tokenizer = { path = "crates/rvllm-tokenizer" }
-rvllm-model-loader = { path = "crates/rvllm-model-loader" }
-rvllm-model-runner = { path = "crates/rvllm-model-runner" }
-rvllm-sampling = { path = "crates/rvllm-sampling" }
-rvllm-scheduler = { path = "crates/rvllm-scheduler" }
-rvllm-sequence = { path = "crates/rvllm-sequence" }
-rvllm-worker = { path = "crates/rvllm-worker" }
-rvllm-executor = { path = "crates/rvllm-executor" }
-rvllm-engine = { path = "crates/rvllm-engine" }
-rvllm-api = { path = "crates/rvllm-api" }
-rvllm-quant = { path = "crates/rvllm-quant" }
-rvllm-speculative = { path = "crates/rvllm-speculative" }
-rvllm-tp = { path = "crates/rvllm-tp" }
-rvllm-telemetry = { path = "crates/rvllm-telemetry" }
-rvllm-fusion = { path = "crates/rvllm-fusion" }
-rvllm-zig = { path = "crates/rvllm-zig" }
+rvllm-core = { version = "0.1.0", path = "crates/rvllm-core" }
+rvllm-config = { version = "0.1.0", path = "crates/rvllm-config" }
+rvllm-gpu = { version = "0.1.0", path = "crates/rvllm-gpu" }
+rvllm-memory = { version = "0.1.0", path = "crates/rvllm-memory" }
+rvllm-block-manager = { version = "0.1.0", path = "crates/rvllm-block-manager" }
+rvllm-kv-cache = { version = "0.1.0", path = "crates/rvllm-kv-cache" }
+rvllm-attention = { version = "0.1.0", path = "crates/rvllm-attention" }
+rvllm-tokenizer = { version = "0.1.0", path = "crates/rvllm-tokenizer" }
+rvllm-model-loader = { version = "0.1.0", path = "crates/rvllm-model-loader" }
+rvllm-model-runner = { version = "0.1.0", path = "crates/rvllm-model-runner" }
+rvllm-sampling = { version = "0.1.0", path = "crates/rvllm-sampling" }
+rvllm-scheduler = { version = "0.1.0", path = "crates/rvllm-scheduler" }
+rvllm-sequence = { version = "0.1.0", path = "crates/rvllm-sequence" }
+rvllm-worker = { version = "0.1.0", path = "crates/rvllm-worker" }
+rvllm-executor = { version = "0.1.0", path = "crates/rvllm-executor" }
+rvllm-engine = { version = "0.1.0", path = "crates/rvllm-engine" }
+rvllm-api = { version = "0.1.0", path = "crates/rvllm-api" }
+rvllm-quant = { version = "0.1.0", path = "crates/rvllm-quant" }
+rvllm-speculative = { version = "0.1.0", path = "crates/rvllm-speculative" }
+rvllm-tp = { version = "0.1.0", path = "crates/rvllm-tp" }
+rvllm-telemetry = { version = "0.1.0", path = "crates/rvllm-telemetry" }
+rvllm-fusion = { version = "0.1.0", path = "crates/rvllm-fusion" }
+rvllm-zig = { version = "0.1.0", path = "crates/rvllm-zig" }
 # External dependencies
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
@@ -99,4 +99,3 @@ tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 anyhow = "1"
 pyo3 = { version = "0.25", features = ["extension-module"] }
-
