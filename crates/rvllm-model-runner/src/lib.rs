@@ -17,6 +17,8 @@ pub mod runner;
 pub mod gpu_layer;
 #[cfg(feature = "cuda")]
 pub mod gpu_runner;
+#[cfg(feature = "cuda")]
+pub mod megakernel;
 
 /// Type alias for cublasLt handle. Compiles to a usable type with the
 /// `cublaslt` feature, or a zero-size dummy without it. This lets
