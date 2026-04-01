@@ -427,8 +427,29 @@ mod inner {
             info!("model weights loaded successfully");
 
             // 8. Profile GPU memory and init KV cache + GPU model runner
-            let (num_gpu_blocks, num_cpu_blocks) =
-                worker.profile_num_available_blocks(config.cache.gpu_memory_utilization)?;
+            let reserve_bytes =
+                (config.cache.gpu_memory_reserve_gb * 1024.0 * 1024.0 * 1024.0) as usize;
+            let (num_gpu_blocks, num_cpu_blocks) = if let Some(num_gpu_blocks) =
+                config.cache.num_gpu_blocks
+            {
+                let num_cpu_blocks = config.cache.num_cpu_blocks.unwrap_or(128);
+                info!(
+                    num_gpu_blocks,
+                    num_cpu_blocks,
+                    reserve_gb = config.cache.gpu_memory_reserve_gb,
+                    "using fixed KV cache block budget"
+                );
+                (num_gpu_blocks, num_cpu_blocks)
+            } else {
+                let (num_gpu_blocks, profiled_cpu_blocks) = worker.profile_num_available_blocks(
+                    config.cache.gpu_memory_utilization,
+                    reserve_bytes,
+                )?;
+                (
+                    num_gpu_blocks,
+                    config.cache.num_cpu_blocks.unwrap_or(profiled_cpu_blocks),
+                )
+            };
             worker.init_cache(num_gpu_blocks, num_cpu_blocks)?;
 
             // 8. Scheduler

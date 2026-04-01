@@ -27,7 +27,7 @@
 #define V3_BC 64
 #define V3_THREADS 256
 #define V3_WARPS 8
-#define V3_GQA_MAX_HPG 16
+#define V3_GQA_MAX_HPG 8
 #define V3_SCORE_STRIDE (V3_BC + 1)
 #define V3_CHUNK 8  // f16 elements per cp.async (16 bytes)
 
@@ -405,6 +405,7 @@ fa3_v3_decode_kernel(
     int num_kv_heads,
     int head_dim,
     int block_size,
+    int max_context_len,
     int max_blocks_per_seq,
     int num_splits
 ) {
@@ -417,6 +418,7 @@ fa3_v3_decode_kernel(
 
     const int context_len = context_lens[seq_idx];
     if (context_len == 0) return;
+    (void)max_context_len;
 
     const int kv_head_idx = (num_kv_heads == num_heads)
         ? head_idx

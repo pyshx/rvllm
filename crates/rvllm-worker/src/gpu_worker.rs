@@ -958,10 +958,12 @@ impl GpuWorker {
     pub fn profile_num_available_blocks(
         &self,
         gpu_memory_utilization: f32,
+        gpu_memory_reserve_bytes: usize,
     ) -> Result<(usize, usize)> {
         let (free, _total) = self.context.mem_get_info()
             .map_err(|e| LLMError::GpuError(format!("mem_get_info failed: {e}")))?;
-        let available = (free as f32 * gpu_memory_utilization) as usize;
+        let free_after_reserve = free.saturating_sub(gpu_memory_reserve_bytes);
+        let available = (free_after_reserve as f32 * gpu_memory_utilization) as usize;
 
         let cache_cfg = self.config.cache_config();
         let total_block_bytes = cache_cfg.total_block_bytes();
@@ -989,6 +991,8 @@ impl GpuWorker {
 
         info!(
             free,
+            gpu_memory_reserve_bytes,
+            free_after_reserve,
             available, num_gpu_blocks, num_cpu_blocks,
             fp8 = self.use_fp8_kv,
             "profiled available blocks"

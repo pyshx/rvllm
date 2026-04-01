@@ -9,6 +9,9 @@ pub struct CacheConfigImpl {
     pub block_size: usize,
     /// Fraction of GPU memory to use for KV cache (0.0..1.0].
     pub gpu_memory_utilization: f32,
+    /// VRAM to leave unallocated for graph/cublas/scratch allocations, in GiB.
+    #[serde(default)]
+    pub gpu_memory_reserve_gb: f32,
     /// CPU swap space budget in GiB.
     pub swap_space_gb: f32,
     /// Override: fixed number of GPU blocks (computed at runtime if None).
@@ -32,6 +35,7 @@ impl Default for CacheConfigImpl {
         Self {
             block_size: 16,
             gpu_memory_utilization: 0.90,
+            gpu_memory_reserve_gb: 0.0,
             swap_space_gb: 4.0,
             num_gpu_blocks: None,
             num_cpu_blocks: None,
@@ -62,6 +66,12 @@ impl CacheConfigBuilder {
     /// Set GPU memory utilization fraction.
     pub fn gpu_memory_utilization(mut self, v: f32) -> Self {
         self.0.gpu_memory_utilization = v;
+        self
+    }
+
+    /// Set GPU memory reserve in GiB.
+    pub fn gpu_memory_reserve_gb(mut self, v: f32) -> Self {
+        self.0.gpu_memory_reserve_gb = v;
         self
     }
 

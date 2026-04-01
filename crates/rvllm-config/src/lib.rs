@@ -90,6 +90,7 @@ fn apply_cli_overrides(config: &mut EngineConfig, args: &CliArgs) {
     // Cache
     config.cache.block_size = args.block_size;
     config.cache.gpu_memory_utilization = args.gpu_memory_utilization;
+    config.cache.gpu_memory_reserve_gb = args.gpu_memory_reserve_gb;
     config.cache.swap_space_gb = args.swap_space_gb;
     config.cache.num_gpu_blocks = args.num_gpu_blocks;
     config.cache.num_cpu_blocks = args.num_cpu_blocks;
@@ -133,6 +134,7 @@ mod tests {
             trust_remote_code: false,
             block_size: 16,
             gpu_memory_utilization: 0.9,
+            gpu_memory_reserve_gb: 0.0,
             swap_space_gb: 4.0,
             num_gpu_blocks: None,
             num_cpu_blocks: None,
@@ -204,6 +206,7 @@ log_level = "warn"
             trust_remote_code: false,
             block_size: 8,
             gpu_memory_utilization: 0.8,
+            gpu_memory_reserve_gb: 0.0,
             swap_space_gb: 2.0,
             num_gpu_blocks: None,
             num_cpu_blocks: None,
@@ -240,6 +243,7 @@ log_level = "warn"
             trust_remote_code: false,
             block_size: 16,
             gpu_memory_utilization: 0.9,
+            gpu_memory_reserve_gb: 0.0,
             swap_space_gb: 4.0,
             num_gpu_blocks: None,
             num_cpu_blocks: None,

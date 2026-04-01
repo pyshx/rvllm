@@ -1,34 +1,36 @@
 # rvLLM: High-performance LLM inference in Rust
 
-A from-scratch Rust rewrite of [vLLM](https://github.com/vllm-project/vllm) -- the most popular open-source LLM serving engine. Drop-in replacement for the OpenAI-compatible API with dramatically better resource efficiency.
+A from-scratch Rust rewrite of [vLLM](https://github.com/vllm-project/vllm) focused on single-card, high-throughput serving with explicit control over kernels, memory, and startup behavior.
 
-**12,312 tok/s at 128 concurrent streams (0.85x vLLM direct engine). 54 CUDA kernels. FA3 v3 cp.async + split-KV attention. No-fallback kernel validation. Rust PTX compiler with 2-7.5x faster codegen than nvcc. cuBLAS autotuning. CUDA graph replay. FP8 inference. INT4/W4A16 GEMV kernel. 20x faster startup. 31x smaller binary.**
+**Latest verified H100 run (2026-04-01): `rvLLM` reaches 3,170 tok/s at `N=32` direct engine (`0.99x` stock `vLLM`) and 2,723 tok/s over HTTP at 200 requests / concurrency 32 (`0.95x` stock `vLLM`). 54 CUDA kernels. FA3 v3 cp.async + split-KV attention. No-fallback kernel validation. Rust PTX compiler. Safe-max VRAM sizing via `--gpu-memory-reserve-gb` and explicit block controls.**
 
-## rvLLM vs Python vLLM -- Head-to-Head
+## Current H100 Comparison
 
-All measurements on H100 SXM 80GB, Qwen2.5-7B f16, separate GPU instances per engine. No cherry-picking -- same model, same hardware, same prompts.
+All measurements below use Qwen2.5-7B f16 on H100 SXM 80GB. Direct engine runs use 256 output tokens. HTTP runs use 200 prompts at concurrency 32 with `max_tokens=256`. Stock `vLLM` was benchmarked through its own OpenAI server, `rvllm-lite` is the intermediate Python serving layer, and `rvLLM` is the Rust server.
 
-### Throughput (Phase 6 -- FA3 v3 + no-fallback)
+### Direct Engine
 
-Direct engine (no HTTP overhead), Qwen2.5-7B f16, 128 tok/req:
+| N | stock vLLM 0.6.3.post1 | rvllm-lite | rvLLM | rvLLM / vLLM |
+|---:|---:|---:|---:|---:|
+| 1 | 133.7 | 133.9 | 120.6 | 0.90x |
+| 4 | 543.3 | 542.8 | 427.9 | 0.79x |
+| 8 | 926.1 | 925.4 | 845.8 | 0.91x |
+| 16 | 1,934.5 | 1,664.8 | 1,648.9 | 0.85x |
+| 32 | 3,197.1 | 2,994.5 | 3,170.0 | 0.99x |
 
-| N | rvLLM (tok/s) | vLLM 0.18 (tok/s) | Ratio |
-|---:|---:|---:|---|
-| 1 | 121 | 170 | 0.71x |
-| 4 | 548 | 665 | 0.82x |
-| 16 | 2,122 | 2,202 | 0.96x |
-| 32 | 3,957 | 4,585 | 0.86x |
-| 64 | 7,451 | 7,888 | 0.94x |
-| 128 | 12,312 | 14,528 | 0.85x |
+`rvllm-lite` direct is essentially the stock `vLLM` library path, so the direct-engine gap is really between stock `vLLM` and `rvLLM`. In the latest verified run, `rvLLM` is still behind at low and mid concurrency, but it closes to near-parity by `N=32`.
 
-HTTP steady-state comparison (apples-to-apples):
+### HTTP Serving
 
-| N | rvLLM | vLLM 0.18 (eager) | Ratio |
-|---:|---:|---:|---|
-| 16 | 1,503 | 1,714 | 0.88x |
-| 32 | 2,902 | 3,431 | 0.85x |
-| 64 | 5,120 | 6,677 | 0.77x |
-| 128 | 8,161 | 12,230 | 0.67x |
+| Stack | Single request tok/s | 200-req throughput tok/s | Avg latency ms | Idle VRAM |
+|---|---:|---:|---:|---:|
+| stock vLLM 0.6.3.post1 | 41.0 | 2,861.9 | 2,061.9 | 71.9 GiB |
+| rvllm-lite | 128.6 | 131.8 | 43,334.9 | 71.9 GiB |
+| rvLLM | 120.2 | 2,723.2 | 2,685.2 | 75.2 GiB |
+
+The key result is that `rvllm-lite` keeps near-stock direct-engine speed but collapses over HTTP, which isolates most of the practical overhead to the Python serving/scheduling layer rather than the underlying `vLLM` engine. `rvLLM`'s server path is in the same practical class as stock `vLLM`, but the direct engine still needs more work to win consistently.
+
+Historical phase-by-phase numbers, including the earlier `12,312 tok/s @ N=128` run, live in [docs/benchmark-history.md](docs/benchmark-history.md).
 
 ### FA3 v3 Attention Kernel
 
@@ -71,29 +73,15 @@ The JIT compiler (`crates/rvllm-fusion/src/ptx_emit.rs`) emits PTX directly from
 
 Per-step savings at N=1 (28 layers): **4.2ms** = estimated **1.8x** single-sequence speedup.
 
-### Efficiency
+### Current Operational Notes
 
-| Metric | rvLLM | Python vLLM 0.18 | Winner |
-|---|---:|---:|---|
-| **Cold start to first token** | **6 sec** | ~120 sec | rvLLM **20x** |
-| **Binary size** | **16 MB** | ~500 MB | rvLLM **31x** |
-| **CPU memory at steady state** | **348 MB** | ~1 GB | rvLLM **3x** |
-| **Dependencies** | **0** (static binary) | PyTorch + 500MB | rvLLM |
-| **P95 latency spread** | **34 ms** (1.4%) | 190 ms (12%) | rvLLM **5.6x tighter** |
-| **CUDA graph capture** | **1.7 sec** (35 sizes) | ~60 sec (torch.compile) | rvLLM **35x** |
-| **cuBLAS autotuning** | **170 ms** (6 shapes) | ~60 sec (torch.compile) | rvLLM **350x** |
+| Metric | stock vLLM | rvllm-lite | rvLLM |
+|---|---:|---:|---:|
+| Idle VRAM after load | 71.9 GiB | 71.9 GiB | 75.2 GiB |
+| Post-HTTP VRAM | 72.1 GiB | 72.0 GiB | 75.3 GiB |
+| Safe-max startup control | `--gpu-memory-utilization` | `--gpu-memory-utilization` | `--gpu-memory-utilization`, `--gpu-memory-reserve-gb`, `--num-gpu-blocks` |
 
-No Python interpreter, no GIL, no garbage collector, no PyTorch tensor allocation. rvLLM's P95 tail is 5.6x tighter than vLLM's because there are no GC pauses, no JIT recompilations, no Python object churn.
-
-### Resource Usage (Qwen2.5-7B f16, H100 80GB)
-
-| Metric | rvLLM | Python vLLM 0.18 |
-|---|---:|---:|
-| **Model weight VRAM** | 14.0 GB | 14.0 GB |
-| **KV cache VRAM (0.9 util)** | 48.5 GB | ~50 GB |
-| **Peak GPU memory** | 66.5 GB | ~72 GB |
-| **FP8 weight support** | Yes (cublasLt) | Yes |
-| **FP8 KV cache** | Yes | Yes |
+For `rvLLM`, `--gpu-memory-utilization 1.0` now works with an explicit reserve, which is safer than guessing a fixed fraction and hoping startup scratch allocations fit.
 
 ### Zig SIMD Acceleration
 
@@ -234,7 +222,7 @@ Note: Phase 5d and earlier numbers used 512 tok/req. Phase 6+ uses 128 tok/req (
 
 ### What Differs from vLLM
 
-Direct engine gap is 0.71-0.96x (near parity at N=16/64). HTTP gap is 0.67-0.88x. Root causes, in order of impact:
+In the latest verified run, `rvLLM` ranges from `0.79x` to `0.99x` stock `vLLM` on direct engine and reaches `0.95x` of stock `vLLM` HTTP throughput. Root causes, in order of impact:
 
 1. **GEMM tuning**: vLLM uses Triton autotuned GEMMs + torch.compile; we use stock cuBLAS heuristics. This is the dominant remaining gap at high concurrency.
 2. **Attention**: vLLM uses FlashAttention-3 (Tri Dao's official CUDA, heavily optimized with TMA, warp specialization, pipelining); our FA3 v3 uses cp.async and split-KV but still lacks TMA and full warp specialization.
@@ -243,13 +231,11 @@ Direct engine gap is 0.71-0.96x (near parity at N=16/64). HTTP gap is 0.67-0.88x
 
 What rvLLM does better:
 
-1. **20x faster cold start** (6s vs 120s) -- no Python interpreter, no torch.compile warmup
-2. **31x smaller binary** (16 MB vs 500 MB) -- static Rust binary, zero dependencies
-3. **3x less CPU memory** (348 MB vs ~1 GB)
-4. **5.6x tighter P95 latency** -- no GIL, no GC pauses, no JIT recompilations
-5. **Zero dependencies** -- single static binary, ~50 MB container image
-6. **JIT fused kernels 2-7.5x faster** than hand-written CUDA for N=1 decode
-7. **Multiple decode paths** -- cuBLAS GEMV (84% BW util), fused GEMV, megakernel, persistent, FP8, INT4 planned
+1. **Owns the whole stack** -- Rust server, worker, scheduler, and kernels without a Python runtime in the serving hot path
+2. **Safe-max memory control** -- reserve-based startup sizing plus explicit GPU/CPU block overrides
+3. **JIT fused kernels** -- `rvllm-fusion` PTX emission beats the hand-written CUDA versions by 2-7.5x on the measured decode microbenchmarks
+4. **Kernel discipline** -- no-fallback validation and multiple decode paths (`FusedDecode`, cuBLAS GEMV, megakernel, persistent, FP8, planned INT4)
+5. **Server overhead vs rvllm-lite** -- the current H100 run shows the Rust server path staying competitive while the intermediate Python layer serializes itself under load
 
 ### What's Inside
 
@@ -261,7 +247,7 @@ What rvLLM does better:
 | `rvllm-model-runner` | Forward pass, weight loading, autotuning |
 | `rvllm-gpu` | CUDA abstractions, cuBLAS, kernel loader, vendored cublaslt |
 | `rvllm-fusion` | JIT kernel compiler, PTX emitter, LLVM NVPTX backend |
-| **`rtriton`** | **Triton-style GPU kernel compiler + cuBLAS integration** |
+| `rtriton` (experimental sidecar) | Triton-style GPU kernel compiler + cuBLAS integration research crate |
 | `rvllm-zig` | Zig SIMD backend (softmax, argmax, weight conversion) |
 | `rvllm-kv-cache` | Paged KV cache (f16 + FP8) |
 | `rvllm-attention` | Attention backends (FA3 v3 cp.async + split-KV, GQA) |
@@ -290,11 +276,11 @@ cargo build --release --features cuda
 ## Quick Start
 
 ```bash
-# Serve Qwen2.5-7B
-rvllm serve --model Qwen/Qwen2.5-7B --dtype half
+# Serve Qwen2.5-7B with safe-max VRAM sizing
+rvllm serve --model Qwen/Qwen2.5-7B --dtype half --gpu-memory-utilization 1.0 --gpu-memory-reserve-gb 2.0
 
 # Benchmark (direct engine, no HTTP)
-rvllm benchmark --model Qwen/Qwen2.5-7B --dtype half --n "1,4,16,64,128"
+rvllm benchmark --model Qwen/Qwen2.5-7B --dtype half --n "1,4,8,16,32" --output-len 256
 ```
 
 ### Optional Features
@@ -332,7 +318,7 @@ RVLLM_SPECULATIVE_DRAFT_LAYERS=8  # layers for self-draft (default: total_layers
 
 ## Benchmark Methodology
 
-Both engines serve the same OpenAI-compatible `/v1/completions` endpoint. Direct engine benchmarks use the built-in `rvllm benchmark` command (no HTTP overhead). HTTP benchmarks use `bench/loadtest.py` (async Python client with aiohttp). Head-to-head comparison via `bench/compare_vllm.sh`.
+Both engines serve the same OpenAI-compatible `/v1/completions` endpoint. Direct engine benchmarks use the built-in `rvllm benchmark` command (no HTTP overhead). The latest published HTTP comparison used `deploy/benchmark_client.py`; the repo also includes `bench/loadtest.py` and `bench/compare_vllm.sh` for broader load and side-by-side runs.
 
 Each engine runs on its own vast.ai H100 SXM 80GB instance -- separate GPUs, clean CUDA state, no cross-contamination.
 

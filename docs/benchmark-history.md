@@ -2,6 +2,34 @@
 
 All results greedy decoding, 512 tokens/request unless noted. (Prior to 2026-03-30: 32 tokens/request.)
 
+## Phase 8 (2026-04-01) -- Stock vLLM vs rvllm-lite vs rvLLM, apples-to-apples H100
+
+This is the current public comparison set used in the README, GitHub Pages, and paper.
+Model: Qwen2.5-7B f16 on H100 SXM 80GB. Direct engine runs use 256 output tokens.
+HTTP runs use 200 requests at concurrency 32 with `max_tokens=256`.
+
+### Direct engine
+
+| N | stock vLLM 0.6.3.post1 | rvllm-lite | rvLLM | rvLLM / vLLM |
+|---:|---:|---:|---:|---:|
+| 1 | 133.7 | 133.9 | 120.6 | 0.90x |
+| 4 | 543.3 | 542.8 | 427.9 | 0.79x |
+| 8 | 926.1 | 925.4 | 845.8 | 0.91x |
+| 16 | 1,934.5 | 1,664.8 | 1,648.9 | 0.85x |
+| 32 | 3,197.1 | 2,994.5 | 3,170.0 | 0.99x |
+
+### HTTP serving
+
+| Stack | Single req tok/s | Load tok/s | Avg latency ms | Idle VRAM |
+|---|---:|---:|---:|---:|
+| stock vLLM 0.6.3.post1 | 41.0 | 2,861.9 | 2,061.9 | 71.9 GiB |
+| rvllm-lite | 128.6 | 131.8 | 43,334.9 | 71.9 GiB |
+| rvLLM | 120.2 | 2,723.2 | 2,685.2 | 75.2 GiB |
+
+The key diagnostic result is `rvllm-lite`: it stays near stock `vLLM` on direct engine
+but collapses under HTTP load, which isolates the practical serving overhead to the
+Python server/scheduler layer rather than the underlying `vLLM` engine.
+
 ## Phase 7 (2026-04-01) -- Architecture hardening + INT4 GEMV (H100 SXM 80GB)
 
 Focus: correctness fixes, portability, and new quantization kernel. No throughput regression at high concurrency (12,312 tok/s N=128 unchanged). N=1 improved from 98 to 121 tok/s via fused GEMV + 128-bit vectorized loads.

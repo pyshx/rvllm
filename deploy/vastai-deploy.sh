@@ -80,7 +80,7 @@ else
 
     # Build
     echo "=== Building ==="
-    CUDA_ARCH=\$ARCH cargo build --release --features cuda 2>&1 | tail -3
+    CUDA_ARCH=\$ARCH cargo build --release --features cuda,cublaslt 2>&1 | tail -3
 
     # Download model
     echo "=== Downloading model ==="

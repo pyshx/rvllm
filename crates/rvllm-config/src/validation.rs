@@ -8,6 +8,7 @@ use crate::engine::EngineConfig;
 /// Checks include:
 /// - `model_path` is non-empty
 /// - `gpu_memory_utilization` is in (0.0, 1.0]
+/// - `gpu_memory_reserve_gb` is non-negative
 /// - `block_size` is a power of two
 /// - `tensor_parallel_size` and `pipeline_parallel_size` are >= 1
 /// - `max_num_batched_tokens` >= `max_num_seqs`
@@ -41,6 +42,13 @@ pub fn validate(config: &EngineConfig) -> Result<(), String> {
         return Err(format!(
             "swap_space_gb must be >= 0, got {}",
             config.cache.swap_space_gb
+        ));
+    }
+
+    if config.cache.gpu_memory_reserve_gb < 0.0 {
+        return Err(format!(
+            "gpu_memory_reserve_gb must be >= 0, got {}",
+            config.cache.gpu_memory_reserve_gb
         ));
     }
 
@@ -172,6 +180,15 @@ mod tests {
         let mut cfg = valid_config();
         cfg.cache.swap_space_gb = -1.0;
         assert!(validate(&cfg).unwrap_err().contains("swap_space_gb"));
+    }
+
+    #[test]
+    fn negative_gpu_memory_reserve_rejected() {
+        let mut cfg = valid_config();
+        cfg.cache.gpu_memory_reserve_gb = -1.0;
+        assert!(validate(&cfg)
+            .unwrap_err()
+            .contains("gpu_memory_reserve_gb"));
     }
 
     #[test]

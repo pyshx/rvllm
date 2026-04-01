@@ -7,29 +7,26 @@
   \vspace{0.3em}
   {\normalsize\texttt{https://github.com/m0at/rvllm}\par}
   \vspace{0.3em}
-  {\normalsize San Francisco, March 28, 2026\par}
+  {\normalsize San Francisco, April 1, 2026\par}
 \end{center}
 \vspace{1em}
 
 % --- Abstract ---
 \begin{abstract}
-\textbf{Work in progress.} I present rvLLM, a from-scratch Rust implementation of
-the vLLM inference engine for OpenAI-compatible API serving with CUDA GPU acceleration.
-The system comprises 23~Rust crates and 50~CUDA kernels, compiling
-to a single 16\,MB static binary. In head-to-head benchmarks on a single H100~SXM~80\,GB,
-rvLLM with FP16 inference achieves 12{,}312~tok/s serving Qwen2.5-7B at $N\!=\!128$ (direct engine),
-\textbf{0.85$\times$ Python vLLM~0.18 direct engine (0.67--0.88$\times$ via HTTP)}
-while offering 20$\times$ faster startup, a 31$\times$ smaller
-binary, and 3$\times$ less CPU memory. At higher concurrency ($N\!>\!512$), Python
-vLLM scales further due to its mature continuous batching optimisations.
-The throughput advantage derives from: (1)~fused GEMM projections (QKV 3$\to$1,
-gate+up 2$\to$1), (2)~GPU-resident greedy decoding via an argmax kernel that reduces
-device-to-host transfer by $\sim$150{,}000$\times$ per step, (3)~FP16 hgemm with
-tensor cores and f16 KV cache, (4)~vectorized float4 loads across all kernels,
-(5)~fixed CUDA graph replay eliminating redundant forward passes,
-(6)~FlashAttention-3 v3 with cp.async and split-KV for decode, (7)~no-fallback kernel validation, and (8)~a zero-copy
-memory architecture with no Python objects, no PyTorch tensor metadata, and no garbage
-collector. rvLLM is open-source under the Apache-2.0 license.
+I present rvLLM, a from-scratch Rust implementation of the vLLM inference engine
+for OpenAI-compatible API serving with CUDA GPU acceleration. The current codebase
+is a 26-package Rust workspace with 54 CUDA kernels, FA3 v3 cp.async + split-KV
+attention, no-fallback kernel validation, and a Rust-native PTX compiler that
+generates fused decode kernels 2--7.5$\times$ faster than the hand-written CUDA
+baselines in the measured microbenchmarks. In the latest verified apples-to-apples
+comparison on a single H100~SXM~80\,GB serving Qwen2.5-7B f16, rvLLM reaches
+3{,}170~tok/s at $N\!=\!32$ direct engine (\textbf{0.99$\times$ stock vLLM~0.6.3.post1})
+and 2{,}723~tok/s over HTTP at 200 requests / concurrency 32 (\textbf{0.95$\times$ stock vLLM}).
+An intermediate Python stack, \texttt{rvllm-lite}, retains near-stock direct-engine
+speed but falls to 131.8~tok/s over HTTP, isolating the serving layer as a major
+source of practical overhead. The remaining direct-engine gap is dominated by GEMM
+tuning, attention microarchitecture, and scheduler maturity rather than by Rust or
+CUDA integration overhead. rvLLM is open-source under the Apache-2.0 license.
 \end{abstract}
 
 % ============================================================================
@@ -76,15 +73,18 @@ $\sim$150{,}000$\times$ reduction.
 
 The primary contributions are:
 \begin{enumerate}
-  \item A modular 23-crate Rust architecture for LLM inference, with GPU-resident
+  \item A modular 26-package Rust architecture for LLM inference, with GPU-resident
         execution that eliminates per-step device-to-host logit transfers for greedy
         decoding.
-  \item 50~CUDA kernels including FlashAttention-3 v3 with cp.async bulk copies and split-KV,
-        paged KV cache support, GPU argmax, and fused residual-RMSNorm. No-fallback
-        startup validation ensures every kernel loads or the server fails fast.
-  \item Verified benchmark results: 12{,}312~tok/s on H100 (FP16, Qwen2.5-7B, $N\!=\!128$, direct engine),
-        achieving 0.67--0.88$\times$ of Python vLLM via HTTP, with coherence verified across 14{,}620 total
-        requests and zero errors.
+  \item 54~CUDA kernels including FlashAttention-3 v3 with cp.async bulk copies and split-KV,
+        paged KV cache support, GPU argmax, fused residual-RMSNorm, and reserve-based
+        safe-max VRAM sizing for server startup. No-fallback startup validation ensures
+        every required kernel loads or the server fails fast.
+  \item Verified three-way H100 benchmark results against stock vLLM and an
+        intermediate Python serving layer, separating direct-engine performance from
+        serving-stack overhead.
+  \item A Rust-native PTX emission path for fused decode kernels, with measured
+        2--7.5$\times$ speedups over the corresponding hand-written CUDA kernels.
   \item A development cost analysis: approximately \$1{,}780 in compute and AI
         assistance to build the system from scratch.
 \end{enumerate}
@@ -94,8 +94,8 @@ The primary contributions are:
 \label{sec:architecture}
 % ============================================================================
 
-rvLLM is organised as a Cargo workspace containing 23~member crates plus a server
-binary. Dependencies flow strictly downward from the API layer to GPU primitives.
+rvLLM is organised as a Cargo workspace containing 26~member packages. Dependencies
+flow strictly downward from the API layer to GPU primitives.
 
 \subsection{Core and Configuration}
 
@@ -128,7 +128,7 @@ startup via \texttt{cudarc}'s \texttt{load\_ptx} API. A static dispatch table ma
 module names to known entry points.
 
 The mock backend substitutes CPU-based stubs with matching output shapes, enabling
-the full test suite (771~tests across 23~crates) to run without GPU hardware.
+the workspace test suite to run without GPU hardware.
 
 \subsection{Model Execution}
 
@@ -273,15 +273,15 @@ PyO3 bindings.
 
 \subsection{Pre-compiled PTX Kernels}
 
-The system includes 15~hand-written CUDA kernels (Table~\ref{tab:kernels}),
-compiled to PTX ahead-of-time via \texttt{nvcc} for compute capabilities
+The system includes 54~CUDA kernels overall. Table~\ref{tab:kernels} lists a
+representative subset of the low-level CUDA kernels, compiled to PTX ahead-of-time via \texttt{nvcc} for compute capabilities
 \texttt{sm\_70} (V100) through \texttt{sm\_100} (B200). At startup, the kernel
 loader registers PTX with the CUDA driver via \texttt{cudarc}. This avoids runtime
 JIT compilation entirely.
 
 \begin{table}[t]
   \centering
-  \caption{Custom CUDA kernels in rvLLM.}
+  \caption{Representative CUDA kernels in rvLLM.}
   \label{tab:kernels}
   \small
   \begin{tabular}{@{}llp{4.8cm}@{}}
@@ -445,144 +445,96 @@ the theoretical peak observed empirically at smaller model sizes.
 
 \subsection{Experimental Setup}
 
-All benchmarks use Qwen2.5-1.5B with greedy decoding ($\text{temperature}\!=\!0$),
-32 output tokens per request, and \texttt{max\_model\_len}\,=\,4096. GPU benchmarks
-were conducted on two hardware configurations:
+The public benchmark set in this revision is the latest verified apples-to-apples
+comparison on Qwen2.5-7B f16, using a single H100~SXM~80\,GB rented on vast.ai.
+All direct-engine runs use 256 output tokens per request. HTTP runs use 200 prompts
+at concurrency 32 with \texttt{max\_tokens}=256 and \texttt{max\_model\_len}=4096.
+
+Three stacks were measured:
 \begin{itemize}
-  \item NVIDIA A100 SXM4 (80\,GB VRAM), rented on vast.ai at \$0.96--1.15/hr.
-  \item NVIDIA B200 (180\,GB VRAM), rented on vast.ai at \$3.13/hr.
+  \item \textbf{stock vLLM~0.6.3.post1}: direct \texttt{LLM.generate(...)} and the
+        stock OpenAI server;
+  \item \textbf{rvllm-lite}: a Python serving layer that wraps vLLM internals;
+  \item \textbf{rvLLM}: the Rust server and direct engine, launched with
+        \texttt{--gpu-memory-utilization 1.0 --gpu-memory-reserve-gb 2.0}.
 \end{itemize}
-Python vLLM~0.18.0 was benchmarked on the same A100~80\,GB SXM4 for direct
-head-to-head comparison. All rvLLM measurements include coherence verification:
-sampled outputs are checked for non-empty, non-degenerate text at each batch size.
+All three stacks completed the HTTP benchmark with 200/200 successful requests.
 
-\subsection{B200 Throughput Scaling}
-
-Table~\ref{tab:b200} shows throughput scaling on a single B200 with 184{,}710 KV
-cache blocks.
+\subsection{Direct Engine: Three-Way Comparison}
 
 \begin{table}[t]
   \centering
-  \caption{B200 throughput scaling. Qwen2.5-1.5B, greedy decoding, 512 tokens/request. Zero errors across all batch sizes.}
-  \label{tab:b200}
+  \caption{H100 direct-engine comparison. Qwen2.5-7B f16, 256 output tokens/request.}
+  \label{tab:h100_direct}
   \small
   \begin{tabular}{@{}rrrrr@{}}
     \toprule
-    \thead{$N$} & \thead{Tokens} & \thead{Wall (ms)} & \thead{tok/s} & \thead{Errors} \\
+    \thead{$N$} & \thead{stock vLLM} & \thead{rvllm-lite} & \thead{rvLLM} & \thead{rvLLM / vLLM} \\
     \midrule
-    1     & 32      & 279     & 114    & 0 \\
-    
-    4     & 128     & 762     & 167    & 0 \\
-    8     & 256     & 601     & 425    & 0 \\
-    
-    16    & 512     & 826     & 619    & 0 \\
-    32    & 1{,}024  & 1{,}346 & 760    & 0 \\
-    
-    64    & 2{,}048  & 798     & 2{,}566 & 0 \\
-    128   & 4{,}096  & 1{,}249 & 3{,}279 & 0 \\
-    
-    256   & 8{,}192  & 2{,}106 & 3{,}889 & 0 \\
-    512   & 16{,}384 & 4{,}179 & 3{,}920 & 0 \\
-    
-    \textbf{768} & \textbf{24{,}576} & \textbf{6{,}227} & \textbf{3{,}946} & \textbf{0} \\
-    1{,}024 & 32{,}768 & 8{,}365 & 3{,}917 & 0 \\
-    
-    2{,}048 & 65{,}536 & 16{,}640 & 3{,}938 & 0 \\
-    4{,}096 & 131{,}072 & 34{,}002 & 3{,}854 & 0 \\
+    1  & 133.7 & 133.9 & 120.6 & 0.90$\times$ \\
+    \rowcolor{gray!8}
+    4  & 543.3 & 542.8 & 427.9 & 0.79$\times$ \\
+    8  & 926.1 & 925.4 & 845.8 & 0.91$\times$ \\
+    \rowcolor{gray!8}
+    16 & 1{,}934.5 & 1{,}664.8 & 1{,}648.9 & 0.85$\times$ \\
+    \textbf{32} & \textbf{3{,}197.1} & \textbf{2{,}994.5} & \textbf{3{,}170.0} & \textbf{0.99$\times$} \\
     \bottomrule
   \end{tabular}
 \end{table}
 
-Throughput plateaus at $\sim$3{,}940~tok/s from $N\!=\!512$ onward, indicating
-the system becomes compute-bound (cuBLAS GEMM throughput) rather than
-scheduling-bound or memory-bound. The plateau is sustained through $N\!=\!4{,}096$
-with zero errors across 13{,}553 total requests.
+\texttt{rvllm-lite} is effectively the stock vLLM library path wrapped in a custom
+Python server, so Table~\ref{tab:h100_direct} isolates the kernel/runtime gap. In
+the latest verified run, rvLLM remains behind at low and mid concurrency but closes
+to near parity by $N\!=\!32$.
 
-\subsection{A100 Head-to-Head: rvLLM vs Python vLLM}
-
-Table~\ref{tab:a100} shows optimised FP16 results on A100~80\,GB SXM4, compared
-directly with Python vLLM~0.18 on the same hardware.
+\subsection{HTTP Serving: Three-Way Comparison}
 
 \begin{table}[t]
   \centering
-  \caption{A100 80\,GB SXM4 head-to-head. Qwen2.5-1.5B, greedy, 512 tok/req. rvLLM FP16 (optimised) vs Python vLLM~0.18.}
-  \label{tab:a100}
-  \small
-  \begin{tabular}{@{}rrrp{3.5cm}@{}}
-    \toprule
-    \thead{$N$} & \thead{rvLLM (tok/s)} & \thead{vLLM (tok/s)} & \thead{Notes} \\
-    \midrule
-    1    & 117    & 69     & rvLLM 1.7$\times$ faster \\
-    
-    4    & 882    & 256    & rvLLM ahead \\
-    8    & 1{,}213 & 517   & \\
-    
-    16   & 1{,}391 & 1{,}060 & \\
-    32   & 1{,}434 & 1{,}943 & \\
-    
-    48   & 3{,}918 & 2{,}887 & rvLLM pulls ahead \\
-    64   & 4{,}796 & 3{,}828 & rvLLM 1.25$\times$ \\
-    
-    96   & 5{,}965 & 5{,}197 & rvLLM 1.15$\times$ \\
-    128  & 7{,}380 & 6{,}400 & rvLLM 1.15$\times$ \\
-    
-    256  & 9{,}905 & 9{,}437 & rvLLM 1.05$\times$ \\
-    512  & 10{,}291 & 10{,}771 & Near parity (0.96$\times$) \\
-    
-    \textbf{768} & \textbf{10{,}235} & --- & \textbf{rvLLM peak} \\
-    1{,}024 & 10{,}051 & 12{,}740 & \\
-    \bottomrule
-  \end{tabular}
-\end{table}
-
-On A100~80\,GB, rvLLM \textbf{beats Python vLLM up to $N\!=\!256$} and peaks at
-10{,}291~tok/s at $N\!=\!512$. At single-sequence latency ($N\!=\!1$), rvLLM is
-1.7$\times$ faster. Python vLLM scales further only beyond $N\!=\!512$.
-
-\subsection{Coherence Verification}
-
-Output coherence was verified at every batch size on both GPUs. Five diverse
-prompts were tested at $N\!=\!1$ and $N\!=\!5$ concurrent:
-
-\begin{lstlisting}[language={},numbers=none,frame=none,xleftmargin=0em]
-Prompt: "The capital of France is"
-Output: "Paris. The capital of France is Paris..."
-
-Prompt: "Write a function that sorts a list in Python:"
-Output: "def sort_list(list): return sorted(list)"
-
-Prompt: "Explain quantum computing in simple terms:"
-Output: "Quantum computing is a new type of computing
-         that uses quantum mechanics..."
-\end{lstlisting}
-
-At $N\!=\!128$ and $N\!=\!1{,}024$, sampled responses across the batch remain
-on-topic and coherent. Zero instances of degenerate output (repeated special tokens,
-empty responses, or token-0 degradation) were observed across any batch size.
-
-\subsection{System-Level Comparison}
-
-\begin{table}[t]
-  \centering
-  \caption{System-level comparison with Python vLLM~0.18.}
-  \label{tab:system}
+  \caption{H100 HTTP comparison. Qwen2.5-7B f16, 200 requests, concurrency 32, 256 max tokens.}
+  \label{tab:h100_http}
   \small
   \begin{tabular}{@{}lrrrr@{}}
     \toprule
-    \thead{Metric} & \thead{rvLLM (B200)} & \thead{rvLLM (A100)} & \thead{Python vLLM} & \thead{Ratio} \\
+    \thead{Stack} & \thead{Single req tok/s} & \thead{Load tok/s} & \thead{Avg latency (ms)} & \thead{Idle VRAM} \\
     \midrule
-    Peak throughput    & 3{,}946 tok/s & 10{,}291 tok/s & 12{,}740 tok/s & Beats vLLM to $N\!=\!256$ \\
-    
-    Max verified batch & $N\!=\!4{,}096$ & $N\!=\!512$ & --- & --- \\
-    Total verified     & 13{,}553 & 1{,}067 & --- & 0 errors \\
-    
-    Startup time       & 9\,s    & 6\,s    & 121\,s  & 15--20$\times$ \\
-    Binary size        & \multicolumn{2}{c}{16\,MB} & $\sim$500\,MB & 31$\times$ \\
-    
-    CPU RSS            & ---     & 348\,MB & 1{,}033\,MB & 3$\times$ \\
+    stock vLLM 0.6.3.post1 & 41.0 & 2{,}861.9 & 2{,}061.9 & 71.9 GiB \\
+    \rowcolor{gray!8}
+    rvllm-lite & 128.6 & 131.8 & 43{,}334.9 & 71.9 GiB \\
+    rvLLM & 120.2 & 2{,}723.2 & 2{,}685.2 & 75.2 GiB \\
     \bottomrule
   \end{tabular}
 \end{table}
+
+The HTTP comparison is the cleanest argument for treating direct-engine and
+serving-stack performance separately. \texttt{rvllm-lite} tracks stock vLLM closely
+in direct-engine mode, yet drops by more than 20$\times$ under HTTP load. That
+isolates the Python serving/scheduling layer as the dominant practical overhead in
+that stack. By contrast, rvLLM's Rust server stays in the same throughput class as
+stock vLLM while the direct engine still trails at low and mid concurrency.
+
+\subsection{Measured VRAM Footprint}
+
+\begin{table}[t]
+  \centering
+  \caption{Measured VRAM footprint for the latest H100 comparison.}
+  \label{tab:h100_vram}
+  \small
+  \begin{tabular}{@{}lrr@{}}
+    \toprule
+    \thead{Stack} & \thead{Idle VRAM} & \thead{Post-HTTP VRAM} \\
+    \midrule
+    stock vLLM 0.6.3.post1 & 71.9 GiB & 72.1 GiB \\
+    \rowcolor{gray!8}
+    rvllm-lite & 71.9 GiB & 72.0 GiB \\
+    rvLLM & 75.2 GiB & 75.3 GiB \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+rvLLM currently reserves more memory at steady state because it was launched with
+safe-max sizing (\texttt{--gpu-memory-utilization 1.0 --gpu-memory-reserve-gb 2.0})
+to avoid the startup OOM behavior seen in earlier runs.
 
 \subsection{CPU Component Benchmarks}
 
@@ -611,8 +563,12 @@ between GPU forward passes, measured on Apple~M5 (10 cores, 24\,GB).
 
 \subsection{Where the Speed Comes From}
 
-The throughput advantage over Python vLLM is not attributable to any
-single optimisation. It is the compound effect of several reinforcing mechanisms:
+The remaining gap to stock vLLM is not attributable to any single issue. The latest
+H100 run suggests that rvLLM's server path is already competitive, while the direct
+engine still needs additional work in the same places that distinguish mature vLLM
+deployments: GEMM tuning, attention microarchitecture, and scheduler behavior. The
+measured gains in rvLLM still come from a compound effect of several reinforcing
+mechanisms:
 
 \begin{enumerate}
   \item \textbf{GPU-resident argmax} (\S\ref{sec:argmax}): eliminates 74\,MB of
@@ -633,20 +589,24 @@ single optimisation. It is the compound effect of several reinforcing mechanisms
         across requests, reducing amortised prefill cost.
 \end{enumerate}
 
-At single-sequence latency ($N\!=\!1$), rvLLM is 1.7$\times$ faster (117 vs.\ 69~tok/s).
-The advantage grows through mid-range concurrency and rvLLM leads at all batch sizes up
-to $N\!=\!256$. Python vLLM overtakes only at very high concurrency ($N\!>\!512$).
+The direct-engine table shows that these mechanisms are sufficient to close to
+0.99$\times$ stock vLLM by $N\!=\!32$, but not yet enough to win consistently at
+low and mid concurrency. The \texttt{rvllm-lite} result is particularly informative:
+because it preserves near-stock direct-engine speed while collapsing under HTTP
+load, much of the practical overhead in that stack lies above the kernels.
 
 \subsection{Limitations}
 
 \begin{itemize}
-  \item Benchmarks use Qwen2.5-1.5B, a small model. Performance characteristics
-        may differ for 7B+ models where GPU computation dominates over scheduling
-        overhead.
-  \item Python vLLM overtakes rvLLM at very high concurrency ($N\!>\!512$), reaching
-        12{,}740~tok/s at $N\!=\!1{,}024$ vs rvLLM's 10{,}051~tok/s.
-  \item Further kernel fusion and batching optimisations may close the remaining gap
-        at high concurrency.
+  \item The current public benchmark set covers one model family
+        (Qwen2.5-7B f16) and one GPU class (H100~SXM~80\,GB). Broader claims require
+        rerunning the same harness on more models and hardware.
+  \item rvLLM still trails stock vLLM on direct engine at low and mid concurrency,
+        especially around $N\!=\!4$ to $N\!=\!16$ where GEMM and attention details are
+        still exposed.
+  \item Earlier large-$N$ historical results in this repository were collected with
+        different harnesses and should be treated as optimization history rather than
+        as the current headline comparison.
 \end{itemize}
 
 % ============================================================================
@@ -719,26 +679,26 @@ paged KV cache support and GQA, plus a CPU reference for testing.
 \label{sec:conclusion}
 % ============================================================================
 
-rvLLM demonstrates that a systems-language reimplementation of LLM serving
-infrastructure can beat the Python incumbent at production batch sizes (up to
-$N\!=\!256$), peaking at 10{,}291~tok/s on A100, while using 3$\times$ less CPU
-memory, starting 20$\times$ faster, and deploying as a 31$\times$ smaller binary.
-The throughput advantage derives from the compound effect of fused GEMM projections,
-GPU-resident greedy decoding, vectorized kernel loads, CUDA graph replay,
-mixed prefill+decode batching, and the absence of Python's GIL and garbage collector.
+rvLLM demonstrates that a systems-language reimplementation of LLM serving can
+reach near-parity with stock vLLM on a current H100 apples-to-apples benchmark:
+0.99$\times$ by $N\!=\!32$ on direct engine and 0.95$\times$ on HTTP throughput.
+The most important comparative result is not just the rvLLM vs vLLM ratio, but the
+fact that \texttt{rvllm-lite} preserves near-stock direct-engine speed while collapsing
+under HTTP load. That separation makes the optimization target clearer: rvLLM's
+remaining work is now mostly direct-engine tuning rather than basic server plumbing.
 
-The system has been verified with zero errors across 14{,}620 requests at batch
-sizes from $N\!=\!1$ to $N\!=\!4{,}096$ on both B200 and A100 GPUs, with coherent
-text output confirmed at every scale.
+The current tree also demonstrates a practical development approach for this class
+of system: explicit GPU memory sizing, no-fallback kernel validation, and a Rust-native
+PTX compiler for fused decode kernels, all inside a single Rust workspace.
 
 Several directions remain: LoRA adapter hot-swapping for multi-tenant deployments,
 vision-language model support, pipeline parallelism for multi-node serving, FP16/BF16
-as the default compute precision, and production hardening through fuzz testing and
-extended load testing.
+as the default compute precision, more aggressive GEMM autotuning, deeper FA3
+specialization (TMA / warp-specialized paths), and production hardening through fuzz
+testing and extended load testing.
 
 The project is open-source under the Apache-2.0 license.
 
 % ============================================================================
 \bibliographystyle{plainnat}
 \bibliography{references}
-

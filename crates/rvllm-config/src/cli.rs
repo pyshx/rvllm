@@ -41,6 +41,10 @@ pub struct CliArgs {
     #[arg(long, default_value_t = 0.90)]
     pub gpu_memory_utilization: f32,
 
+    /// VRAM in GiB to leave free for graph/cublas/scratch allocations.
+    #[arg(long, default_value_t = 0.0)]
+    pub gpu_memory_reserve_gb: f32,
+
     /// CPU swap space in GiB.
     #[arg(long, default_value_t = 4.0)]
     pub swap_space_gb: f32,

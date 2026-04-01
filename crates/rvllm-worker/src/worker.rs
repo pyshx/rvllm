@@ -167,9 +167,11 @@ impl Worker {
     pub fn profile_num_available_blocks(
         &self,
         gpu_memory_utilization: f32,
+        gpu_memory_reserve_bytes: usize,
     ) -> Result<(usize, usize)> {
         let free_bytes = self.gpu.free_gpu_bytes();
-        let available = (free_bytes as f32 * gpu_memory_utilization) as usize;
+        let free_after_reserve = free_bytes.saturating_sub(gpu_memory_reserve_bytes);
+        let available = (free_after_reserve as f32 * gpu_memory_utilization) as usize;
 
         let cache_cfg = self.config.cache_config();
         let total_block_bytes = cache_cfg.total_block_bytes();
@@ -190,6 +192,8 @@ impl Worker {
 
         info!(
             free_bytes,
+            gpu_memory_reserve_bytes,
+            free_after_reserve,
             available, num_gpu_blocks, num_cpu_blocks, "profiled available blocks"
         );
 

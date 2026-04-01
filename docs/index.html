@@ -28,6 +28,21 @@ header .links a:hover{color:#fff}
 .hero{padding:1.5rem 0 2rem;border-bottom:1px solid #111}
 .hero .big{font-size:3.6rem;font-weight:700;color:#fff;letter-spacing:-0.04em;line-height:1.1}
 .hero .sub{font-size:0.95rem;color:#888;margin-top:0.4rem;font-weight:300}
+.hero-graphic{position:relative;margin-top:1.6rem;padding:1rem 1rem 0.8rem;background:radial-gradient(circle at top left,rgba(70,115,255,0.14),transparent 32%),radial-gradient(circle at top right,rgba(0,212,170,0.10),transparent 28%),linear-gradient(180deg,#060606,#020202);border:1px solid #111;overflow:hidden}
+.hero-graphic:before{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent 0,rgba(255,255,255,0.03) 50%,transparent 100%);transform:translateX(-100%);animation:sweep 9s linear infinite}
+.hero-graphic-head{display:flex;justify-content:space-between;align-items:flex-end;gap:1rem;margin-bottom:0.9rem;position:relative;z-index:1}
+.hero-graphic-title{font-size:0.68rem;text-transform:uppercase;letter-spacing:0.12em;color:#9a9a9a}
+.hero-graphic-sub{font-size:0.8rem;color:#666;max-width:420px}
+.hero-legend{display:flex;flex-wrap:wrap;gap:0.8rem 1rem;justify-content:flex-end;font-size:0.68rem;color:#777}
+.hero-legend span{display:inline-flex;align-items:center;gap:0.4rem}
+.hero-legend i{display:inline-block;width:10px;height:10px;border-radius:999px}
+.hero-graphic svg{display:block;width:100%;height:auto;position:relative;z-index:1}
+.hero-chip{font-size:0.62rem;letter-spacing:0.08em;text-transform:uppercase;fill:#a8a8a8}
+.hero-chip-val{font-size:0.82rem;font-weight:600;fill:#fff}
+
+@keyframes sweep{
+  to{transform:translateX(100%)}
+}
 
 section{padding:2rem 0;border-bottom:1px solid #111}
 section:last-of-type{border-bottom:none}
@@ -75,6 +90,9 @@ footer a:hover{color:#999}
   header{padding:3rem 0 2rem}
   header h1{font-size:2rem}
   .hero .big{font-size:2.4rem}
+  .hero-graphic{padding:0.8rem 0.75rem 0.7rem}
+  .hero-graphic-head{flex-direction:column;align-items:flex-start}
+  .hero-legend{justify-content:flex-start}
   .container{padding:0 1.2rem}
   table{font-size:0.75rem}
   thead th,tbody td{padding:0.3rem 0.5rem}
@@ -86,7 +104,7 @@ footer a:hover{color:#999}
 
 <header>
   <h1>rvLLM</h1>
-  <p class="sub">High-performance LLM inference in Rust. 54 CUDA kernels. FA3 v3 cp.async + split-KV. JIT PTX compiler. 16 MB binary.</p>
+  <p class="sub">High-performance LLM inference in Rust. 26-package workspace. 54 CUDA kernels. FA3 v3 cp.async + split-KV. JIT PTX compiler.</p>
   <p class="links">
     <a href="https://github.com/m0at/rvllm">GitHub</a>
     <a href="paper/rvllm.pdf">Paper (color)</a>
@@ -96,28 +114,169 @@ footer a:hover{color:#999}
 </header>
 
 <div class="hero">
-  <div class="big">12,312 tok/s</div>
-  <div class="sub">Qwen2.5-7B on H100. 0.85x vLLM direct engine. FA3 v3 cp.async + split-KV. No-fallback kernel validation. JIT fused kernels 2-7.5x faster than hand-written CUDA.</div>
+  <div class="big">3,170 tok/s</div>
+  <div class="sub">Qwen2.5-7B on H100, direct engine, N=32. 0.99x stock vLLM in the latest apples-to-apples run. HTTP throughput: 2,723 tok/s at 200 requests / concurrency 32.</div>
+  <div class="hero-graphic">
+    <div class="hero-graphic-head">
+      <div>
+        <div class="hero-graphic-title">Inference Signal Path</div>
+        <div class="hero-graphic-sub">Colored by subsystem so the page stays dark and dense, but the data path reads instantly.</div>
+      </div>
+      <div class="hero-legend">
+        <span><i style="background:#6ba8ff"></i>Ingress</span>
+        <span><i style="background:#ff8a4c"></i>Scheduler</span>
+        <span><i style="background:#00d4aa"></i>KV / Attention</span>
+        <span><i style="background:#ff4d6d"></i>Fused Compute</span>
+        <span><i style="background:#d7ff64"></i>Sample / Output</span>
+      </div>
+    </div>
+    <svg viewBox="0 0 1080 500" aria-label="rvLLM data path">
+      <defs>
+        <linearGradient id="gridFade" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="#1a1a1a"/>
+          <stop offset="100%" stop-color="#070707"/>
+        </linearGradient>
+        <linearGradient id="flowIngress" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0%" stop-color="#295fff"/>
+          <stop offset="100%" stop-color="#6ba8ff"/>
+        </linearGradient>
+        <linearGradient id="flowSched" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0%" stop-color="#ff6b2c"/>
+          <stop offset="100%" stop-color="#ffb35c"/>
+        </linearGradient>
+        <linearGradient id="flowKv" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0%" stop-color="#00b79a"/>
+          <stop offset="100%" stop-color="#79ffd6"/>
+        </linearGradient>
+        <linearGradient id="flowFuse" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0%" stop-color="#ff3d63"/>
+          <stop offset="100%" stop-color="#ff7f97"/>
+        </linearGradient>
+        <linearGradient id="flowOut" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0%" stop-color="#9fd21f"/>
+          <stop offset="100%" stop-color="#e7ff7e"/>
+        </linearGradient>
+        <filter id="softGlow" x="-50%" y="-50%" width="200%" height="200%">
+          <feGaussianBlur stdDeviation="8" result="blur"/>
+          <feMerge>
+            <feMergeNode in="blur"/>
+            <feMergeNode in="SourceGraphic"/>
+          </feMerge>
+        </filter>
+      </defs>
+
+      <rect x="0" y="0" width="1080" height="500" fill="url(#gridFade)"/>
+      <g opacity="0.5">
+        <path d="M0 70H1080M0 160H1080M0 250H1080M0 340H1080M0 430H1080" stroke="#111" stroke-width="1"/>
+        <path d="M90 0V500M270 0V500M450 0V500M630 0V500M810 0V500M990 0V500" stroke="#111" stroke-width="1"/>
+      </g>
+
+      <g>
+        <rect x="28" y="40" width="160" height="90" rx="18" fill="#090909" stroke="#17305f"/>
+        <text x="52" y="72" class="hero-chip">API / HTTP</text>
+        <text x="52" y="104" class="hero-chip-val">Requests</text>
+        <text x="52" y="121" fill="#6ba8ff" font-size="13">OpenAI-compatible ingress</text>
+
+        <rect x="236" y="40" width="175" height="90" rx="18" fill="#090909" stroke="#5b2f17"/>
+        <text x="260" y="72" class="hero-chip">Scheduler</text>
+        <text x="260" y="104" class="hero-chip-val">Continuous Batch</text>
+        <text x="260" y="121" fill="#ff9e62" font-size="13">Step packing + queue merge</text>
+
+        <rect x="458" y="40" width="175" height="90" rx="18" fill="#090909" stroke="#0f5e4e"/>
+        <text x="482" y="72" class="hero-chip">Memory</text>
+        <text x="482" y="104" class="hero-chip-val">Paged KV Cache</text>
+        <text x="482" y="121" fill="#51eac6" font-size="13">Block allocation + reuse</text>
+
+        <rect x="680" y="40" width="175" height="90" rx="18" fill="#090909" stroke="#5b1730"/>
+        <text x="704" y="72" class="hero-chip">Compute</text>
+        <text x="704" y="104" class="hero-chip-val">Fused Kernels</text>
+        <text x="704" y="121" fill="#ff7f97" font-size="13">RMSNorm + GEMV + FA3 v3</text>
+
+        <rect x="902" y="40" width="150" height="90" rx="18" fill="#090909" stroke="#576c15"/>
+        <text x="926" y="72" class="hero-chip">Output</text>
+        <text x="926" y="104" class="hero-chip-val">Token Emit</text>
+        <text x="926" y="121" fill="#d7ff64" font-size="13">Sample + stream</text>
+      </g>
+
+      <g fill="none" stroke-linecap="round">
+        <path d="M188 85C215 85 215 85 236 85" stroke="url(#flowIngress)" stroke-width="12" filter="url(#softGlow)"/>
+        <path d="M411 85C432 85 436 85 458 85" stroke="url(#flowSched)" stroke-width="12" filter="url(#softGlow)"/>
+        <path d="M633 85C654 85 658 85 680 85" stroke="url(#flowKv)" stroke-width="12" filter="url(#softGlow)"/>
+        <path d="M855 85C877 85 882 85 902 85" stroke="url(#flowFuse)" stroke-width="12" filter="url(#softGlow)"/>
+
+        <path d="M315 155C365 230 505 240 549 184" stroke="url(#flowSched)" stroke-width="6" opacity="0.9"/>
+        <path d="M549 184C600 120 725 123 770 185" stroke="url(#flowKv)" stroke-width="6" opacity="0.9"/>
+        <path d="M770 185C815 247 925 242 967 181" stroke="url(#flowFuse)" stroke-width="6" opacity="0.9"/>
+      </g>
+
+      <g>
+        <rect x="64" y="178" width="952" height="260" rx="22" fill="#050505" stroke="#111"/>
+        <text x="94" y="214" class="hero-chip">Decode Step Timeline</text>
+
+        <rect x="94" y="244" width="124" height="42" rx="12" fill="#0b1320" stroke="#17305f"/>
+        <text x="115" y="270" fill="#7bb2ff" font-size="15">parse + enqueue</text>
+
+        <rect x="246" y="244" width="158" height="42" rx="12" fill="#1a1009" stroke="#5b2f17"/>
+        <text x="269" y="270" fill="#ffaf74" font-size="15">block plan + admission</text>
+
+        <rect x="432" y="244" width="148" height="42" rx="12" fill="#081514" stroke="#0f5e4e"/>
+        <text x="460" y="270" fill="#67f1d2" font-size="15">rope + kv write</text>
+
+        <rect x="608" y="244" width="182" height="42" rx="12" fill="#190810" stroke="#5b1730"/>
+        <text x="632" y="270" fill="#ff86a1" font-size="15">jit fused gemv / fa3</text>
+
+        <rect x="818" y="244" width="164" height="42" rx="12" fill="#15190a" stroke="#576c15"/>
+        <text x="848" y="270" fill="#e7ff7e" font-size="15">argmax + sample</text>
+
+        <path d="M94 324C190 284 260 381 356 345S522 280 618 335S786 402 982 332" fill="none" stroke="#111827" stroke-width="42" stroke-linecap="round"/>
+        <path d="M94 324C190 284 260 381 356 345S522 280 618 335S786 402 982 332" fill="none" stroke="url(#flowIngress)" stroke-width="7" stroke-linecap="round" opacity="0.8"/>
+        <path d="M94 332C190 292 260 389 356 353S522 288 618 343S786 410 982 340" fill="none" stroke="url(#flowSched)" stroke-width="6" stroke-linecap="round" opacity="0.8"/>
+        <path d="M94 340C190 300 260 397 356 361S522 296 618 351S786 418 982 348" fill="none" stroke="url(#flowKv)" stroke-width="5" stroke-linecap="round" opacity="0.9"/>
+        <path d="M94 348C190 308 260 405 356 369S522 304 618 359S786 426 982 356" fill="none" stroke="url(#flowFuse)" stroke-width="5" stroke-linecap="round" opacity="0.92"/>
+
+        <g transform="translate(100 378)">
+          <rect x="0" y="0" width="140" height="34" rx="12" fill="#0a0a0a" stroke="#191919"/>
+          <text x="18" y="14" class="hero-chip">batch width</text>
+          <text x="18" y="24" class="hero-chip-val">N = 1 ... 128</text>
+        </g>
+        <g transform="translate(276 378)">
+          <rect x="0" y="0" width="190" height="34" rx="12" fill="#0a0a0a" stroke="#191919"/>
+          <text x="18" y="14" class="hero-chip">kernel strategy</text>
+          <text x="18" y="24" class="hero-chip-val">JIT > CUDA > cuBLAS</text>
+        </g>
+        <g transform="translate(502 378)">
+          <rect x="0" y="0" width="180" height="34" rx="12" fill="#0a0a0a" stroke="#191919"/>
+          <text x="18" y="14" class="hero-chip">memory mode</text>
+          <text x="18" y="24" class="hero-chip-val">Safe-max card fill</text>
+        </g>
+        <g transform="translate(718 378)">
+          <rect x="0" y="0" width="268" height="34" rx="12" fill="#0a0a0a" stroke="#191919"/>
+          <text x="18" y="14" class="hero-chip">goal</text>
+          <text x="18" y="24" class="hero-chip-val">Fastest tok/s without fallback paths</text>
+        </g>
+      </g>
+    </svg>
+  </div>
 </div>
 
 <section>
 <h2>Abstract</h2>
-<p class="section-sub">Andy Norris (m0at) -- San Francisco, March 31 2026</p>
+<p class="section-sub">Andy Norris (m0at) -- San Francisco, April 1 2026</p>
 <p>
   rvLLM is a from-scratch Rust implementation of the vLLM inference engine for
-  OpenAI-compatible API serving with CUDA GPU acceleration. 54 hand-written CUDA kernels,
-  a Rust-native PTX compiler that generates fused kernels 2-7.5x faster than nvcc,
-  FA3 v3 cp.async + split-KV attention, no-fallback kernel validation, cuBLAS algorithm
-  autotuning, and CUDA graph replay across 35 batch sizes -- compiling to a single 16 MB static binary.
+  OpenAI-compatible API serving with CUDA GPU acceleration. The current tree is a
+  26-package Rust workspace with 54 CUDA kernels, a Rust-native PTX compiler that
+  generates fused kernels 2-7.5x faster than the hand-written CUDA versions in the
+  measured decode microbenchmarks, FA3 v3 cp.async + split-KV attention, and no-fallback
+  kernel validation.
 </p>
 <p>
-  On H100 SXM 80GB serving Qwen2.5-7B f16, rvLLM achieves <strong>12,312 tok/s at N=128</strong>
-  (direct engine, <strong>0.85x vLLM</strong>). Direct engine gap: 0.82--0.96x (near parity at N=16/64).
-  HTTP comparison: 0.67--0.88x.
-  20x faster startup, 31x smaller binary, 3x less CPU memory, and 5.6x tighter P95 latency.
-  The JIT compiler generates shape-specialized fused kernels (RMSNorm+GEMV, SiLU*Mul+Down,
-  Add+RMSNorm+GateUp) that are <strong>2-7.5x faster</strong> than the hand-written CUDA equivalents
-  on the same hardware.
+  In the latest verified apples-to-apples H100 SXM 80GB comparison on Qwen2.5-7B f16,
+  rvLLM reaches <strong>3,170 tok/s at N=32 direct engine</strong> (<strong>0.99x stock vLLM</strong>)
+  and <strong>2,723 tok/s over HTTP</strong> at 200 requests / concurrency 32
+  (<strong>0.95x stock vLLM</strong>). The intermediate <code>rvllm-lite</code> stack keeps near-stock
+  direct-engine speed but collapses to 131.8 tok/s over HTTP, which isolates the Python
+  serving layer as a major source of practical overhead.
 </p>
 </section>
 
@@ -148,76 +307,45 @@ footer a:hover{color:#999}
 </section>
 
 <section>
-<h2>Head-to-Head: rvLLM vs Python vLLM</h2>
-<p class="section-sub">H100 SXM 80GB, Qwen2.5-7B f16, HTTP (enforce_eager), 512 tok/req</p>
+<h2>Current H100 Direct</h2>
+<p class="section-sub">Qwen2.5-7B f16, 256 output tok/req, stock vLLM 0.6.3.post1 vs rvllm-lite vs rvLLM</p>
 <div class="tbl">
 <table>
-<thead><tr><th class="r">N</th><th class="r">rvLLM (tok/s)</th><th class="r">vLLM 0.18 (tok/s)</th><th>Ratio</th><th>Was</th></tr></thead>
+<thead><tr><th class="r">N</th><th class="r">stock vLLM</th><th class="r">rvllm-lite</th><th class="r">rvLLM</th><th>rvLLM / vLLM</th></tr></thead>
 <tbody>
-<tr><td class="r">16</td><td class="r">1,503</td><td class="r">1,714</td><td>0.88x</td><td>~0.50x</td></tr>
-<tr><td class="r">32</td><td class="r">2,902</td><td class="r">3,431</td><td>0.85x</td><td>~0.50x</td></tr>
-<tr><td class="r">64</td><td class="r">5,120</td><td class="r">6,677</td><td>0.77x</td><td>~0.50x</td></tr>
-<tr class="peak"><td class="r">128</td><td class="r">8,161</td><td class="r">12,230</td><td>0.67x</td><td>~0.50x</td></tr>
+<tr><td class="r">1</td><td class="r">133.7</td><td class="r">133.9</td><td class="r">120.6</td><td>0.90x</td></tr>
+<tr><td class="r">4</td><td class="r">543.3</td><td class="r">542.8</td><td class="r">427.9</td><td>0.79x</td></tr>
+<tr><td class="r">8</td><td class="r">926.1</td><td class="r">925.4</td><td class="r">845.8</td><td>0.91x</td></tr>
+<tr><td class="r">16</td><td class="r">1,934.5</td><td class="r">1,664.8</td><td class="r">1,648.9</td><td>0.85x</td></tr>
+<tr class="peak"><td class="r">32</td><td class="r">3,197.1</td><td class="r">2,994.5</td><td class="r">3,170.0</td><td>0.99x</td></tr>
 </tbody>
 </table>
 </div>
 </section>
 
 <section>
-<h2>Direct Engine: rvLLM vs Python vLLM</h2>
-<p class="section-sub">H100 SXM 80GB, Qwen2.5-7B f16, no HTTP, 128 tok/req</p>
+<h2>Current H100 HTTP</h2>
+<p class="section-sub">Qwen2.5-7B f16, 200 requests, concurrency 32, 256 max tokens</p>
 <div class="tbl">
 <table>
-<thead><tr><th class="r">N</th><th class="r">rvLLM (tok/s)</th><th class="r">vLLM 0.18 (tok/s)</th><th>Ratio</th></tr></thead>
+<thead><tr><th>Stack</th><th class="r">Single req tok/s</th><th class="r">Load tok/s</th><th class="r">Avg latency (ms)</th><th class="r">Idle VRAM</th></tr></thead>
 <tbody>
-<tr><td class="r">1</td><td class="r">98</td><td class="r">170</td><td>0.58x</td></tr>
-<tr><td class="r">4</td><td class="r">548</td><td class="r">665</td><td>0.82x</td></tr>
-<tr><td class="r">16</td><td class="r">2,122</td><td class="r">2,202</td><td>0.96x</td></tr>
-<tr><td class="r">32</td><td class="r">3,957</td><td class="r">4,585</td><td>0.86x</td></tr>
-<tr><td class="r">64</td><td class="r">7,451</td><td class="r">7,888</td><td>0.94x</td></tr>
-<tr class="peak"><td class="r">128</td><td class="r">12,312</td><td class="r">14,528</td><td>0.85x</td></tr>
+<tr><td>stock vLLM 0.6.3.post1</td><td class="r">41.0</td><td class="r">2,861.9</td><td class="r">2,061.9</td><td class="r">71.9 GiB</td></tr>
+<tr><td>rvllm-lite</td><td class="r">128.6</td><td class="r">131.8</td><td class="r">43,334.9</td><td class="r">71.9 GiB</td></tr>
+<tr class="peak"><td>rvLLM</td><td class="r">120.2</td><td class="r">2,723.2</td><td class="r">2,685.2</td><td class="r">75.2 GiB</td></tr>
 </tbody>
 </table>
 </div>
 <div class="note">
-  Direct engine bypasses HTTP/networking overhead on both sides. Gap narrows to <strong>0.82--0.96x</strong>
-  (vs 0.67--0.88x via HTTP), with near-parity at N=16 and N=64.
+  `rvllm-lite` is the important middle row here: near-stock direct engine, but effectively serialized HTTP behavior. That makes it a useful diagnostic target and makes the serving stack problem visible instead of hiding it inside kernel comparisons.
 </div>
 </section>
 
 <section>
-<h2>Qwen2.5-1.5B (H100)</h2>
-<p class="section-sub">Direct engine, 512 tok/req</p>
-<div class="tbl">
-<table>
-<thead><tr><th class="r">N</th><th class="r">rvLLM (tok/s)</th><th class="r">vLLM 0.18 (tok/s)</th><th>Ratio</th></tr></thead>
-<tbody>
-<tr><td class="r">1</td><td class="r">240</td><td class="r">435</td><td>0.55x</td></tr>
-<tr><td class="r">16</td><td class="r">4,229</td><td class="r">6,374</td><td>0.66x</td></tr>
-<tr><td class="r">64</td><td class="r">15,812</td><td class="r">19,620</td><td>0.81x</td></tr>
-<tr><td class="r">128</td><td class="r">26,161</td><td class="r">32,971</td><td>0.79x</td></tr>
-<tr class="peak"><td class="r">256</td><td class="r">40,714</td><td class="r">48,564</td><td>0.84x</td></tr>
-</tbody>
-</table>
-</div>
-</section>
-
-<section>
-<h2>System Efficiency</h2>
-<p class="section-sub">Where rvLLM wins decisively</p>
-<div class="tbl">
-<table>
-<thead><tr><th>Metric</th><th class="r">rvLLM</th><th class="r">Python vLLM</th><th>Winner</th></tr></thead>
-<tbody>
-<tr class="peak"><td>Cold start to first token</td><td class="r">6 sec</td><td class="r">~120 sec</td><td>rvLLM 20x</td></tr>
-<tr class="peak"><td>Binary size</td><td class="r">16 MB</td><td class="r">~500 MB</td><td>rvLLM 31x</td></tr>
-<tr class="peak"><td>CPU memory</td><td class="r">348 MB</td><td class="r">~1 GB</td><td>rvLLM 3x</td></tr>
-<tr class="peak"><td>P95 latency spread</td><td class="r">34 ms (1.4%)</td><td class="r">190 ms (12%)</td><td>rvLLM 5.6x</td></tr>
-<tr class="peak"><td>CUDA graph capture</td><td class="r">1.7 sec</td><td class="r">~60 sec</td><td>rvLLM 35x</td></tr>
-<tr class="peak"><td>cuBLAS autotuning</td><td class="r">170 ms</td><td class="r">~60 sec</td><td>rvLLM 350x</td></tr>
-<tr><td>Dependencies</td><td class="r">0 (static)</td><td class="r">PyTorch+500MB</td><td>rvLLM</td></tr>
-</tbody>
-</table>
+<h2>Historical Peaks</h2>
+<p class="section-sub">Earlier phase results retained for context, not the current headline benchmark</p>
+<div class="note">
+  The repository also contains earlier phase-specific runs, including the 12,312 tok/s N=128 direct-engine result on H100. Those measurements remain useful for optimization history, but the public headline numbers above are now tied to the latest reproducible three-way run against stock vLLM and rvllm-lite.
 </div>
 </section>
 
@@ -266,7 +394,7 @@ footer a:hover{color:#999}
 
 <section>
 <h2>Optimization Timeline</h2>
-<p class="section-sub">7B tok/s at N=128 on H100</p>
+<p class="section-sub">Historical 7B tok/s at N=128 on H100</p>
 <div class="tbl">
 <table>
 <thead><tr><th>Phase</th><th>Change</th><th class="r">tok/s</th><th>Date</th></tr></thead>
@@ -288,8 +416,8 @@ footer a:hover{color:#999}
 
 <section>
 <h2>Architecture</h2>
-<p class="section-sub">11 crates, 54 CUDA kernels, JIT compiler</p>
-<pre>rvllm-server (16 MB)
+<p class="section-sub">26 workspace packages, 54 CUDA kernels, selected components</p>
+<pre>rvllm-server (12 MB local release build)
   +-- rvllm-engine         async engine, continuous batching
   |     +-- rvllm-worker   GPU worker, CUDA graph management
   |     +-- rvllm-speculative  self-draft speculative decoding

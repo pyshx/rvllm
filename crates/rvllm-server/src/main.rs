@@ -32,6 +32,12 @@ enum Commands {
         max_model_len: usize,
         #[arg(long, default_value_t = 0.90)]
         gpu_memory_utilization: f32,
+        #[arg(long, default_value_t = 0.0)]
+        gpu_memory_reserve_gb: f32,
+        #[arg(long)]
+        num_gpu_blocks: Option<usize>,
+        #[arg(long)]
+        num_cpu_blocks: Option<usize>,
         #[arg(long, default_value_t = 1)]
         tensor_parallel_size: usize,
         #[arg(long, default_value_t = 256)]
@@ -61,6 +67,12 @@ enum Commands {
         max_model_len: usize,
         #[arg(long, default_value_t = 0.90)]
         gpu_memory_utilization: f32,
+        #[arg(long, default_value_t = 0.0)]
+        gpu_memory_reserve_gb: f32,
+        #[arg(long)]
+        num_gpu_blocks: Option<usize>,
+        #[arg(long)]
+        num_cpu_blocks: Option<usize>,
         /// Print results as JSON (for scripted comparison)
         #[arg(long)]
         json: bool,
@@ -121,6 +133,9 @@ async fn main() -> anyhow::Result<()> {
             dtype,
             max_model_len,
             gpu_memory_utilization,
+            gpu_memory_reserve_gb,
+            num_gpu_blocks,
+            num_cpu_blocks,
             tensor_parallel_size,
             max_num_seqs,
             tokenizer,
@@ -135,6 +150,15 @@ async fn main() -> anyhow::Result<()> {
             // Build EngineConfig from CLI args
             let config = {
                 use rvllm_config::*;
+                let mut cache = CacheConfigImpl::builder()
+                    .gpu_memory_utilization(gpu_memory_utilization)
+                    .gpu_memory_reserve_gb(gpu_memory_reserve_gb);
+                if let Some(v) = num_gpu_blocks {
+                    cache = cache.num_gpu_blocks(v);
+                }
+                if let Some(v) = num_cpu_blocks {
+                    cache = cache.num_cpu_blocks(v);
+                }
                 EngineConfig::builder()
                     .model({
                         let mut m = ModelConfigImpl::builder()
@@ -146,11 +170,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                         m.build()
                     })
-                    .cache(
-                        CacheConfigImpl::builder()
-                            .gpu_memory_utilization(gpu_memory_utilization)
-                            .build(),
-                    )
+                    .cache(cache.build())
                     .scheduler(
                         SchedulerConfigImpl::builder()
                             .max_num_seqs(max_num_seqs)
@@ -182,6 +202,9 @@ async fn main() -> anyhow::Result<()> {
                 dtype = %dtype,
                 max_model_len = max_model_len,
                 gpu_memory_utilization = gpu_memory_utilization,
+                gpu_memory_reserve_gb = gpu_memory_reserve_gb,
+                num_gpu_blocks = num_gpu_blocks,
+                num_cpu_blocks = num_cpu_blocks,
                 tp_size = tensor_parallel_size,
                 "starting server"
             );
@@ -208,6 +231,9 @@ async fn main() -> anyhow::Result<()> {
             dtype,
             max_model_len,
             gpu_memory_utilization,
+            gpu_memory_reserve_gb,
+            num_gpu_blocks,
+            num_cpu_blocks,
             json,
         } => {
             init_tracing("warn");
@@ -225,6 +251,15 @@ async fn main() -> anyhow::Result<()> {
             // Build engine config
             let config = {
                 use rvllm_config::*;
+                let mut cache = CacheConfigImpl::builder()
+                    .gpu_memory_utilization(gpu_memory_utilization)
+                    .gpu_memory_reserve_gb(gpu_memory_reserve_gb);
+                if let Some(v) = num_gpu_blocks {
+                    cache = cache.num_gpu_blocks(v);
+                }
+                if let Some(v) = num_cpu_blocks {
+                    cache = cache.num_cpu_blocks(v);
+                }
                 EngineConfig::builder()
                     .model(
                         ModelConfigImpl::builder()
@@ -233,11 +268,7 @@ async fn main() -> anyhow::Result<()> {
                             .max_model_len(max_model_len)
                             .build(),
                     )
-                    .cache(
-                        CacheConfigImpl::builder()
-                            .gpu_memory_utilization(gpu_memory_utilization)
-                            .build(),
-                    )
+                    .cache(cache.build())
                     .scheduler(
                         SchedulerConfigImpl::builder()
                             .max_num_seqs(batch_sizes.iter().copied().max().unwrap_or(256).max(256))
