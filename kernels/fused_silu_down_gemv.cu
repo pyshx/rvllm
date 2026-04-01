@@ -60,9 +60,9 @@ fused_cute_silu_down_gemv(
 
     #pragma unroll 4
     for (int i = lane_id; i < k8; i += CUTE_SILU_WARP_SIZE) {
-        int4 gv = __ldg(&gate4[i]);
-        int4 uv = __ldg(&up4[i]);
-        int4 wv = __ldg(&w4[i]);
+        int4 gv = gate4[i];
+        int4 uv = up4[i];
+        int4 wv = w4[i];
 
         half2 g01 = *reinterpret_cast<half2*>(&gv.x);
         half2 g23 = *reinterpret_cast<half2*>(&gv.y);

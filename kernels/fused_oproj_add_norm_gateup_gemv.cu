@@ -181,7 +181,7 @@ fused_cute_oproj_add_norm_gateup_gemv(
         for (int r = 0; r < RPB; r++) {
             if (r < rows_this_block) {
                 const int4* w4 = (const int4*)(gateup_weight + (long long)(block_row_base + r) * hidden_size);
-                int4 packed = __ldg(&w4[i]);
+                int4 packed = w4[i];
                 half2 w01 = *reinterpret_cast<half2*>(&packed.x);
                 half2 w23 = *reinterpret_cast<half2*>(&packed.y);
                 half2 w45 = *reinterpret_cast<half2*>(&packed.z);

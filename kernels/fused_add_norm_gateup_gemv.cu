@@ -122,7 +122,7 @@ fused_cute_add_norm_gateup_gemv(
             float acc = 0.0f;
             #pragma unroll 4
             for (int i = lane_id; i < h8; i += 32) {
-                int4 packed = __ldg(&w4[i]);
+                int4 packed = w4[i];
                 half2 w01 = *reinterpret_cast<half2*>(&packed.x);
                 half2 w23 = *reinterpret_cast<half2*>(&packed.y);
                 half2 w45 = *reinterpret_cast<half2*>(&packed.z);
