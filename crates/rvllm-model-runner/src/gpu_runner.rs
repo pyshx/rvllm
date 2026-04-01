@@ -277,8 +277,9 @@ mod cuda_impl {
             #[cfg(feature = "cublaslt")]
             let blas_lt = rvllm_gpu::cublaslt_ops::CublasLtOps::new(stream.clone()).ok();
 
-            // Autotune cublasLt algorithms for all GEMM shapes
+            // Autotune cublasLt algorithms (RVLLM_AUTOTUNE=1 to enable)
             #[cfg(feature = "cublaslt")]
+            if std::env::var("RVLLM_AUTOTUNE").map_or(false, |v| v == "1") {
             if let Some(ref lt) = blas_lt {
                 let hidden = config.hidden_size;
                 let num_heads = config.num_attention_heads;
@@ -311,7 +312,7 @@ mod cuda_impl {
                         tracing::warn!(%e, "cublasLt autotuning failed, using heuristics");
                     }
                 }
-            }
+            }}
 
             // Load CUTLASS shared library (compiled by build_cutlass_so.sh).
             // Try arch-specific path first, then fallback paths.
