@@ -408,6 +408,33 @@ pub struct ResponseReasoningSummary {
     pub effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<serde_json::Value>,
+    /// Summary verbosity requested: "concise" | "detailed" | "none".
+    /// Accepted and echoed; this runtime does not produce reasoning traces.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generate_summary: Option<String>,
+    /// Reasoning token budget. Accepted and echoed; not enforced separately
+    /// from max_output_tokens on this runtime.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+}
+
+/// A single token's log-probability entry in a Responses output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct ResponseTopLogprob {
+    pub token: String,
+    pub logprob: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<Vec<u8>>,
+}
+
+/// Per-token logprob entry returned when `message.output_text.logprobs` is included.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct ResponseLogprob {
+    pub token: String,
+    pub logprob: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<Vec<u8>>,
+    pub top_logprobs: Vec<ResponseTopLogprob>,
 }
 
 /// Output text content returned by the assistant.
@@ -417,6 +444,9 @@ pub struct ResponseOutputText {
     pub part_type: String,
     pub text: String,
     pub annotations: Vec<serde_json::Value>,
+    /// Per-token logprobs, populated when `message.output_text.logprobs` is in `include`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<Vec<ResponseLogprob>>,
 }
 
 impl ResponseOutputText {
@@ -425,6 +455,7 @@ impl ResponseOutputText {
             part_type: "output_text".to_string(),
             text: text.into(),
             annotations: Vec::new(),
+            logprobs: None,
         }
     }
 }
@@ -879,15 +910,54 @@ impl CreateResponseRequest {
                         }
                         other => {
                             return Err(ApiError::InvalidRequest(format!(
-                                "responses reasoning.effort '{}' is not supported yet",
+                                "responses reasoning.effort '{}' is not supported; \
+                                 expected minimal/low/medium/high",
                                 other
                             )));
                         }
                     }
                 }
+                "generate_summary" => {
+                    if value.is_null() {
+                        continue;
+                    }
+                    let v = value.as_str().ok_or_else(|| {
+                        ApiError::InvalidRequest(
+                            "responses reasoning.generate_summary must be a string".into(),
+                        )
+                    })?;
+                    match v {
+                        "concise" | "detailed" | "none" => {
+                            normalized.generate_summary = Some(v.to_string());
+                        }
+                        other => {
+                            return Err(ApiError::InvalidRequest(format!(
+                                "responses reasoning.generate_summary '{}' is not supported; \
+                                 expected concise/detailed/none",
+                                other
+                            )));
+                        }
+                    }
+                }
+                "max_tokens" => {
+                    if value.is_null() {
+                        continue;
+                    }
+                    let n = value.as_u64().ok_or_else(|| {
+                        ApiError::InvalidRequest(
+                            "responses reasoning.max_tokens must be a positive integer".into(),
+                        )
+                    })?;
+                    if n == 0 {
+                        return Err(ApiError::InvalidRequest(
+                            "responses reasoning.max_tokens must be greater than 0".into(),
+                        ));
+                    }
+                    normalized.max_tokens = Some(n);
+                }
                 other => {
                     return Err(ApiError::InvalidRequest(format!(
-                        "responses reasoning.{} is not supported yet",
+                        "responses reasoning.{} is not supported",
                         other
                     )));
                 }
@@ -932,12 +1002,16 @@ impl CreateResponseRequest {
     }
 
     pub fn normalize_include(&self) -> Result<Vec<String>, ApiError> {
-        const SUPPORTED_INCLUDES: &[&str] = &[
+        // Values that are populated on this runtime.
+        const POPULATABLE: &[&str] = &["message.output_text.logprobs"];
+
+        // Values that are valid per the OpenAI spec but require tools or
+        // capabilities not yet implemented on this runtime.
+        const UNIMPLEMENTED: &[&str] = &[
             "code_interpreter_call.outputs",
             "computer_call_output.output.image_url",
             "file_search_call.results",
             "message.input_image.image_url",
-            "message.output_text.logprobs",
             "reasoning.encrypted_content",
             "web_search_call.action.sources",
         ];
@@ -949,11 +1023,16 @@ impl CreateResponseRequest {
         include
             .iter()
             .map(|value| {
-                if SUPPORTED_INCLUDES.contains(&value.as_str()) {
+                if POPULATABLE.contains(&value.as_str()) {
                     Ok(value.clone())
+                } else if UNIMPLEMENTED.contains(&value.as_str()) {
+                    Err(ApiError::InvalidRequest(format!(
+                        "responses include value '{}' is not yet supported on this runtime",
+                        value
+                    )))
                 } else {
                     Err(ApiError::InvalidRequest(format!(
-                        "responses include value '{}' is not supported yet",
+                        "responses include value '{}' is not recognised",
                         value
                     )))
                 }
@@ -1326,19 +1405,13 @@ mod tests {
             text: None,
             reasoning: None,
             conversation: None,
-            include: Some(vec![
-                "message.input_image.image_url".into(),
-                "reasoning.encrypted_content".into(),
-            ]),
+            include: Some(vec!["message.output_text.logprobs".into()]),
             truncation: None,
         };
         req.validate().unwrap();
         assert_eq!(
             req.normalize_include().unwrap(),
-            vec![
-                "message.input_image.image_url".to_string(),
-                "reasoning.encrypted_content".to_string(),
-            ]
+            vec!["message.output_text.logprobs".to_string()]
         );
     }
 
@@ -1427,7 +1500,7 @@ mod tests {
         let err = req.validate().unwrap_err();
         assert!(err
             .to_string()
-            .contains("responses include value 'message.output_text.foo' is not supported yet"));
+            .contains("responses include value 'message.output_text.foo' is not recognised"));
     }
 
     #[test]
@@ -1690,6 +1763,8 @@ mod tests {
             ResponseReasoningSummary {
                 effort: Some("medium".into()),
                 summary: None,
+                generate_summary: None,
+                max_tokens: None,
             }
         );
     }
@@ -1722,7 +1797,7 @@ mod tests {
         let err = req.validate().unwrap_err();
         assert!(err
             .to_string()
-            .contains("responses reasoning.summary is not supported yet"));
+            .contains("responses reasoning.summary is not supported"));
     }
 
     #[test]
@@ -1753,7 +1828,7 @@ mod tests {
         let err = req.validate().unwrap_err();
         assert!(err
             .to_string()
-            .contains("responses reasoning.effort 'max' is not supported yet"));
+            .contains("responses reasoning.effort 'max' is not supported"));
     }
 
     #[test]

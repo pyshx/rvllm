@@ -18,7 +18,7 @@ use crate::server::AppState;
 use crate::types::request::ChatMessage;
 use crate::types::responses::{
     CreateResponseRequest, ResponseFunctionCallItem, ResponseFunctionCallOutputItem,
-    ResponseInputItem, ResponseInputItemsList, ResponseObject, ResponseOutputItem,
+    ResponseInputItem, ResponseInputItemsList, ResponseLogprob, ResponseObject, ResponseOutputItem,
     ResponseOutputMessage, ResponseToolChoice, ResponseUsage,
 };
 
@@ -178,6 +178,8 @@ pub async fn create_response(
     let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
     let response_text = req.normalize_text_config()?;
     let response_reasoning = req.normalize_reasoning_config()?;
+    let response_include = req.normalize_include()?;
+    let include_logprobs = response_include.iter().any(|v| v == "message.output_text.logprobs");
     let sampling_params = req.to_sampling_params();
     let tool_choice = req.effective_tool_choice();
     let response_tools = req.tools.clone().unwrap_or_default();
@@ -237,6 +239,7 @@ pub async fn create_response(
         let tool_choice_clone = tool_choice.clone();
         let response_tools_clone = response_tools.clone();
         let conversation_id_clone = conversation_id.clone();
+        let include_logprobs_clone = include_logprobs;
 
         tokio::spawn(async move {
             let result = collect_response_output(engine, prompt_clone, sampling_params_clone).await;
@@ -256,6 +259,7 @@ pub async fn create_response(
                     response_reasoning_clone.clone(),
                     tool_choice_clone.clone(),
                     response_tools_clone.clone(),
+                    include_logprobs_clone,
                 )
                 .map(|response| (response, output))
             }) {
@@ -611,6 +615,7 @@ pub async fn create_response(
             response_reasoning,
             tool_choice,
             response_tools,
+            include_logprobs,
         )?;
 
         if req.store {
@@ -1241,18 +1246,53 @@ fn response_from_output(
     reasoning: crate::types::responses::ResponseReasoningSummary,
     tool_choice: ResponseToolChoice,
     response_tools: Vec<serde_json::Value>,
+    include_logprobs: bool,
 ) -> Result<ResponseObject, ApiError> {
     let completion = output
         .outputs
         .first()
         .ok_or_else(|| ApiError::Internal("engine produced no completion output".into()))?;
-    let output_items = response_output_items_from_text(
+    let mut output_items = response_output_items_from_text(
         response_id,
         &completion.text,
         req,
         function_tools,
         &tool_choice,
     )?;
+
+    // Attach logprobs to message content parts when requested and available.
+    if include_logprobs {
+        if let Some(raw_logprobs) = &completion.logprobs {
+            let response_logprobs: Vec<ResponseLogprob> = raw_logprobs
+                .iter()
+                .map(|pos| {
+                    let (sampled_id, sampled_lp) = pos.first().copied().unwrap_or((0, 0.0));
+                    let top_logprobs = pos
+                        .iter()
+                        .map(|&(id, lp)| crate::types::responses::ResponseTopLogprob {
+                            token: id.to_string(),
+                            logprob: lp,
+                            bytes: None,
+                        })
+                        .collect();
+                    ResponseLogprob {
+                        token: sampled_id.to_string(),
+                        logprob: sampled_lp,
+                        bytes: None,
+                        top_logprobs,
+                    }
+                })
+                .collect();
+            for item in &mut output_items {
+                if let ResponseOutputItem::Message(msg) = item {
+                    for part in &mut msg.content {
+                        part.logprobs = Some(response_logprobs.clone());
+                    }
+                }
+            }
+        }
+    }
+
     Ok(ResponseObject::completed(
         response_id.to_string(),
         model.to_string(),
@@ -1801,8 +1841,7 @@ mod tests {
                 "model": "test",
                 "input": "Hello",
                 "include": [
-                    "message.output_text.logprobs",
-                    "reasoning.encrypted_content"
+                    "message.output_text.logprobs"
                 ]
             }))
             .await;
