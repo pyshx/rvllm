@@ -17,6 +17,12 @@ pub struct GpuDevice {
     pub total_memory: usize,
 }
 
+impl GpuDevice {
+    pub fn is_blackwell(&self) -> bool {
+        self.compute_capability.0 >= 10
+    }
+}
+
 /// Enumerate available GPU devices.
 ///
 /// Under `mock-gpu` this returns a single virtual device.
@@ -106,5 +112,38 @@ mod tests {
             used: 40,
         };
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn is_blackwell_sm100() {
+        let dev = GpuDevice {
+            id: 0,
+            name: "B200".into(),
+            compute_capability: (10, 0),
+            total_memory: 192 * 1024 * 1024 * 1024,
+        };
+        assert!(dev.is_blackwell());
+    }
+
+    #[test]
+    fn is_blackwell_sm120() {
+        let dev = GpuDevice {
+            id: 0,
+            name: "RTX 5090".into(),
+            compute_capability: (12, 0),
+            total_memory: 32 * 1024 * 1024 * 1024,
+        };
+        assert!(dev.is_blackwell());
+    }
+
+    #[test]
+    fn is_not_blackwell_hopper() {
+        let dev = GpuDevice {
+            id: 0,
+            name: "H100".into(),
+            compute_capability: (9, 0),
+            total_memory: 80 * 1024 * 1024 * 1024,
+        };
+        assert!(!dev.is_blackwell());
     }
 }

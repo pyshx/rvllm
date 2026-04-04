@@ -27,6 +27,7 @@ members = [
     "crates/rvllm-python",
     "crates/rvllm-fusion",
     "crates/rvllm-zig",
+    "crates/rvllm-autotune",
 ]
 
 [workspace.package]

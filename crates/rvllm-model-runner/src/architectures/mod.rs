@@ -4,9 +4,11 @@ pub mod cohere;
 pub mod deepseek;
 pub mod embedding;
 pub mod gemma;
+pub mod gemma4;
 pub mod gpt_neox;
 pub mod llama;
 pub mod mistral;
+pub mod nemotron_h_moe;
 pub mod mixtral;
 pub mod phi;
 pub mod qwen2;
@@ -45,10 +47,14 @@ pub fn create_model(
         )),
         "GemmaForCausalLM" => Ok(Box::new(gemma::GemmaForCausalLM::new(weights, config)?)),
         "Gemma2ForCausalLM" => Ok(Box::new(gemma::Gemma2ForCausalLM::new(weights, config)?)),
+        "Gemma4ForCausalLM" => Ok(Box::new(gemma4::Gemma4ForCausalLM::new(weights, config)?)),
         "DeepSeekV2ForCausalLM" | "DeepseekV2ForCausalLM" => Ok(Box::new(
             deepseek::DeepSeekV2ForCausalLM::new(weights, config)?,
         )),
         "MixtralForCausalLM" => Ok(Box::new(mixtral::MixtralForCausalLM::new(weights, config)?)),
+        "nemotron_h_moe" | "NemotronHMoEForCausalLM" | "NemotronHMoE" => {
+            Ok(Box::new(nemotron_h_moe::NemotronHMoEForCausalLM::new(weights, config)?))
+        }
         "PhiForCausalLM" | "Phi3ForCausalLM" | "Phi3SmallForCausalLM" => {
             Ok(Box::new(phi::PhiForCausalLM::new(weights, config)?))
         }

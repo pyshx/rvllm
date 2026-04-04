@@ -400,6 +400,8 @@ pub fn beam_to_output_states(state: &BeamSearchState) -> Vec<SequenceOutputState
             cumulative_logprob: hyp.cumulative_logprob,
             logprobs: hyp.logprobs.clone(),
             finish_reason: hyp.finish_reason,
+            reasoning_tokens: 0,
+            in_reasoning: false,
         })
         .collect()
 }

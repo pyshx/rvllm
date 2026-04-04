@@ -55,12 +55,54 @@ pub fn select_backend(compute_capability: (u32, u32)) -> Box<dyn AttentionBacken
     select_backend_with_options(compute_capability, true)
 }
 
+/// Blackwell-specific attention configuration.
+///
+/// SM100/SM120 support 228 KB shared memory per SM, UMMA (Unified Matrix
+/// Multiply-Accumulate) instructions, and 2-CTA cluster launch for
+/// cooperative attention tiles.
+#[cfg(feature = "cuda")]
+pub struct BlackwellAttentionConfig {
+    pub tile_m: usize,
+    pub tile_n: usize,
+    pub cluster_ctas: usize,
+    pub shared_mem_bytes: usize,
+    pub use_umma: bool,
+}
+
+#[cfg(feature = "cuda")]
+impl Default for BlackwellAttentionConfig {
+    fn default() -> Self {
+        Self {
+            tile_m: 256,
+            tile_n: 128,
+            cluster_ctas: 2,
+            shared_mem_bytes: 228 * 1024,
+            use_umma: true,
+        }
+    }
+}
+
+fn is_blackwell(cc: (u32, u32)) -> bool {
+    cc.0 >= 10
+}
+
 /// Select backend with explicit control over split-KV.
 pub fn select_backend_with_options(
     compute_capability: (u32, u32),
     use_split_kv: bool,
 ) -> Box<dyn AttentionBackend> {
     let (major, minor) = compute_capability;
+
+    if is_blackwell(compute_capability) {
+        tracing::info!(
+            backend = "SplitKvAttention",
+            sm = %format!("{major}.{minor}"),
+            blackwell = true,
+            "selected Blackwell split-KV attention backend"
+        );
+        return Box::new(SplitKvAttention::new());
+    }
+
     if major >= 8 && use_split_kv {
         tracing::info!(
             backend = "SplitKvAttention",
@@ -90,11 +132,19 @@ pub fn select_backend_with_options(
 /// For short contexts (<= 1024 tokens), FlashAttention-2 is preferred since
 /// the work fits in a single thread block. For longer contexts, SplitKV
 /// distributes across blocks for better occupancy.
+///
+/// Blackwell (SM100+) always uses SplitKV -- the larger shared memory and
+/// 2-CTA cluster launch make it faster even at short context lengths.
 pub fn select_decode_backend(
     compute_capability: (u32, u32),
     max_context_len: usize,
 ) -> Box<dyn AttentionBackend> {
     let (major, _) = compute_capability;
+
+    if is_blackwell(compute_capability) {
+        return Box::new(SplitKvAttention::new());
+    }
+
     if major < 8 {
         return Box::new(PagedAttentionV2::new());
     }
@@ -124,6 +174,28 @@ mod tests {
     #[test]
     fn select_split_kv_for_sm120_blackwell() {
         let backend = select_backend((12, 0));
+        assert_eq!(backend.name(), "SplitKvAttention-CPU");
+    }
+
+    #[test]
+    fn select_split_kv_for_sm100_blackwell() {
+        let backend = select_backend((10, 0));
+        assert_eq!(backend.name(), "SplitKvAttention-CPU");
+    }
+
+    #[test]
+    fn blackwell_decode_always_split_kv() {
+        // Even at short context, Blackwell should use SplitKV
+        let backend = select_decode_backend((10, 0), 128);
+        assert_eq!(backend.name(), "SplitKvAttention-CPU");
+        let backend = select_decode_backend((12, 0), 512);
+        assert_eq!(backend.name(), "SplitKvAttention-CPU");
+    }
+
+    #[test]
+    fn blackwell_ignores_split_kv_disable() {
+        // Blackwell path takes priority over use_split_kv=false
+        let backend = select_backend_with_options((10, 0), false);
         assert_eq!(backend.name(), "SplitKvAttention-CPU");
     }
 

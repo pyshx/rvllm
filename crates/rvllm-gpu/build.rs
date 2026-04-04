@@ -100,8 +100,27 @@ fn resolve_archs() -> Vec<String> {
     vec!["sm_80".to_string()]
 }
 
+/// Returns true if the arch string targets Blackwell (sm_100, sm_100a, sm_120, sm_122).
+fn is_blackwell_arch(arch: &str) -> bool {
+    arch.starts_with("sm_10") || arch.starts_with("sm_12")
+}
+
 fn compile_kernels(nvcc: &Path, kernel_dir: &Path, out_dir: &Path) {
     let archs = resolve_archs();
+
+    // For any Blackwell arch detected, ensure both sm_100 and sm_120 are
+    // included so we ship PTX for both data-center and consumer Blackwell.
+    let mut archs = archs;
+    if archs.iter().any(|a| is_blackwell_arch(a)) {
+        for extra in &["sm_100", "sm_120"] {
+            if !archs.contains(&extra.to_string()) {
+                archs.push(extra.to_string());
+            }
+        }
+        archs.sort();
+        archs.dedup();
+    }
+
     println!(
         "cargo:warning=Target CUDA architectures: {}",
         archs.join(", ")
@@ -139,6 +158,10 @@ fn compile_kernels(nvcc: &Path, kernel_dir: &Path, out_dir: &Path) {
             let needs_cubin = stem == "persistent_layer_decode" || stem == "megakernel_decode";
             let arch_flag = format!("-arch={}", arch);
 
+            // Blackwell SM100/SM120 benefits from UMMA-aware register
+            // allocation and larger shared-memory default carveout.
+            let blackwell = is_blackwell_arch(arch);
+
             if needs_cubin {
                 // Compile to cubin for cooperative launch
                 let cubin_name = if archs.len() == 1 {
@@ -149,6 +172,11 @@ fn compile_kernels(nvcc: &Path, kernel_dir: &Path, out_dir: &Path) {
                 let cubin_path = ptx_dir.join(&cubin_name);
                 let mut nvcc_cmd = Command::new(nvcc);
                 nvcc_cmd.args(["-cubin", &arch_flag, "-O3", "--use_fast_math"]);
+                if blackwell {
+                    // 228 KB shared mem default for Blackwell cluster kernels
+                    nvcc_cmd.arg("-Xptxas").arg("--maxrregcount=255");
+                    nvcc_cmd.arg("-DBLACKWELL=1");
+                }
                 nvcc_cmd.arg("-Xptxas");
                 nvcc_cmd.arg("-v");
                 nvcc_cmd.arg("-o").arg(&cubin_path).arg(&path);
@@ -185,6 +213,9 @@ fn compile_kernels(nvcc: &Path, kernel_dir: &Path, out_dir: &Path) {
             } else {
                 let mut nvcc_cmd = Command::new(nvcc);
                 nvcc_cmd.args(["-ptx", &arch_flag, "-O3"]);
+                if blackwell {
+                    nvcc_cmd.arg("-DBLACKWELL=1");
+                }
                 nvcc_cmd.arg("-o").arg(&ptx_path).arg(&path);
                 let status = nvcc_cmd.status();
                 match status {

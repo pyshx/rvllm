@@ -14,6 +14,8 @@ pub struct SequenceOutputState {
     pub cumulative_logprob: LogProb,
     pub logprobs: Vec<Vec<(TokenId, LogProb)>>,
     pub finish_reason: Option<FinishReason>,
+    pub reasoning_tokens: usize,
+    pub in_reasoning: bool,
 }
 
 impl SequenceOutputState {
@@ -24,6 +26,8 @@ impl SequenceOutputState {
             cumulative_logprob: 0.0,
             logprobs: Vec::new(),
             finish_reason: None,
+            reasoning_tokens: 0,
+            in_reasoning: false,
         }
     }
 
@@ -61,17 +65,64 @@ impl OutputProcessor {
             state.logprobs.push(top);
         }
 
-        // Check stop conditions
-        if let Some(reason) =
-            StopChecker::check_stop(&state.text, &state.token_ids, params, eos_token_id)
-        {
-            state.finish_reason = Some(reason);
+        // Track reasoning tokens between <think> and </think>
+        // Only scan when a reasoning budget is set (avoids O(n) text scan per token)
+        if params.reasoning_budget.is_some() {
+            Self::update_reasoning_state(state, params);
+        }
 
-            // Truncate at stop string if applicable
-            if reason == FinishReason::Stop && !params.stop_strings.is_empty() {
-                let (truncated, _) =
-                    StopChecker::truncate_at_stop(&state.text, &params.stop_strings);
-                state.text = truncated;
+        // Check stop conditions
+        if state.finish_reason.is_none() {
+            if let Some(reason) =
+                StopChecker::check_stop(&state.text, &state.token_ids, params, eos_token_id)
+            {
+                state.finish_reason = Some(reason);
+
+                // Truncate at stop string if applicable
+                if reason == FinishReason::Stop && !params.stop_strings.is_empty() {
+                    let (truncated, _) =
+                        StopChecker::truncate_at_stop(&state.text, &params.stop_strings);
+                    state.text = truncated;
+                }
+            }
+        }
+    }
+
+    fn update_reasoning_state(state: &mut SequenceOutputState, params: &SamplingParams) {
+        let text = &state.text;
+
+        if !state.in_reasoning {
+            if text.contains("<think>") {
+                // Entered a reasoning block
+                state.in_reasoning = true;
+                // Check if it was immediately closed in the same text
+                if let Some(open) = text.rfind("<think>") {
+                    let after = open + "<think>".len();
+                    if text[after..].contains("</think>") {
+                        state.in_reasoning = false;
+                        return;
+                    }
+                }
+            }
+        } else {
+            // Currently inside a reasoning block
+            if text.contains("</think>") {
+                // Check if the closing tag appears after the last opening tag
+                if let Some(open) = text.rfind("<think>") {
+                    let after = open + "<think>".len();
+                    if text[after..].contains("</think>") {
+                        state.in_reasoning = false;
+                        return;
+                    }
+                }
+            }
+            // Still in reasoning: count this token
+            state.reasoning_tokens += 1;
+
+            if let Some(budget) = params.reasoning_budget {
+                if state.reasoning_tokens >= budget {
+                    state.finish_reason = Some(FinishReason::Length);
+                }
             }
         }
     }
@@ -275,5 +326,95 @@ mod tests {
         assert_eq!(ro.outputs.len(), 2);
         assert_eq!(ro.outputs[0].index, 0);
         assert_eq!(ro.outputs[1].index, 1);
+    }
+
+    // --- Reasoning token tracking tests ---
+
+    #[test]
+    fn reasoning_tokens_counted_inside_think_tags() {
+        let mut state = SequenceOutputState::new();
+        let params = default_params();
+
+        OutputProcessor::process_token(&mut state, 1, -0.1, None, "<think>", &params, None);
+        assert_eq!(state.reasoning_tokens, 0);
+        assert!(state.in_reasoning);
+
+        OutputProcessor::process_token(&mut state, 2, -0.1, None, "step 1", &params, None);
+        assert_eq!(state.reasoning_tokens, 1);
+
+        OutputProcessor::process_token(&mut state, 3, -0.1, None, " step 2", &params, None);
+        assert_eq!(state.reasoning_tokens, 2);
+
+        OutputProcessor::process_token(&mut state, 4, -0.1, None, "</think>", &params, None);
+        assert_eq!(state.reasoning_tokens, 2);
+        assert!(!state.in_reasoning);
+    }
+
+    #[test]
+    fn reasoning_tokens_not_counted_outside_think() {
+        let mut state = SequenceOutputState::new();
+        let params = default_params();
+
+        OutputProcessor::process_token(&mut state, 1, -0.1, None, "hello", &params, None);
+        assert_eq!(state.reasoning_tokens, 0);
+
+        OutputProcessor::process_token(&mut state, 2, -0.1, None, " world", &params, None);
+        assert_eq!(state.reasoning_tokens, 0);
+        assert!(!state.in_reasoning);
+    }
+
+    #[test]
+    fn reasoning_budget_forces_stop() {
+        let mut state = SequenceOutputState::new();
+        let mut params = default_params();
+        params.reasoning_budget = Some(3);
+
+        OutputProcessor::process_token(&mut state, 1, -0.1, None, "<think>", &params, None);
+        assert!(!state.is_finished());
+
+        OutputProcessor::process_token(&mut state, 2, -0.1, None, "a", &params, None);
+        assert!(!state.is_finished());
+        assert_eq!(state.reasoning_tokens, 1);
+
+        OutputProcessor::process_token(&mut state, 3, -0.1, None, "b", &params, None);
+        assert!(!state.is_finished());
+        assert_eq!(state.reasoning_tokens, 2);
+
+        OutputProcessor::process_token(&mut state, 4, -0.1, None, "c", &params, None);
+        assert!(state.is_finished());
+        assert_eq!(state.finish_reason, Some(FinishReason::Length));
+        assert_eq!(state.reasoning_tokens, 3);
+    }
+
+    #[test]
+    fn reasoning_budget_none_does_not_limit() {
+        let mut state = SequenceOutputState::new();
+        let params = default_params(); // reasoning_budget = None
+
+        OutputProcessor::process_token(&mut state, 1, -0.1, None, "<think>", &params, None);
+        for i in 2..102 {
+            OutputProcessor::process_token(&mut state, i, -0.1, None, "x", &params, None);
+        }
+        assert!(!state.is_finished());
+        assert_eq!(state.reasoning_tokens, 100);
+    }
+
+    #[test]
+    fn reasoning_tokens_zero_when_no_think_tags() {
+        let mut state = SequenceOutputState::new();
+        let mut params = default_params();
+        params.reasoning_budget = Some(5);
+
+        OutputProcessor::process_token(&mut state, 1, -0.1, None, "plain text", &params, None);
+        OutputProcessor::process_token(&mut state, 2, -0.1, None, " more text", &params, None);
+        assert_eq!(state.reasoning_tokens, 0);
+        assert!(!state.is_finished());
+    }
+
+    #[test]
+    fn reasoning_default_state() {
+        let s = SequenceOutputState::new();
+        assert_eq!(s.reasoning_tokens, 0);
+        assert!(!s.in_reasoning);
     }
 }
