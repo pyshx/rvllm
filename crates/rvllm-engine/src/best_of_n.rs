@@ -159,6 +159,8 @@ mod tests {
                 cumulative_logprob: -5.0,
                 logprobs: vec![],
                 finish_reason: Some(FinishReason::Stop),
+                reasoning_tokens: 0,
+                in_reasoning: false,
             },
             SequenceOutputState {
                 text: "b".into(),
@@ -166,6 +168,8 @@ mod tests {
                 cumulative_logprob: -1.0,
                 logprobs: vec![],
                 finish_reason: Some(FinishReason::Length),
+                reasoning_tokens: 0,
+                in_reasoning: false,
             },
             SequenceOutputState {
                 text: "c".into(),
@@ -173,6 +177,8 @@ mod tests {
                 cumulative_logprob: -3.0,
                 logprobs: vec![],
                 finish_reason: Some(FinishReason::Stop),
+                reasoning_tokens: 0,
+                in_reasoning: false,
             },
         ];
         assert_eq!(best_of_n_index(&states), Some(1));
@@ -186,6 +192,8 @@ mod tests {
             cumulative_logprob: 0.0,
             logprobs: vec![],
             finish_reason: None,
+            reasoning_tokens: 0,
+            in_reasoning: false,
         }];
         assert_eq!(best_of_n_index(&states), None);
     }
@@ -199,6 +207,8 @@ mod tests {
                 cumulative_logprob: -10.0,
                 logprobs: vec![],
                 finish_reason: Some(FinishReason::Stop),
+                reasoning_tokens: 0,
+                in_reasoning: false,
             },
             SequenceOutputState {
                 text: "winner".into(),
@@ -206,6 +216,8 @@ mod tests {
                 cumulative_logprob: -0.5,
                 logprobs: vec![],
                 finish_reason: Some(FinishReason::Stop),
+                reasoning_tokens: 0,
+                in_reasoning: false,
             },
         ];
         let output = make_output(&[-10.0, -0.5]);

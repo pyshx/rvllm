@@ -189,6 +189,10 @@ pub struct SamplingParams {
     /// If true, return logprobs for prompt tokens as well as generated tokens.
     #[serde(default)]
     pub echo: bool,
+    /// Maximum number of reasoning tokens allowed between `<think>` and `</think>` tags.
+    /// If set, generation stops when the budget is exceeded.
+    #[serde(default)]
+    pub reasoning_budget: Option<usize>,
 }
 
 impl Default for SamplingParams {
@@ -210,6 +214,7 @@ impl Default for SamplingParams {
             use_beam_search: false,
             response_format: ResponseFormat::default(),
             echo: false,
+            reasoning_budget: None,
         }
     }
 }

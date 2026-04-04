@@ -44,6 +44,8 @@ pub enum ToolPromptStyle {
     Hermes,
     /// Generic JSON: embed tool schemas as a JSON array in the system prompt.
     GenericJson,
+    /// Gemma 4: uses `<tool_call>` tags with `name` field directly in the JSON body.
+    Gemma4,
 }
 
 /// Definition of a single tool parameter property.
@@ -99,6 +101,7 @@ pub fn format_tool_definitions(tools: &[ToolDefinition], style: ToolPromptStyle)
     match style {
         ToolPromptStyle::Hermes => format_hermes_tools(tools),
         ToolPromptStyle::GenericJson => format_generic_json_tools(tools),
+        ToolPromptStyle::Gemma4 => format_gemma4_tools(tools),
     }
 }
 
@@ -124,19 +127,37 @@ fn format_generic_json_tools(tools: &[ToolDefinition]) -> String {
     out
 }
 
+fn format_gemma4_tools(tools: &[ToolDefinition]) -> String {
+    let mut out = String::from("You have access to the following tools:\n\n");
+    for tool in tools {
+        out.push_str(&format!("- {}", tool.function.name));
+        if let Some(desc) = &tool.function.description {
+            out.push_str(&format!(": {}", desc));
+        }
+        out.push('\n');
+        if let Some(params) = &tool.function.parameters {
+            if let Ok(json) = serde_json::to_string(params) {
+                out.push_str(&format!("  Parameters: {}\n", json));
+            }
+        }
+    }
+    out.push_str("\nTo call a tool, use the following format:\n<tool_call>\n{\"name\": \"function_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>");
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Output parsing
 // ---------------------------------------------------------------------------
 
 /// Parse model output text for tool calls.
 ///
-/// Tries Hermes-style `<tool_call>` tags first, then falls back to scanning
-/// for bare JSON objects with the expected shape.
+/// Tries Hermes-style `<tool_call>` tags first (also covers Gemma 4 format),
+/// then falls back to scanning for bare JSON objects with the expected shape.
 pub fn parse_tool_calls(text: &str, call_id_prefix: &str) -> ToolParseResult {
-    // Try Hermes-style tags first
-    let hermes = parse_hermes_tool_calls(text, call_id_prefix);
-    if let ToolParseResult::ToolCalls { .. } = &hermes {
-        return hermes;
+    // Try <tool_call> tag-based formats (Hermes and Gemma 4 both use these)
+    let tagged = parse_tagged_tool_calls(text, call_id_prefix);
+    if let ToolParseResult::ToolCalls { .. } = &tagged {
+        return tagged;
     }
 
     // Fallback: scan for bare JSON
@@ -148,8 +169,27 @@ pub fn parse_tool_calls(text: &str, call_id_prefix: &str) -> ToolParseResult {
     ToolParseResult::PlainText(text.to_string())
 }
 
-/// Parse `<tool_call>{ ... }</tool_call>` blocks.
-fn parse_hermes_tool_calls(text: &str, call_id_prefix: &str) -> ToolParseResult {
+/// Parse model output for tool calls with a specific style hint.
+/// For Gemma4 and Hermes, both use `<tool_call>` tags; for GenericJson, uses bare JSON.
+pub fn parse_tool_calls_styled(
+    text: &str,
+    call_id_prefix: &str,
+    style: ToolPromptStyle,
+) -> ToolParseResult {
+    match style {
+        ToolPromptStyle::Hermes | ToolPromptStyle::Gemma4 => {
+            let tagged = parse_tagged_tool_calls(text, call_id_prefix);
+            if let ToolParseResult::ToolCalls { .. } = &tagged {
+                return tagged;
+            }
+            parse_json_tool_calls(text, call_id_prefix)
+        }
+        ToolPromptStyle::GenericJson => parse_json_tool_calls(text, call_id_prefix),
+    }
+}
+
+/// Parse `<tool_call>{ ... }</tool_call>` blocks (used by Hermes and Gemma 4).
+fn parse_tagged_tool_calls(text: &str, call_id_prefix: &str) -> ToolParseResult {
     const OPEN_TAG: &str = "<tool_call>";
     const CLOSE_TAG: &str = "</tool_call>";
 
@@ -196,7 +236,7 @@ fn parse_hermes_tool_calls(text: &str, call_id_prefix: &str) -> ToolParseResult 
     if calls.is_empty() {
         ToolParseResult::PlainText(text.to_string())
     } else {
-        debug!(count = calls.len(), "parsed hermes-style tool calls");
+        debug!(count = calls.len(), "parsed tagged tool calls (hermes/gemma4)");
         ToolParseResult::ToolCalls { prefix_text, calls }
     }
 }
@@ -548,6 +588,135 @@ mod tests {
             ToolParseResult::ToolCalls { calls, .. } => {
                 assert_eq!(calls.len(), 1);
                 assert_eq!(calls[0].name, "create_file");
+            }
+            _ => panic!("expected ToolCalls"),
+        }
+    }
+
+    // --- Gemma 4 tool parser tests ---
+
+    #[test]
+    fn parse_gemma4_single_tool_call() {
+        let text = r#"<tool_call>
+{"name": "get_weather", "arguments": {"location": "Tokyo", "unit": "celsius"}}
+</tool_call>"#;
+        let result = parse_tool_calls_styled(text, "g4_", ToolPromptStyle::Gemma4);
+        match result {
+            ToolParseResult::ToolCalls { calls, prefix_text } => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].name, "get_weather");
+                assert!(calls[0].arguments.contains("Tokyo"));
+                assert_eq!(calls[0].id, "call_g4_0");
+                assert!(prefix_text.is_empty());
+            }
+            _ => panic!("expected ToolCalls"),
+        }
+    }
+
+    #[test]
+    fn parse_gemma4_with_prefix_text() {
+        let text = r#"Let me check that for you.
+<tool_call>
+{"name": "search", "arguments": {"query": "rust async"}}
+</tool_call>"#;
+        let result = parse_tool_calls_styled(text, "g4p_", ToolPromptStyle::Gemma4);
+        match result {
+            ToolParseResult::ToolCalls { calls, prefix_text } => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].name, "search");
+                assert_eq!(prefix_text, "Let me check that for you.");
+            }
+            _ => panic!("expected ToolCalls"),
+        }
+    }
+
+    #[test]
+    fn parse_gemma4_parallel_calls() {
+        let text = r#"<tool_call>
+{"name": "get_weather", "arguments": {"location": "Berlin"}}
+</tool_call>
+<tool_call>
+{"name": "get_time", "arguments": {"timezone": "CET"}}
+</tool_call>"#;
+        let result = parse_tool_calls_styled(text, "g4m_", ToolPromptStyle::Gemma4);
+        match result {
+            ToolParseResult::ToolCalls { calls, .. } => {
+                assert_eq!(calls.len(), 2);
+                assert_eq!(calls[0].name, "get_weather");
+                assert_eq!(calls[1].name, "get_time");
+            }
+            _ => panic!("expected ToolCalls"),
+        }
+    }
+
+    #[test]
+    fn parse_gemma4_no_tool_call() {
+        let text = "The answer is 42.";
+        let result = parse_tool_calls_styled(text, "g4n_", ToolPromptStyle::Gemma4);
+        match result {
+            ToolParseResult::ToolCalls { .. } => panic!("expected PlainText"),
+            ToolParseResult::PlainText(t) => assert_eq!(t, text),
+        }
+    }
+
+    #[test]
+    fn format_gemma4_tools_output() {
+        let tools = vec![ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "get_weather".to_string(),
+                description: Some("Get weather for a location".to_string()),
+                parameters: Some(ToolParameters {
+                    schema_type: "object".to_string(),
+                    properties: {
+                        let mut m = std::collections::HashMap::new();
+                        m.insert(
+                            "location".to_string(),
+                            ToolParameterProperty {
+                                param_type: "string".to_string(),
+                                description: Some("City name".to_string()),
+                                enum_values: None,
+                            },
+                        );
+                        m
+                    },
+                    required: vec!["location".to_string()],
+                }),
+            },
+        }];
+        let formatted = format_tool_definitions(&tools, ToolPromptStyle::Gemma4);
+        assert!(formatted.contains("get_weather"));
+        assert!(formatted.contains("Get weather for a location"));
+        assert!(formatted.contains("<tool_call>"));
+        assert!(formatted.contains("</tool_call>"));
+        assert!(formatted.contains("Parameters:"));
+    }
+
+    #[test]
+    fn gemma4_unclosed_tag_still_parses() {
+        let text = r#"<tool_call>
+{"name": "ping", "arguments": {}}"#;
+        let result = parse_tool_calls_styled(text, "g4u_", ToolPromptStyle::Gemma4);
+        match result {
+            ToolParseResult::ToolCalls { calls, .. } => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].name, "ping");
+            }
+            _ => panic!("expected ToolCalls"),
+        }
+    }
+
+    #[test]
+    fn parse_gemma4_via_generic_parse_tool_calls() {
+        // Gemma 4 format should also be detected by the generic parse_tool_calls
+        let text = r#"<tool_call>
+{"name": "calculate", "arguments": {"expr": "1+1"}}
+</tool_call>"#;
+        let result = parse_tool_calls(text, "compat_");
+        match result {
+            ToolParseResult::ToolCalls { calls, .. } => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].name, "calculate");
             }
             _ => panic!("expected ToolCalls"),
         }
