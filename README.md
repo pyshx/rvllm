@@ -14,62 +14,42 @@ VASTAI_API_KEY=<your_key> ./race.sh
 
 Results land in `bench/combined_results_h100_lifecycle.json`. The instance stays up after the run so you can inspect logs; destroy it with the printed `vastai destroy instance <id>` command when done.
 
-## What Is Already Clearly Better
+## Current Status
 
-- **Direct engine gets close by `N=32`**: `rvLLM` reaches `3,170 tok/s` vs `3,197 tok/s` for stock `vLLM`.
-- **Launch-to-finished lifecycle is faster right now**: in the matched 10k race, `rvLLM` finishes in `30.33s` vs `35.51s` for stock `vLLM`.
-- **HTTP steady-state still has obvious headroom**: the same matched race lands at `3,419.4 tok/s` for `rvLLM` vs `4,394.6 tok/s` for stock `vLLM`, so the remaining gap is still serving-path work.
-- **`rvllm-lite` cleanly exposes serving overhead**: near-stock direct engine, then `131.8 tok/s` over HTTP.
-- **The 10k lifecycle path is verified on real GPU**: `rvLLM` completes `14,080` completion tokens at concurrency `32` in `30.33s` launch-to-finished (`26.04s` to first completion, `4.12s` bench tail, `3,419.4 tok/s`).
-- **VRAM startup is safer to drive hard**: reserve-based fill via `--gpu-memory-reserve-gb`, plus explicit `--num-gpu-blocks` and `--num-cpu-blocks`.
-- **Kernel behavior is explicit**: 54 CUDA kernels, no-fallback validation, and a Rust PTX fusion path with measured `2-7.5x` decode microbench wins vs our hand-written CUDA equivalents.
+**0.86x-0.92x stock vLLM 0.19.0** on direct engine across the full concurrency range (N=1 through N=32). Measured on the same H100 SXM 80GB, same model, same parameters. This is an honest apples-to-apples comparison against the latest vLLM release (April 2026, 448 commits from 197 contributors).
+
+What rvLLM does well:
+- **Consistent ~90% of vLLM throughput** with zero Python in the hot path
+- **~50 MB container image** vs ~15 GB for Python vLLM
+- **35-second build from source**, no pip, no PyTorch, no torch.compile
+- **54 CUDA kernels** with no-fallback validation -- silent degradation is treated as a bug
+- **JIT fused kernels** 2-7.5x faster than our hand-written CUDA on M=1 decode microbenchmarks
+- **Safe-max VRAM control**: `--gpu-memory-reserve-gb` + explicit `--num-gpu-blocks` + `--num-cpu-blocks`
+
+Where the remaining ~10% gap comes from (in order of impact):
+1. **GEMM tuning**: vLLM uses Triton autotuned GEMMs + torch.compile; we use cuBLAS heuristics with disk-cached autotuning
+2. **Attention**: vLLM uses FlashAttention-3 (Tri Dao's official CUDA with TMA + warp specialization); our FA3 v3 uses cp.async + split-KV but lacks TMA
+3. **Scheduler maturity**: vLLM's zero-bubble async scheduling + DBO has had 6 months more optimization; ours was just implemented
 
 ## Current H100 Comparison
 
-Qwen2.5-7B f16 on H100 SXM 80GB. Direct engine runs use 256 output tokens. HTTP runs use 200 requests at concurrency 32 with `max_tokens=256`.
+Qwen2.5-7B f16 on H100 SXM 80GB, 256 output tokens per request, greedy decode (temperature=0). Both engines on the same physical GPU, clean CUDA state.
 
-![Current H100 comparison](docs/assets/h100-comparison.svg)
+### Direct Engine (April 4, 2026)
 
-All measurements below use the same setup. Stock `vLLM` was benchmarked through its own OpenAI server, `rvllm-lite` is the intermediate Python serving layer, and `rvLLM` is the Rust server.
+| N | vLLM 0.19.0 tok/s | rvLLM tok/s | rvLLM / vLLM |
+|---:|---:|---:|---:|
+| 1 | 167.8 | 143.9 | 0.86x |
+| 4 | 664.3 | 599.8 | 0.90x |
+| 8 | 1,321.8 | 1,183.8 | 0.90x |
+| 16 | 2,440.1 | 2,247.6 | 0.92x |
+| 32 | 4,772.7 | 4,384.7 | 0.92x |
 
-### Direct Engine
+The gap is consistent at ~10% across all concurrency levels, which points to a single dominant bottleneck (GEMM algorithm selection) rather than multiple issues. vLLM 0.19.0 uses Triton autotuned GEMMs with disk-cached configs that have been tuned for 6+ months; our cuBLAS autotuning was just implemented.
 
-| N | stock vLLM 0.6.3.post1 | rvllm-lite | rvLLM | rvLLM / vLLM |
-|---:|---:|---:|---:|---:|
-| 1 | 133.7 | 133.9 | 120.6 | 0.90x |
-| 4 | 543.3 | 542.8 | 427.9 | 0.79x |
-| 8 | 926.1 | 925.4 | 845.8 | 0.91x |
-| 16 | 1,934.5 | 1,664.8 | 1,648.9 | 0.85x |
-| 32 | 3,197.1 | 2,994.5 | 3,170.0 | 0.99x |
+### Historical Comparison (vLLM 0.6.3, March 2026)
 
-`rvllm-lite` direct is essentially the stock `vLLM` library path, so the direct-engine gap is really between stock `vLLM` and `rvLLM`. In the latest verified run, `rvLLM` is still behind at low and mid concurrency, but it closes to near-parity by `N=32`.
-
-### HTTP Serving
-
-| Stack | Single request tok/s | 200-req throughput tok/s | Avg latency ms | Idle VRAM |
-|---|---:|---:|---:|---:|
-| stock vLLM 0.6.3.post1 | 41.0 | 2,861.9 | 2,061.9 | 71.9 GiB |
-| rvllm-lite | 128.6 | 131.8 | 43,334.9 | 71.9 GiB |
-| rvLLM | 120.2 | 2,723.2 | 2,685.2 | 75.2 GiB |
-
-The key result is that `rvllm-lite` keeps near-stock direct-engine speed but collapses over HTTP, which isolates most of the practical overhead to the Python serving/scheduling layer rather than the underlying `vLLM` engine. `rvLLM`'s server path is in the same practical class as stock `vLLM`, but the direct engine still needs more work to win consistently.
-
-Historical phase-by-phase numbers, including the earlier `12,312 tok/s @ N=128` run, live in [docs/benchmark-history.md](docs/benchmark-history.md).
-
-### 10k Lifecycle Race
-
-Verified on isolated H100 SXM 80GB instances with Qwen2.5-7B f16. This is the matched fixed-length greedy lifecycle harness at `32` concurrency. The first `64`-concurrency `rvLLM` attempt crashed in `gpu-step`, so `32` is the current stable race setting.
-
-| Engine | Concurrency | first_completion_sec | benchmark_wall_sec | shutdown_sec | launch_to_finished_tokens_sec | completion_tokens | throughput_tok_per_sec | avg_latency_ms |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| rvLLM | 32 | 26.04 | 4.12 | 0.51 | 30.33 | 14,080 | 3,419.4 | 1,043.3 |
-| stock vLLM | 32 | 32.10 | 3.20 | 0.81 | 35.51 | 14,080 | 4,394.6 | 716.1 |
-
-This run matters because it lines up with the direct-engine `0.99x` parity result at `N=32`: the raw card path is already basically there, while the remaining shortfall is in the HTTP + prefill + request-handling path. The headline read right now is simple: `rvLLM` wins launch-to-finished, stock `vLLM` still wins steady-state HTTP throughput.
-
-Artifacts:
-- `rvLLM` result: `/root/bench_results/rvllm_result_c32.json`
-- `rvLLM` benchmark output: `/root/bench_results/rvllm_bench.json`
+Earlier benchmark against the older vLLM 0.6.3.post1 showed rvLLM at 0.79x-0.99x. Those numbers are retained in [docs/benchmark-history.md](docs/benchmark-history.md) for optimization history but are not the current headline comparison.
 
 ### FA3 v3 Attention Kernel
 
@@ -273,24 +253,27 @@ See [crates/rvllm-fusion/README.md](crates/rvllm-fusion/README.md) for the full 
 | 8 | Chunked prefill scheduler + lifecycle race | 3,419 (N=32) | Apr 2 |
 | 9 | Responses API + Harmony templates + vision types | -- | Apr 3 |
 | 10 | Qwen/Nemotron integrations + GGUF loader + mock smoke path | -- | Apr 3 |
+| 11 | v0.19 upgrade: zero-bubble scheduling, DBO, MLA, Gemma 4, Blackwell, MXFP8, autotune cache | 4,385 (N=32) | Apr 4 |
 
 ### What Differs from vLLM
 
-In the latest verified run, `rvLLM` ranges from `0.79x` to `0.99x` stock `vLLM` on direct engine, wins the matched `10k` launch-to-finished lifecycle race (`30.33s` vs `35.51s`), and still trails stock `vLLM` on steady-state HTTP throughput (`3,419.4` vs `4,394.6 tok/s`). Root causes, in order of impact:
+Against vLLM 0.19.0 (April 2026), rvLLM runs at **0.86x-0.92x** on direct engine across N=1 to N=32. The gap is consistent (~10%), pointing to a single dominant bottleneck.
 
-1. **GEMM tuning**: vLLM uses Triton autotuned GEMMs + torch.compile; we use stock cuBLAS heuristics. This is the dominant remaining gap at high concurrency.
-2. **Attention**: vLLM uses FlashAttention-3 (Tri Dao's official CUDA, heavily optimized with TMA, warp specialization, pipelining); our FA3 v3 uses cp.async and split-KV but still lacks TMA and full warp specialization.
-3. **Scheduler**: vLLM has mature continuous batching with sophisticated prefill/decode interleaving, chunked prefill, and priority preemption. Ours is simpler.
-4. **Quantization**: vLLM supports GPTQ, AWQ, SqueezeLLM, Marlin, FP8, etc. We have FP8, INT4/W4A16, and GGUF (Q4/Q5/Q8).
+Root causes of the gap (in order of impact):
+
+1. **GEMM tuning**: vLLM uses Triton autotuned GEMMs with 6+ months of per-model config tuning + torch.compile; we use cuBLAS with freshly-implemented disk-cached autotuning.
+2. **Attention**: vLLM uses FlashAttention-3 (Tri Dao's official CUDA with TMA + warp specialization); our FA3 v3 uses cp.async + split-KV but lacks TMA.
+3. **Scheduler maturity**: vLLM's zero-bubble + DBO has had months of production hardening; ours was just implemented.
+4. **Quantization breadth**: vLLM supports GPTQ, AWQ, Marlin, FP8, MXFP8, NVFP4. We have FP8, MXFP8, INT4/W4A16, and GGUF (Q4/Q5/Q8).
 
 What rvLLM does better:
 
 1. **Owns the whole stack** -- Rust server, worker, scheduler, and kernels without a Python runtime in the serving hot path
-2. **Safe-max memory control** -- reserve-based startup sizing plus explicit GPU/CPU block overrides
+2. **Deployment footprint** -- ~50 MB container image vs ~15 GB; 35 sec build from source
 3. **JIT fused kernels** -- `rvllm-fusion` PTX emission beats the hand-written CUDA versions by 2-7.5x on the measured decode microbenchmarks
 4. **Kernel discipline** -- no-fallback validation and 6 decode paths (`FusedDecode`, cuBLAS GEMV, megakernel, persistent, FP8, batched)
-5. **Server overhead vs rvllm-lite** -- the current H100 run shows the Rust server path staying competitive while the intermediate Python layer serializes itself under load
-6. **Deployment footprint** -- ~50 MB container image vs ~15 GB for Python vLLM
+5. **Safe-max memory control** -- reserve-based startup sizing plus explicit GPU/CPU block overrides
+6. **No GIL, no GC** -- deterministic Rust execution, parallel scheduling via Rayon
 
 ## Zig SIMD Acceleration
 

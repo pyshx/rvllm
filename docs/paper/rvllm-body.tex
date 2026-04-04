@@ -20,17 +20,15 @@ architectures (Llama, Qwen2, Mistral, DeepSeek-V2, Mixtral, NemotronH~MoE, Gemma
 and others), FA3 v3 cp.async + split-KV attention, no-fallback kernel validation,
 and a Rust-native PTX compiler that generates fused decode kernels
 2--7.5$\times$ faster than the hand-written CUDA baselines in the measured
-microbenchmarks. In the latest verified apples-to-apples
-comparison on a single H100~SXM~80\,GB serving Qwen2.5-7B f16, rvLLM reaches
-3{,}170~tok/s at $N\!=\!32$ direct engine (\textbf{0.99$\times$ stock vLLM~0.6.3.post1}).
-In a matched fixed-length 10k lifecycle race on clean H100 boxes, rvLLM finishes
-14{,}080 completion tokens in \textbf{30.33\,s} launch-to-finished versus
-\textbf{35.51\,s} for stock vLLM, while stock vLLM still leads on steady-state HTTP
-throughput at 4{,}394.6~tok/s versus 3{,}419.4~tok/s for rvLLM. An intermediate Python
-stack, \texttt{rvllm-lite}, retains near-stock direct-engine speed but falls to
-131.8~tok/s over HTTP, isolating the serving layer as a major source of practical
-overhead. The current gap is therefore no longer a large raw card-performance deficit;
-it is concentrated in HTTP, prefill, and request-handling maturity. rvLLM is
+microbenchmarks. In an honest same-GPU comparison on H100~SXM~80\,GB
+serving Qwen2.5-7B f16 against the latest vLLM release (0.19.0, April 2026),
+rvLLM reaches 4{,}385~tok/s at $N\!=\!32$ direct engine
+(\textbf{0.92$\times$ stock vLLM~0.19.0}, which achieves 4{,}773~tok/s).
+The gap is consistent at $\sim$10\% across all concurrency levels ($N\!=\!1$
+through $N\!=\!32$), pointing to GEMM algorithm selection as the dominant
+remaining bottleneck: vLLM uses Triton autotuned GEMMs with months of
+per-model config tuning, while rvLLM uses cuBLAS with freshly-implemented
+disk-cached autotuning. rvLLM is
 open-source under the Apache-2.0 license.
 \end{abstract}
 

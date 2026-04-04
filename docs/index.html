@@ -138,15 +138,14 @@ footer a:hover{color:#999}
 </header>
 
 <div class="hero">
-  <div class="big">3,170 tok/s</div>
-  <div class="sub">Qwen2.5-7B on H100, direct engine, N=32. 0.99x stock vLLM in the latest apples-to-apples run. In the matched 10k lifecycle race, rvLLM finishes in 30.33s vs 35.51s for stock vLLM. Remaining gap is still HTTP + prefill path, not raw direct-engine parity.</div>
+  <div class="big">4,385 tok/s</div>
+  <div class="sub">Qwen2.5-7B on H100, direct engine, N=32. 0.92x stock vLLM 0.19.0 (4,773 tok/s) in an honest same-GPU comparison against the latest release. Consistent ~10% gap across all concurrency levels points to GEMM tuning as the dominant remaining bottleneck.</div>
   <div class="hero-graphic">
     <div class="hero-graphic-title">Verified H100 Comparison</div>
     <div class="hero-graphic-sub">Three-way benchmark: stock vLLM vs rvllm-lite vs rvLLM, with both direct-engine and HTTP serving results.</div>
     <div class="hero-chart-root" aria-label="rvLLM H100 comparison chart">
       <div class="hero-chart-legend">
-        <span><i style="background:#78CFFF"></i>stock vLLM 0.6.3.post1</span>
-        <span><i style="background:#F09FC2"></i>rvllm-lite</span>
+        <span><i style="background:#78CFFF"></i>vLLM 0.19.0</span>
         <span><i style="background:#84E6B7"></i>rvLLM</span>
       </div>
 
@@ -155,59 +154,51 @@ footer a:hover{color:#999}
           <div class="hero-chart-head">
             <div>
               <h3>Direct Engine Throughput</h3>
-              <p>Rawer kernel/runtime view across increasing concurrency.</p>
+              <p>Same GPU, same model, vLLM 0.19.0 vs rvLLM (April 4, 2026).</p>
             </div>
           </div>
           <div class="hero-static-block">
             <div class="hero-static-row">
               <div class="hero-static-label">N=1</div>
               <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:4.2%;background:#78CFFF"></div></div>
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:4.2%;background:#F09FC2"></div></div>
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:3.8%;background:#84E6B7"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:3.5%;background:#78CFFF"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:3.0%;background:#84E6B7"></div></div>
                 <div class="hero-static-meta">
-                  <span class="hero-static-series"><i style="background:#78CFFF"></i>133.7</span>
-                  <span class="hero-static-series"><i style="background:#F09FC2"></i>133.9</span>
-                  <span class="hero-static-series"><i style="background:#84E6B7"></i>120.6</span>
+                  <span class="hero-static-series"><i style="background:#78CFFF"></i>167.8</span>
+                  <span class="hero-static-series"><i style="background:#84E6B7"></i>143.9 (0.86x)</span>
                 </div>
               </div>
             </div>
             <div class="hero-static-row">
               <div class="hero-static-label">N=4</div>
               <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:17.0%;background:#78CFFF"></div></div>
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:17.0%;background:#F09FC2"></div></div>
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:13.4%;background:#84E6B7"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:13.9%;background:#78CFFF"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:12.6%;background:#84E6B7"></div></div>
                 <div class="hero-static-meta">
-                  <span class="hero-static-series"><i style="background:#78CFFF"></i>543.3</span>
-                  <span class="hero-static-series"><i style="background:#F09FC2"></i>542.8</span>
-                  <span class="hero-static-series"><i style="background:#84E6B7"></i>427.9</span>
+                  <span class="hero-static-series"><i style="background:#78CFFF"></i>664.3</span>
+                  <span class="hero-static-series"><i style="background:#84E6B7"></i>599.8 (0.90x)</span>
                 </div>
               </div>
             </div>
             <div class="hero-static-row">
               <div class="hero-static-label">N=8</div>
               <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:29.0%;background:#78CFFF"></div></div>
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:28.9%;background:#F09FC2"></div></div>
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:26.5%;background:#84E6B7"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:27.7%;background:#78CFFF"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:24.8%;background:#84E6B7"></div></div>
                 <div class="hero-static-meta">
-                  <span class="hero-static-series"><i style="background:#78CFFF"></i>926.1</span>
-                  <span class="hero-static-series"><i style="background:#F09FC2"></i>925.4</span>
-                  <span class="hero-static-series"><i style="background:#84E6B7"></i>845.8</span>
+                  <span class="hero-static-series"><i style="background:#78CFFF"></i>1321.8</span>
+                  <span class="hero-static-series"><i style="background:#84E6B7"></i>1183.8 (0.90x)</span>
                 </div>
               </div>
             </div>
             <div class="hero-static-row">
               <div class="hero-static-label">N=16</div>
               <div class="hero-static-bars">
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:60.5%;background:#78CFFF"></div></div>
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:52.1%;background:#F09FC2"></div></div>
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:51.6%;background:#84E6B7"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:51.1%;background:#78CFFF"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:47.1%;background:#84E6B7"></div></div>
                 <div class="hero-static-meta">
-                  <span class="hero-static-series"><i style="background:#78CFFF"></i>1934.5</span>
-                  <span class="hero-static-series"><i style="background:#F09FC2"></i>1664.8</span>
-                  <span class="hero-static-series"><i style="background:#84E6B7"></i>1648.9</span>
+                  <span class="hero-static-series"><i style="background:#78CFFF"></i>2440.1</span>
+                  <span class="hero-static-series"><i style="background:#84E6B7"></i>2247.6 (0.92x)</span>
                 </div>
               </div>
             </div>
@@ -215,12 +206,10 @@ footer a:hover{color:#999}
               <div class="hero-static-label">N=32</div>
               <div class="hero-static-bars">
                 <div class="hero-static-track"><div class="hero-static-fill" style="width:100%;background:#78CFFF"></div></div>
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:93.7%;background:#F09FC2"></div></div>
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:99.2%;background:#84E6B7"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:91.9%;background:#84E6B7"></div></div>
                 <div class="hero-static-meta">
-                  <span class="hero-static-series"><i style="background:#78CFFF"></i>3197.1 tok/s</span>
-                  <span class="hero-static-series"><i style="background:#F09FC2"></i>2994.5 tok/s</span>
-                  <span class="hero-static-series"><i style="background:#84E6B7"></i>3170.0 tok/s</span>
+                  <span class="hero-static-series"><i style="background:#78CFFF"></i>4772.7 tok/s</span>
+                  <span class="hero-static-series"><i style="background:#84E6B7"></i>4384.7 tok/s (0.92x)</span>
                 </div>
               </div>
             </div>
@@ -230,8 +219,8 @@ footer a:hover{color:#999}
         <div class="hero-chart-card">
           <div class="hero-chart-head">
             <div>
-              <h3>HTTP Serving Throughput</h3>
-              <p>200 requests, concurrency 32, max_tokens=256.</p>
+              <h3>HTTP Serving (vs vLLM 0.6.3, historical)</h3>
+              <p>200 requests, concurrency 32, max_tokens=256. Not yet re-run against 0.19.0.</p>
             </div>
           </div>
           <div class="hero-static-http">
@@ -270,16 +259,16 @@ footer a:hover{color:#999}
 
       <div class="hero-chart-notes">
         <div class="hero-chart-pill">
-          <strong>0.99x at N=32</strong>
-          rvLLM closes to near parity with stock vLLM on direct engine at the highest tested concurrency.
+          <strong>0.92x at N=32</strong>
+          Honest comparison against vLLM 0.19.0 (latest release, April 2026). Consistent ~10% gap across all batch sizes.
         </div>
         <div class="hero-chart-pill">
-          <strong>HTTP path still has room</strong>
-          direct-engine parity is already near real at N=32, so the remaining delta is in HTTP, prefill, and request handling rather than the base decode kernels.
+          <strong>GEMM tuning is the bottleneck</strong>
+          The uniform gap points to a single cause: vLLM's Triton autotuned GEMMs with 6+ months of per-model config tuning vs our fresh cuBLAS autotuning.
         </div>
         <div class="hero-chart-pill">
-          <strong>lite exposes the gap</strong>
-          rvllm-lite stays near stock direct-engine, then falls apart once the Python serving path is involved.
+          <strong>Zero Python overhead</strong>
+          ~50 MB container, 35s build, no GIL/GC. The ~10% raw throughput gap is the honest trade-off for full Rust ownership of the stack.
         </div>
       </div>
     </div>
@@ -348,24 +337,27 @@ footer a:hover{color:#999}
 
 <section>
 <h2>Current H100 Direct</h2>
-<p class="section-sub">Qwen2.5-7B f16, 256 output tok/req, stock vLLM 0.6.3.post1 vs rvllm-lite vs rvLLM</p>
+<p class="section-sub">Qwen2.5-7B f16, 256 output tok/req, vLLM 0.19.0 vs rvLLM, same GPU (April 4, 2026)</p>
 <div class="tbl">
 <table>
-<thead><tr><th class="r">N</th><th class="r">stock vLLM</th><th class="r">rvllm-lite</th><th class="r">rvLLM</th><th>rvLLM / vLLM</th></tr></thead>
+<thead><tr><th class="r">N</th><th class="r">vLLM 0.19.0</th><th class="r">rvLLM</th><th>rvLLM / vLLM</th></tr></thead>
 <tbody>
-<tr><td class="r">1</td><td class="r">133.7</td><td class="r">133.9</td><td class="r">120.6</td><td>0.90x</td></tr>
-<tr><td class="r">4</td><td class="r">543.3</td><td class="r">542.8</td><td class="r">427.9</td><td>0.79x</td></tr>
-<tr><td class="r">8</td><td class="r">926.1</td><td class="r">925.4</td><td class="r">845.8</td><td>0.91x</td></tr>
-<tr><td class="r">16</td><td class="r">1,934.5</td><td class="r">1,664.8</td><td class="r">1,648.9</td><td>0.85x</td></tr>
-<tr class="peak"><td class="r">32</td><td class="r">3,197.1</td><td class="r">2,994.5</td><td class="r">3,170.0</td><td>0.99x</td></tr>
+<tr><td class="r">1</td><td class="r">167.8</td><td class="r">143.9</td><td>0.86x</td></tr>
+<tr><td class="r">4</td><td class="r">664.3</td><td class="r">599.8</td><td>0.90x</td></tr>
+<tr><td class="r">8</td><td class="r">1,321.8</td><td class="r">1,183.8</td><td>0.90x</td></tr>
+<tr><td class="r">16</td><td class="r">2,440.1</td><td class="r">2,247.6</td><td>0.92x</td></tr>
+<tr class="peak"><td class="r">32</td><td class="r">4,772.7</td><td class="r">4,384.7</td><td>0.92x</td></tr>
 </tbody>
 </table>
+</div>
+<div class="note">
+  <strong>Honest baseline</strong>: previous comparisons used vLLM 0.6.3 (late 2024). vLLM 0.19.0 is ~25-50% faster due to Triton autotuned GEMMs, zero-bubble scheduling, and DBO. The gap is now a consistent ~10%.
 </div>
 </section>
 
 <section>
-<h2>Current H100 HTTP</h2>
-<p class="section-sub">Qwen2.5-7B f16, 200 requests, concurrency 32, 256 max tokens</p>
+<h2>Historical H100 HTTP (vs vLLM 0.6.3)</h2>
+<p class="section-sub">Retained for reference -- measured against vLLM 0.6.3, not current</p>
 <div class="tbl">
 <table>
 <thead><tr><th>Stack</th><th class="r">Single req tok/s</th><th class="r">Load tok/s</th><th class="r">Avg latency (ms)</th><th class="r">Idle VRAM</th></tr></thead>
@@ -377,24 +369,24 @@ footer a:hover{color:#999}
 </table>
 </div>
 <div class="note">
-  `rvllm-lite` is the important middle row here: near-stock direct engine, but effectively serialized HTTP behavior. That makes it a useful diagnostic target and makes the serving stack problem visible instead of hiding it inside kernel comparisons.
+  These HTTP numbers were measured against vLLM 0.6.3 (late 2024) and have not been re-run against vLLM 0.19.0 yet. The direct-engine comparison above is the current honest baseline.
 </div>
 </section>
 
 <section>
-<h2>Matched 10k Lifecycle Race</h2>
-<p class="section-sub">Clean H100 SXM boxes, fixed-length greedy decode, 14,080 completion tokens, concurrency 32</p>
+<h2>Historical 10k Lifecycle Race (vs vLLM 0.6.3)</h2>
+<p class="section-sub">Retained for reference -- measured against vLLM 0.6.3, not current</p>
 <div class="tbl">
 <table>
 <thead><tr><th>Engine</th><th class="r">First completion (s)</th><th class="r">Bench tail (s)</th><th class="r">Shutdown (s)</th><th class="r">Launch to finished (s)</th><th class="r">Completion toks</th><th class="r">tok/s</th><th class="r">Avg latency (ms)</th></tr></thead>
 <tbody>
 <tr class="peak"><td>rvLLM</td><td class="r">26.04</td><td class="r">4.12</td><td class="r">0.51</td><td class="r">30.33</td><td class="r">14,080</td><td class="r">3,419.4</td><td class="r">1,043.3</td></tr>
-<tr><td>stock vLLM</td><td class="r">32.10</td><td class="r">3.20</td><td class="r">0.81</td><td class="r">35.51</td><td class="r">14,080</td><td class="r">4,394.6</td><td class="r">716.1</td></tr>
+<tr><td>stock vLLM 0.6.3</td><td class="r">32.10</td><td class="r">3.20</td><td class="r">0.81</td><td class="r">35.51</td><td class="r">14,080</td><td class="r">4,394.6</td><td class="r">716.1</td></tr>
 </tbody>
 </table>
 </div>
 <div class="note">
-  This is the current practical read: direct engine is already near parity, rvLLM wins full launch-to-finished wall clock, and stock vLLM still wins steady-state HTTP throughput. That leaves the remaining obvious optimization surface in HTTP, prefill, and request handling.
+  This lifecycle race was against vLLM 0.6.3. The launch-to-finished advantage may still hold against 0.19.0 due to rvLLM's fast startup (no Python imports, no torch.compile), but this has not been re-verified.
 </div>
 </section>
 
@@ -471,6 +463,7 @@ footer a:hover{color:#999}
 <tr><td>8</td><td>Chunked prefill scheduler + lifecycle race</td><td class="r">3,419 (N=32)</td><td>Apr 2</td></tr>
 <tr><td>9</td><td>Responses API + Harmony templates + vision types</td><td class="r">--</td><td>Apr 3</td></tr>
 <tr><td>10</td><td>Qwen/Nemotron integrations + GGUF loader + mock smoke path</td><td class="r">--</td><td>Apr 3</td></tr>
+<tr class="peak"><td>11</td><td>v0.19 upgrade: zero-bubble, DBO, MLA, Gemma 4, Blackwell, MXFP8</td><td class="r">4,385 (N=32)</td><td>Apr 4</td></tr>
 </tbody>
 </table>
 </div>
