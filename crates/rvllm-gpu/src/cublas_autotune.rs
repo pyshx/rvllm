@@ -14,7 +14,7 @@ use crate::autotune_cache::{AutotuneCache, AutotuneCacheEntry, AutotuneCacheKey}
 use crate::cublaslt_ops::CublasLtOps;
 use crate::{LLMError, Result};
 
-const MAX_ALGOS: usize = 32;
+const MAX_ALGOS: usize = 128;
 const WARMUP_ITERS: usize = 3;
 const BENCH_ITERS: usize = 10;
 
@@ -140,8 +140,9 @@ impl CublasAutotuner {
         let mut c_buf = unsafe { stream.alloc::<u8>(m * n * 2) } // output always f16
             .map_err(|e| LLMError::GpuError(format!("autotune alloc C: {e}")))?;
 
-        // Workspace (reuse the cublasLt internal workspace size: 32MB Hopper, 4MB else)
-        let ws_size: usize = 4 * 1024 * 1024; // 4 MiB fallback
+        // Workspace: 32 MB for H100/Hopper. Larger workspace unlocks split-K
+        // algorithms that need intermediate reduction buffers.
+        let ws_size: usize = 32 * 1024 * 1024;
         let ws_buf = unsafe { stream.alloc::<u8>(ws_size) }
             .map_err(|e| LLMError::GpuError(format!("autotune alloc ws: {e}")))?;
 
@@ -156,7 +157,9 @@ impl CublasAutotuner {
                 lt_sys::cudaDataType_t::CUDA_R_16F,
                 lt_sys::cudaDataType_t::CUDA_R_16F,
                 lt_sys::cudaDataType_t::CUDA_R_16F,
-                lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                // FAST_16F uses FP16 tensor core accumulation -- faster than FP32
+                // accumulation, sufficient precision for inference (not training).
+                lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F,
             ),
             GemmDtype::Fp8E4M3 => (
                 lt_sys::cudaDataType_t::CUDA_R_8F_E4M3,
@@ -360,7 +363,10 @@ impl CublasAutotuner {
         gate_up_dim: usize,
         gpu_name: &str,
     ) -> Result<Self> {
-        let m_values: &[usize] = &[1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128];
+        // Cap at M=32 to avoid OOM during autotuning (large gate_up shapes
+        // at M=128 need ~300MB per benchmark buffer). Model load happens after
+        // autotuning, so we can't use all VRAM.
+        let m_values: &[usize] = &[1, 2, 4, 8, 16, 32];
         let nk_shapes: &[(usize, usize)] = &[
             (qkv_dim, hidden),        // QKV projection
             (hidden, q_dim),           // O-proj
