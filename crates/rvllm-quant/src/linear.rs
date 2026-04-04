@@ -63,6 +63,28 @@ impl QuantizedLinear {
                 w.shape,
             )),
             QuantMethod::FP8 => Ok(dequant::dequantize_fp8(&w.data, &w.scales, w.shape)),
+            QuantMethod::Mxfp8 => {
+                let (rows, cols) = w.shape;
+                let block_size = w.quant_config.group_size;
+                let blocks_per_row = (cols + block_size - 1) / block_size;
+                let total = rows * cols;
+                let mut output = vec![0.0f32; total];
+
+                for r in 0..rows {
+                    let data_off = r * cols;
+                    let scale_off = r * blocks_per_row;
+                    for b in 0..blocks_per_row {
+                        let col_start = b * block_size;
+                        let col_end = (col_start + block_size).min(cols);
+                        let scale = w.scales[scale_off + b];
+                        for c in col_start..col_end {
+                            output[data_off + c] =
+                                dequant::fp8::FP8_E4M3_LUT[w.data[data_off + c] as usize] * scale;
+                        }
+                    }
+                }
+                Ok(output)
+            }
             QuantMethod::GgufQ5_0 | QuantMethod::GgufQ5KM | QuantMethod::GgufQ8_0 => {
                 Err(LLMError::ModelError(format!(
                     "dequantization not yet implemented for {}",

@@ -185,6 +185,22 @@ fn dequantize_row(
                 *dst = dequant::fp8::FP8_E4M3_LUT[byte as usize] * scale;
             }
         }
+        QuantMethod::Mxfp8 => {
+            let block_size = weight.quant_config.group_size;
+            let blocks_per_row = (cols + block_size - 1) / block_size;
+            let data_offset = row * cols;
+            let scale_offset = row * blocks_per_row;
+            let src = &weight.data[data_offset..data_offset + cols];
+
+            for b in 0..blocks_per_row {
+                let col_start = b * block_size;
+                let col_end = (col_start + block_size).min(cols);
+                let scale = weight.scales[scale_offset + b];
+                for c in col_start..col_end {
+                    buf[c] = dequant::fp8::FP8_E4M3_LUT[src[c] as usize] * scale;
+                }
+            }
+        }
         QuantMethod::GgufQ5_0 | QuantMethod::GgufQ5KM | QuantMethod::GgufQ8_0 => {
             return Err(LLMError::ModelError(format!(
                 "dequantization not yet implemented for {}",

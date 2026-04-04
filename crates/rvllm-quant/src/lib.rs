@@ -46,14 +46,21 @@ pub fn detect_quant_method(model_path: &Path) -> Result<QuantMethod> {
     if config_path.exists() {
         let content = std::fs::read_to_string(&config_path)?;
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-            // Check quantization_config.quant_method
+            // Check quantization_config
             if let Some(qcfg) = val.get("quantization_config") {
+                // Check for mxfp8 via quant_type field
+                if let Some(qt) = qcfg.get("quant_type").and_then(|v| v.as_str()) {
+                    if qt.to_lowercase() == "mxfp8" {
+                        return Ok(QuantMethod::Mxfp8);
+                    }
+                }
                 if let Some(method) = qcfg.get("quant_method").and_then(|v| v.as_str()) {
                     return match method.to_lowercase().as_str() {
                         "gptq" => Ok(QuantMethod::GPTQ),
                         "awq" => Ok(QuantMethod::AWQ),
                         "squeezellm" => Ok(QuantMethod::SqueezeLLM),
                         "fp8" => Ok(QuantMethod::FP8),
+                        "mxfp8" => Ok(QuantMethod::Mxfp8),
                         other => {
                             tracing::warn!(method = other, "unknown quant_method in config.json");
                             Ok(QuantMethod::None)
@@ -145,5 +152,23 @@ mod tests {
         fs::write(dir.path().join("quantize_config.json"), config).unwrap();
         let method = detect_quant_method(dir.path()).unwrap();
         assert_eq!(method, QuantMethod::FP8);
+    }
+
+    #[test]
+    fn detect_mxfp8_via_quant_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = r#"{"quantization_config": {"quant_type": "mxfp8"}}"#;
+        fs::write(dir.path().join("config.json"), config).unwrap();
+        let method = detect_quant_method(dir.path()).unwrap();
+        assert_eq!(method, QuantMethod::Mxfp8);
+    }
+
+    #[test]
+    fn detect_mxfp8_via_quant_method() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = r#"{"quantization_config": {"quant_method": "mxfp8"}}"#;
+        fs::write(dir.path().join("config.json"), config).unwrap();
+        let method = detect_quant_method(dir.path()).unwrap();
+        assert_eq!(method, QuantMethod::Mxfp8);
     }
 }

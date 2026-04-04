@@ -12,6 +12,7 @@ pub enum QuantMethod {
     GgufQ5_0,
     GgufQ5KM,
     GgufQ8_0,
+    Mxfp8,
 }
 
 impl QuantMethod {
@@ -27,6 +28,7 @@ impl QuantMethod {
             Self::GgufQ5_0 => 5,
             Self::GgufQ5KM => 5,
             Self::GgufQ8_0 => 8,
+            Self::Mxfp8 => 8,
         }
     }
 
@@ -46,6 +48,7 @@ impl QuantMethod {
             Self::GgufQ5_0 => Some(32),
             Self::GgufQ5KM => Some(32),
             Self::GgufQ8_0 => Some(32),
+            Self::Mxfp8 => Some(32),
         }
     }
 }
@@ -63,6 +66,7 @@ impl fmt::Display for QuantMethod {
             Self::GgufQ5_0 => write!(f, "gguf_q5_0"),
             Self::GgufQ5KM => write!(f, "gguf_q5_k_m"),
             Self::GgufQ8_0 => write!(f, "gguf_q8_0"),
+            Self::Mxfp8 => write!(f, "mxfp8"),
         }
     }
 }
@@ -115,6 +119,7 @@ mod tests {
             QuantMethod::GgufQ5_0,
             QuantMethod::GgufQ5KM,
             QuantMethod::GgufQ8_0,
+            QuantMethod::Mxfp8,
         ];
         for m in &all {
             if matches!(m, QuantMethod::None) {
