@@ -4,6 +4,7 @@ pub mod cohere;
 pub mod deepseek;
 pub mod embedding;
 pub mod gemma;
+pub mod gemma4;
 pub mod gpt_neox;
 pub mod llama;
 pub mod mistral;
@@ -46,6 +47,7 @@ pub fn create_model(
         )),
         "GemmaForCausalLM" => Ok(Box::new(gemma::GemmaForCausalLM::new(weights, config)?)),
         "Gemma2ForCausalLM" => Ok(Box::new(gemma::Gemma2ForCausalLM::new(weights, config)?)),
+        "Gemma4ForCausalLM" => Ok(Box::new(gemma4::Gemma4ForCausalLM::new(weights, config)?)),
         "DeepSeekV2ForCausalLM" | "DeepseekV2ForCausalLM" => Ok(Box::new(
             deepseek::DeepSeekV2ForCausalLM::new(weights, config)?,
         )),
