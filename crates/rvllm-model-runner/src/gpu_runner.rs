@@ -1168,12 +1168,26 @@ mod cuda_impl {
             let hidden_size = self.config.hidden_size;
             let vocab_size = self.config.vocab_size;
             let block_size = self.cache.block_size();
+            let debug_logits = std::env::var("RVLLM_DEBUG_LOGITS").map_or(false, |v| v == "1");
 
             if num_tokens == 0 {
                 return Err(LLMError::ModelError("empty input".into()));
             }
 
             let mut hidden_f16 = self.embedding_lookup_from_meta(num_tokens)?;
+
+            if debug_logits {
+                let embed_cpu: Vec<half::f16> = self.stream.clone_dtoh(&hidden_f16)
+                    .unwrap_or_default();
+                let first8: Vec<f32> = embed_cpu.iter().take(8).map(|v| v.to_f32()).collect();
+                let all_zero = embed_cpu.iter().all(|v| v.to_f32() == 0.0);
+                let any_nan = embed_cpu.iter().any(|v| v.to_f32().is_nan());
+                info!(
+                    len = embed_cpu.len(), all_zero, any_nan,
+                    first8 = ?first8,
+                    "RVLLM_DEBUG: embedding output (graph_body)"
+                );
+            }
 
             let gpu_cache = self.cache.gpu_cache();
             let num_layers = self.layers.len();
@@ -1310,6 +1324,26 @@ mod cuda_impl {
 
             let logits_cpu = self.stream.clone_dtoh(&logits_gpu)
                 .map_err(|e| LLMError::GpuError(format!("logits DtoH: {e}")))?;
+
+            // Debug: dump top logits for first token to diagnose garbled output
+            if std::env::var("RVLLM_DEBUG_LOGITS").map_or(false, |v| v == "1") && num_tokens >= 1 {
+                let first_logits = &logits_cpu[..vocab_size.min(logits_cpu.len())];
+                let mut indexed: Vec<(usize, f32)> = first_logits.iter().copied().enumerate().collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let top5: Vec<_> = indexed.iter().take(5).map(|(i, v)| format!("{}={:.4}", i, v)).collect();
+                let all_same = first_logits.windows(2).all(|w| (w[0] - w[1]).abs() < 1e-6);
+                let any_nan = first_logits.iter().any(|v| v.is_nan());
+                let any_inf = first_logits.iter().any(|v| v.is_infinite());
+                info!(
+                    vocab_size, num_tokens,
+                    top5 = %top5.join(", "),
+                    all_same, any_nan, any_inf,
+                    min = first_logits.iter().cloned().reduce(f32::min).unwrap_or(0.0),
+                    max = first_logits.iter().cloned().reduce(f32::max).unwrap_or(0.0),
+                    "RVLLM_DEBUG_LOGITS: raw logits after LM head"
+                );
+            }
+
             Ok(ForwardOutput::Logits(logits_cpu))
         }
 
