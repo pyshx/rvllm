@@ -2692,6 +2692,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rvllm-autotune"
+version = "0.1.0"
+dependencies = [
+ "rvllm-core",
+ "rvllm-gpu",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "rvllm-bench"
 version = "0.1.0"
 dependencies = [
