@@ -2694,7 +2694,12 @@ mod cuda_impl {
             let heads_per_group = num_heads / num_kv_heads;
             let attn_scale = 1.0f32 / (head_dim as f32).sqrt();
 
-            let smem = PersistentV2Kernels::v3_shared_mem(hidden, head_dim, heads_per_group);
+            let smem = PersistentV2Kernels::v3_shared_mem(
+                hidden,
+                head_dim,
+                heads_per_group,
+                intermediate,
+            );
 
             // V3: non-cooperative, up to 1024 blocks
             let grid_blocks = pv2.v3_max_grid(smem).map_err(|e| LLMError::GpuError(e))?;

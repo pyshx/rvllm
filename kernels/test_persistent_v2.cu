@@ -13,6 +13,7 @@
 #include <cstring>
 #include <cmath>
 #include <cfloat>
+#include <cstdint>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -60,6 +61,21 @@ static float rand_f32(float lo, float hi) {
 
 static __half rand_f16(float lo, float hi) {
     return __float2half(rand_f32(lo, hi));
+}
+
+static int env_i32(const char* name, int fallback) {
+    const char* value = std::getenv(name);
+    if (!value || !*value) return fallback;
+    char* end = nullptr;
+    long parsed = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0') return fallback;
+    return (int)parsed;
+}
+
+static bool env_flag(const char* name) {
+    const char* value = std::getenv(name);
+    if (!value || !*value) return false;
+    return strcmp(value, "0") != 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +145,30 @@ static bool check_determinism(const __half* a, const __half* b, int n, const cha
         printf("  OK: %s deterministic (bitwise identical)\n", name);
     }
     return true; // non-determinism in parallel reductions is not a failure
+}
+
+static void print_plv3_phase_profile(const unsigned long long* stamps, int clock_rate_khz) {
+    static const char* names[] = {
+        "phase1 qkv",
+        "phase2 rope",
+        "phase3 attn",
+        "phase4 oproj",
+        "phase5 gateup",
+        "phase6 down",
+    };
+    static const int num_phases = (int)(sizeof(names) / sizeof(names[0]));
+
+    unsigned long long total_cycles = stamps[num_phases] - stamps[0];
+    double total_us = (double)total_cycles * 1000.0 / (double)clock_rate_khz;
+
+    printf("  Phase profile:\n");
+    for (int i = 0; i < num_phases; i++) {
+        unsigned long long cycles = stamps[i + 1] - stamps[i];
+        double us = (double)cycles * 1000.0 / (double)clock_rate_khz;
+        double pct = total_cycles ? (100.0 * (double)cycles / (double)total_cycles) : 0.0;
+        printf("    %-13s %.1f us  %5.1f%%\n", names[i], us, pct);
+    }
+    printf("    %-13s %.1f us  %5.1f%%\n", "total", total_us, 100.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -201,7 +241,9 @@ static int compute_smem_v3() {
     int hpg = 8;
     int stride = 32 + 1;
     int attn_smem = 2 * 32 * HEAD_DIM * 2 + hpg * stride * 4 + WARPS * 4;
-    return gemv_smem > attn_smem ? gemv_smem : attn_smem;
+    int phase6_smem = INTER * 2;
+    int smem = gemv_smem > attn_smem ? gemv_smem : attn_smem;
+    return smem > phase6_smem ? smem : phase6_smem;
 }
 
 // ---------------------------------------------------------------------------
@@ -478,11 +520,25 @@ static bool test_persistent_layer_v3(CUmodule mod) {
     printf("\n=== persistent_layer_v3_f16 ===\n");
 
     CUfunction func;
+    CUfunction prof_func;
     CU_CHECK(cuModuleGetFunction(&func, mod, "persistent_layer_v3_f16"));
+    bool profile = env_flag("PLV3_PROFILE");
+    if (profile) {
+        CU_CHECK(cuModuleGetFunction(&prof_func, mod, "persistent_layer_v3_f16_profile"));
+    }
 
     int smem = compute_smem_v3();
     CU_CHECK(cuFuncSetAttribute(func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem));
+    if (profile) {
+        CU_CHECK(cuFuncSetAttribute(prof_func, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem));
+    }
+    const unsigned int grid_v3 = (unsigned int)env_i32("PLV3_GRID", 1024);
+    const int iters = env_i32("PLV3_ITERS", 100);
+    int max_splits = env_i32("PLV3_MAX_SPLITS", MAX_SPLITS);
     printf("  shared memory: %d bytes\n", smem);
+    printf("  grid blocks: %u\n", grid_v3);
+    printf("  max_splits: %d\n", max_splits);
+    printf("  phase profile: %s\n", profile ? "on" : "off");
 
     xor_state = 0x13579BDF;
 
@@ -558,7 +614,10 @@ static bool test_persistent_layer_v3(CUmodule mod) {
     void* d_split_acc = gpu_alloc(split_acc_size * 2);
 
     int num_sync_flags = 6;
-    void* d_sync_flags = gpu_alloc(num_sync_flags * 4);
+    int num_profile_stamps = 7;
+    size_t sync_bytes = (size_t)num_sync_flags * sizeof(int);
+    if (profile) sync_bytes += (size_t)num_profile_stamps * sizeof(unsigned long long);
+    void* d_sync_flags = gpu_alloc(sync_bytes);
 
     upload(d_prev_residual, h_prev_residual);
     upload(d_key_cache, h_key_cache);
@@ -593,8 +652,6 @@ static bool test_persistent_layer_v3(CUmodule mod) {
     int block_size = BLOCK_SZ;
     int max_context_len = MAX_CTX;
     int max_blocks_per_seq = MAX_BPQ;
-    int max_splits = MAX_SPLITS;
-
     void* args[] = {
         &d_mlp_out, &d_residual_out,
         &d_prev_residual, &d_prev_mlp,
@@ -615,9 +672,7 @@ static bool test_persistent_layer_v3(CUmodule mod) {
         &d_sync_flags
     };
 
-    const unsigned int grid_v3 = 1024;
-
-    RT_CHECK(cudaMemset(d_sync_flags, 0, num_sync_flags * 4));
+    RT_CHECK(cudaMemset(d_sync_flags, 0, sync_bytes));
     RT_CHECK(cudaMemset(d_split_max, 0, split_meta_size * 4));
     RT_CHECK(cudaMemset(d_split_sum, 0, split_meta_size * 4));
     RT_CHECK(cudaMemset(d_split_acc, 0, split_acc_size * 2));
@@ -632,6 +687,62 @@ static bool test_persistent_layer_v3(CUmodule mod) {
     bool pass = true;
     pass &= check_output("mlp_out", h_mlp_out.data(), HIDDEN);
     pass &= check_output("residual_out", h_residual_out.data(), HIDDEN);
+
+    printf("  Performance (%d iterations):\n", iters);
+    for (int i = 0; i < 5; i++) {
+        RT_CHECK(cudaMemset(d_sync_flags, 0, sync_bytes));
+        RT_CHECK(cudaMemset(d_split_max, 0, split_meta_size * 4));
+        RT_CHECK(cudaMemset(d_split_sum, 0, split_meta_size * 4));
+        RT_CHECK(cudaMemset(d_split_acc, 0, split_acc_size * 2));
+        upload(d_key_cache, h_key_cache);
+        upload(d_val_cache, h_val_cache);
+        CU_CHECK(cuLaunchKernel(func, grid_v3, 1, 1, BLOCK, 1, 1, smem, 0, args, nullptr));
+        RT_CHECK(cudaDeviceSynchronize());
+    }
+
+    if (profile) {
+        cudaDeviceProp prop;
+        RT_CHECK(cudaGetDeviceProperties(&prop, 0));
+        std::vector<unsigned long long> h_stamps(num_profile_stamps);
+        void* d_profile = (void*)((char*)d_sync_flags + (size_t)num_sync_flags * sizeof(int));
+
+        RT_CHECK(cudaMemset(d_sync_flags, 0, sync_bytes));
+        RT_CHECK(cudaMemset(d_split_max, 0, split_meta_size * 4));
+        RT_CHECK(cudaMemset(d_split_sum, 0, split_meta_size * 4));
+        RT_CHECK(cudaMemset(d_split_acc, 0, split_acc_size * 2));
+        upload(d_key_cache, h_key_cache);
+        upload(d_val_cache, h_val_cache);
+        CU_CHECK(cuLaunchKernel(prof_func, grid_v3, 1, 1, BLOCK, 1, 1, smem, 0, args, nullptr));
+        RT_CHECK(cudaDeviceSynchronize());
+        RT_CHECK(cudaMemcpy(h_stamps.data(), d_profile,
+                            (size_t)num_profile_stamps * sizeof(unsigned long long),
+                            cudaMemcpyDeviceToHost));
+        print_plv3_phase_profile(h_stamps.data(), prop.clockRate);
+    }
+
+    cudaEvent_t t0, t1;
+    RT_CHECK(cudaEventCreate(&t0));
+    RT_CHECK(cudaEventCreate(&t1));
+    RT_CHECK(cudaEventRecord(t0));
+    for (int i = 0; i < iters; i++) {
+        RT_CHECK(cudaMemset(d_sync_flags, 0, sync_bytes));
+        RT_CHECK(cudaMemset(d_split_max, 0, split_meta_size * 4));
+        RT_CHECK(cudaMemset(d_split_sum, 0, split_meta_size * 4));
+        RT_CHECK(cudaMemset(d_split_acc, 0, split_acc_size * 2));
+        upload(d_key_cache, h_key_cache);
+        upload(d_val_cache, h_val_cache);
+        CU_CHECK(cuLaunchKernel(func, grid_v3, 1, 1, BLOCK, 1, 1, smem, 0, args, nullptr));
+    }
+    RT_CHECK(cudaEventRecord(t1));
+    RT_CHECK(cudaEventSynchronize(t1));
+
+    float ms = 0.0f;
+    RT_CHECK(cudaEventElapsedTime(&ms, t0, t1));
+    float avg_us = (ms * 1000.0f) / (float)iters;
+    printf("  Avg time: %.1f us (total %.2f ms for %d iters)\n", avg_us, ms, iters);
+
+    RT_CHECK(cudaEventDestroy(t0));
+    RT_CHECK(cudaEventDestroy(t1));
 
     cudaFree(d_mlp_out); cudaFree(d_residual_out);
     cudaFree(d_prev_residual);
@@ -965,10 +1076,15 @@ int main() {
     printf("  loaded OK\n");
 
     bool pass = true;
+    bool only_v3 = env_flag("ONLY_V3");
 
-    pass &= test_persistent_layer_v2(mod_layer);
-    pass &= test_persistent_layer_v3(mod_v3);
-    pass &= test_megakernel_v2(mod_mega);
+    if (only_v3) {
+        pass &= test_persistent_layer_v3(mod_v3);
+    } else {
+        pass &= test_persistent_layer_v2(mod_layer);
+        pass &= test_persistent_layer_v3(mod_v3);
+        pass &= test_megakernel_v2(mod_mega);
+    }
 
     CU_CHECK(cuModuleUnload(mod_layer));
     CU_CHECK(cuModuleUnload(mod_v3));

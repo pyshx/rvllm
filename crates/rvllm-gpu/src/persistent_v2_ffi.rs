@@ -617,10 +617,16 @@ impl PersistentV2Kernels {
 
     /// Compute shared memory for persistent_layer_v3.
     ///
-    /// V3 has no weight double buffer. Shared memory is max of:
+    /// V3 shared memory is max of:
     ///   - GEMV phases: hidden_size * 4 (normed f32) + WARPS * 4 (scratch)
     ///   - Attention: 2 * BC * head_dim * 2 (KV tiles) + PLV3_FA_HPG * STRIDE * 4 + WARPS * 4
-    pub fn v3_shared_mem(hidden_size: usize, head_dim: usize, heads_per_group: usize) -> u32 {
+    ///   - Phase 6: intermediate_size * 2 (activated f16 vector cached per block)
+    pub fn v3_shared_mem(
+        hidden_size: usize,
+        head_dim: usize,
+        heads_per_group: usize,
+        intermediate_size: usize,
+    ) -> u32 {
         let warps = 8usize;
         // GEMV phases: normed f32 + warp scratch (no weight buffer)
         let gemv_smem = hidden_size * 4 + warps * 4;
@@ -631,8 +637,9 @@ impl PersistentV2Kernels {
         let hpg = 8usize; // PLV3_FA_HPG scratch is fixed-size in the kernel
         let stride = bc + 1; // bank conflict avoidance
         let attn_smem = 2 * bc * head_dim * 2 + hpg * stride * 4 + warps * 4;
+        let phase6_smem = intermediate_size * std::mem::size_of::<u16>();
 
-        gemv_smem.max(attn_smem) as u32
+        gemv_smem.max(attn_smem).max(phase6_smem) as u32
     }
 
     /// Compute the v3 grid size: min(1024, blocks_per_sm * num_sms).
@@ -644,8 +651,8 @@ impl PersistentV2Kernels {
         };
         let sms =
             crate::cooperative::sm_count(&self.context).map_err(|e| format!("v3 sm_count: {e}"))?;
-        // v3 targets 1024 blocks (non-cooperative, no co-residency requirement)
-        Ok((bpsm * sms).min(1024))
+        // After the phase6 rewrite, direct timing sweeps favor a slightly higher grid.
+        Ok((bpsm * sms).min(512))
     }
 
     /// Launch persistent_layer_v3_f16 (non-cooperative, regular cuLaunchKernel).
