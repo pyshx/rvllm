@@ -34,38 +34,36 @@ __global__ void fused_rope_cache_f16_kernel(
     const float cos_val = cos_table[pos * half_dim + tid];
     const float sin_val = sin_table[pos * half_dim + tid];
 
-    // Apply RoPE to Q (all heads) -- split-half convention (Llama/Qwen2)
-    // Pairs: (x[i], x[i + half_dim]) rotated by frequency[i]
+    // Apply RoPE to Q (all heads) -- interleaved pairs convention
     if (head_idx < num_heads) {
         int q_base = (token_idx * num_heads + head_idx) * head_dim;
-        float q0 = __half2float(q[q_base + tid]);
-        float q1 = __half2float(q[q_base + half_dim + tid]);
-        q[q_base + tid]            = __float2half(q0 * cos_val - q1 * sin_val);
-        q[q_base + half_dim + tid] = __float2half(q0 * sin_val + q1 * cos_val);
+        float q0 = __half2float(q[q_base + 2 * tid]);
+        float q1 = __half2float(q[q_base + 2 * tid + 1]);
+        q[q_base + 2 * tid]     = __float2half(q0 * cos_val - q1 * sin_val);
+        q[q_base + 2 * tid + 1] = __float2half(q0 * sin_val + q1 * cos_val);
     }
 
     // Apply RoPE to K (kv_heads only) + write to KV cache
-    // Same split-half convention as Q
     if (head_idx < num_kv_heads) {
         int k_base = (token_idx * num_kv_heads + head_idx) * head_dim;
-        float k0 = __half2float(k[k_base + tid]);
-        float k1 = __half2float(k[k_base + half_dim + tid]);
+        float k0 = __half2float(k[k_base + 2 * tid]);
+        float k1 = __half2float(k[k_base + 2 * tid + 1]);
         float k0_rot = k0 * cos_val - k1 * sin_val;
         float k1_rot = k0 * sin_val + k1 * cos_val;
-        k[k_base + tid]            = __float2half(k0_rot);
-        k[k_base + half_dim + tid] = __float2half(k1_rot);
+        k[k_base + 2 * tid]     = __float2half(k0_rot);
+        k[k_base + 2 * tid + 1] = __float2half(k1_rot);
 
-        // Write rotated K to cache (sequential layout matching attention read)
+        // Write rotated K to cache
         int slot = slot_mapping[token_idx];
         if (slot >= 0) {
             int cache_offset = (slot * num_kv_heads + head_idx) * head_dim;
-            key_cache[cache_offset + tid]            = __float2half(k0_rot);
-            key_cache[cache_offset + half_dim + tid] = __float2half(k1_rot);
+            key_cache[cache_offset + 2 * tid]     = __float2half(k0_rot);
+            key_cache[cache_offset + 2 * tid + 1] = __float2half(k1_rot);
 
-            // Write V to cache (no RoPE on V, sequential copy)
+            // Write V to cache (no RoPE on V)
             int v_base = (token_idx * num_kv_heads + head_idx) * head_dim;
-            value_cache[cache_offset + tid]            = v[v_base + tid];
-            value_cache[cache_offset + half_dim + tid] = v[v_base + half_dim + tid];
+            value_cache[cache_offset + 2 * tid]     = v[v_base + 2 * tid];
+            value_cache[cache_offset + 2 * tid + 1] = v[v_base + 2 * tid + 1];
         }
     }
 }
