@@ -961,10 +961,15 @@ mod inner {
             for scheduled in groups {
                 let group = &scheduled.seq_group;
                 let prompt_len = group.prompt_len();
+                // Use remaining_prefill to determine if this is truly a prefill step,
+                // not the chunk bounds which incorrectly report is_prompt=true during decode.
+                let is_prompt = group.is_prefilling();
                 let chunk_end = group.num_prompt_tokens_processed.min(prompt_len);
-                let chunk_start =
-                    chunk_end.saturating_sub(scheduled.token_chunk_size.min(chunk_end));
-                let is_prompt = chunk_start < chunk_end;
+                let chunk_start = if is_prompt {
+                    chunk_end.saturating_sub(scheduled.token_chunk_size.min(chunk_end))
+                } else {
+                    chunk_end
+                };
                 let mut seq_data = HashMap::new();
                 let mut block_tables = HashMap::new();
 
