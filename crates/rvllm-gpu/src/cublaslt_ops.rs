@@ -124,7 +124,7 @@ impl CublasLtOps {
                 let mut desc: lt_sys::cublasLtMatmulDesc_t = std::ptr::null_mut();
                 let s = lt_sys::cublasLtMatmulDescCreate(
                     &mut desc,
-                    lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F,
+                    lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
                     lt_sys::cudaDataType_t::CUDA_R_32F,
                 );
                 if s != lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
@@ -274,7 +274,7 @@ impl CublasLtOps {
             let mut desc: lt_sys::cublasLtMatmulDesc_t = std::ptr::null_mut();
             let s = lt_sys::cublasLtMatmulDescCreate(
                 &mut desc,
-                lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F,
+                lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
                 lt_sys::cudaDataType_t::CUDA_R_32F,
             );
             if s != lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
@@ -421,7 +421,7 @@ impl CublasLtOps {
             unsafe {
                 let handle = *self.handle.handle();
                 let mut desc: lt_sys::cublasLtMatmulDesc_t = std::ptr::null_mut();
-                let s = lt_sys::cublasLtMatmulDescCreate(&mut desc, lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F, lt_sys::cudaDataType_t::CUDA_R_32F);
+                let s = lt_sys::cublasLtMatmulDescCreate(&mut desc, lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F, lt_sys::cudaDataType_t::CUDA_R_32F);
                 if s != lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
                     return Err(LLMError::GpuError(format!("fp8 desc create: {s:?}")));
                 }
@@ -510,7 +510,7 @@ impl CublasLtOps {
             let mut desc: lt_sys::cublasLtMatmulDesc_t = std::ptr::null_mut();
             let s = lt_sys::cublasLtMatmulDescCreate(
                 &mut desc,
-                lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F,
+                lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
                 lt_sys::cudaDataType_t::CUDA_R_32F,
             );
             if s != lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
@@ -632,7 +632,7 @@ impl CublasLtOps {
             let mut desc: lt_sys::cublasLtMatmulDesc_t = std::ptr::null_mut();
             let s = lt_sys::cublasLtMatmulDescCreate(
                 &mut desc,
-                lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F,
+                lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
                 lt_sys::cudaDataType_t::CUDA_R_32F,
             );
             if s != lt_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {

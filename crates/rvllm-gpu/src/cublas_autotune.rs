@@ -159,7 +159,7 @@ impl CublasAutotuner {
                 lt_sys::cudaDataType_t::CUDA_R_16F,
                 // FAST_16F uses FP16 tensor core accumulation -- faster than FP32
                 // accumulation, sufficient precision for inference (not training).
-                lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F_FAST_16F,
+                lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
             ),
             GemmDtype::Fp8E4M3 => (
                 lt_sys::cudaDataType_t::CUDA_R_8F_E4M3,
