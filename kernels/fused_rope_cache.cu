@@ -55,17 +55,17 @@ __global__ void fused_rope_cache_f16_kernel(
         k[k_base + tid]            = __float2half(k0_rot);
         k[k_base + half_dim + tid] = __float2half(k1_rot);
 
-        // Write rotated K to cache
+        // Write rotated K to cache (sequential layout matching attention read)
         int slot = slot_mapping[token_idx];
         if (slot >= 0) {
             int cache_offset = (slot * num_kv_heads + head_idx) * head_dim;
-            key_cache[cache_offset + 2 * tid]     = __float2half(k0_rot);
-            key_cache[cache_offset + 2 * tid + 1] = __float2half(k1_rot);
+            key_cache[cache_offset + tid]            = __float2half(k0_rot);
+            key_cache[cache_offset + half_dim + tid] = __float2half(k1_rot);
 
-            // Write V to cache (no RoPE on V)
+            // Write V to cache (no RoPE on V, sequential copy)
             int v_base = (token_idx * num_kv_heads + head_idx) * head_dim;
-            value_cache[cache_offset + 2 * tid]     = v[v_base + 2 * tid];
-            value_cache[cache_offset + 2 * tid + 1] = v[v_base + 2 * tid + 1];
+            value_cache[cache_offset + tid]            = v[v_base + tid];
+            value_cache[cache_offset + half_dim + tid] = v[v_base + half_dim + tid];
         }
     }
 }
