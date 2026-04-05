@@ -654,6 +654,20 @@ mod cuda_impl {
 
             debug!(num_tokens, num_seqs, is_prefill, greedy_only, "GpuModelRunner::forward_ex");
 
+            // Debug decode metadata
+            if std::env::var("RVLLM_DEBUG_LOGITS").map_or(false, |v| v == "1") {
+                info!(
+                    num_tokens, num_seqs, is_prefill,
+                    max_context_len = attn_meta.max_context_len,
+                    context_lens = ?&attn_meta.context_lens,
+                    positions = ?positions,
+                    slot_mapping = ?&attn_meta.slot_mapping,
+                    block_tables_len = attn_meta.block_tables.len(),
+                    first_bt = ?attn_meta.block_tables.first().map(|bt| &bt[..bt.len().min(4)]),
+                    "RVLLM_DEBUG: forward_ex metadata"
+                );
+            }
+
             let max_context_len = attn_meta.max_context_len;
 
             // Single packed upload: all 6 metadata fields in one memcpy_htod.
