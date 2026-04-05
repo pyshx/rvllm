@@ -56,6 +56,7 @@ impl GpuTransformerLayer {
         };
 
         // 1. Pre-attention RMSNorm
+        if dbg { dbg_dump("input_hidden", input.hidden_states, &self.stream); }
         let residual_from_fused: bool;
         if let Some(prev_mlp) = prev_mlp_out {
             Self::fused_residual_rmsnorm_f16_into(
@@ -78,6 +79,7 @@ impl GpuTransformerLayer {
                 num_tokens, qkv_dim, hidden, q_dim, kv_dim)?;
         }
 
+        if dbg { dbg_dump("after_qkv_gemm", &*scratch.qkv, &self.stream); }
         let residual_ref: &CudaSlice<f16> = if residual_from_fused {
             &*scratch.down
         } else {
@@ -107,6 +109,7 @@ impl GpuTransformerLayer {
             }
         }
 
+        if dbg { dbg_dump("after_rope+cache", &*scratch.qkv, &self.stream); }
         // 6. Attention
         let attn_out = if input.is_prefill {
             Self::prefill_attention_f16io(
