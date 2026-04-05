@@ -22,7 +22,7 @@ use crate::{LLMError, Result};
 pub const CUBLASLT_M_THRESHOLD: usize = 32;
 
 /// 4 MiB workspace for split-K heuristics in cublasLt.
-const FP8_WORKSPACE_SIZE: usize = 32 * 1024 * 1024;
+const FP8_WORKSPACE_SIZE: usize = 4 * 1024 * 1024;
 
 /// Cached FP8 matmul plan (descriptors + algo) for a specific (M, N, K) shape.
 struct Fp8Plan {
