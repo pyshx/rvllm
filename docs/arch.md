@@ -24,10 +24,10 @@ The dedicated GPU thread still owns CUDA state, graph capture, replay, and the r
 The normal path is now:
 
 ```text
-CublasGemvDecode
+Batched
 ```
 
-That was not true before. The old default still used the legacy fused decode path, and that was one of the main reasons the public docs were wrong.
+That was not true before. The path had already been moved off the old fused default, but it was still staying on the older single-token family instead of the reusable batched scratch path.
 
 ### `T>=2`: batched decode and prefill
 
@@ -45,8 +45,8 @@ This is the current best policy on H100 for Qwen2.5-7B.
 Two architectural problems were masking the real performance picture:
 
 1. **Wrong batch-1 default**
-   - The standard `T=1` path still went through the older fused decode stack.
-   - Fix: normal `T=1` now defaults to `CublasGemvDecode`.
+   - The standard `T=1` path still used the legacy single-token stack.
+   - Fix: normal `T=1` now defaults to `ForwardPath::Batched`, which keeps reusable scratch buffers alive and avoids per-layer output churn.
 
 2. **Half-wired batched hybrid policy**
    - The runner wanted a hybrid strategy, but the actual enum and dispatch did not enforce one.
@@ -59,17 +59,16 @@ Two architectural problems were masking the real performance picture:
 
 ```text
 RMSNorm
-QKV projection
+QKV via cuBLAS / cublasLt
 RoPE + KV cache write
 attention decode
-O-proj
+O-proj via cuBLAS / cublasLt
 RMSNorm
-gate_up
-SiLU * Mul
-down
+GateUp + SiLU via CUTLASS
+down via cuBLAS / cublasLt
 ```
 
-All projection-heavy ops are handled through the cuBLAS-backed batch-1 path now.
+This uses the same reusable scratch buffers as the batched path instead of the older single-token allocator-heavy route.
 
 ### Batched decode / prefill
 
@@ -90,10 +89,10 @@ Same H100, same Qwen2.5-7B snapshot, direct engine, `output-len=128`:
 
 | N | vLLM 0.19.0 | rvLLM | rvLLM / vLLM |
 |---:|---:|---:|---:|
-| 1 | 165.5 | 127.9 | 0.77x |
+| 1 | 165.5 | 133.1 | 0.80x |
 | 32 | 4467.7 | 4407.5 | 0.99x |
-| 64 | 7972.1 | 7964.0 | 1.00x |
-| 128 | 13903.5 | 13148.3 | 0.95x |
+| 64 | 7972.1 | 8038.0 | 1.01x |
+| 128 | 13903.5 | 13110.1 | 0.94x |
 
 So the architecture story is now:
 

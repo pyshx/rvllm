@@ -13,18 +13,18 @@ Decode length: `output-len=128`
 
 | N | vLLM 0.19.0 tok/s | rvLLM tok/s | rvLLM / vLLM |
 |---:|---:|---:|---:|
-| 1 | 165.5 | 127.9 | 0.77x |
+| 1 | 165.5 | 133.1 | 0.80x |
 | 32 | 4467.7 | 4407.5 | 0.99x |
-| 64 | 7972.1 | 7964.0 | 1.00x |
-| 128 | 13903.5 | 13148.3 | 0.95x |
+| 64 | 7972.1 | 8038.0 | 1.01x |
+| 128 | 13903.5 | 13110.1 | 0.94x |
 
 ### What changed to get here
 
 Two fixes matter most:
 
-1. **Batch-1 dispatch fix**
-   - normal `T=1` decode now defaults to `CublasGemvDecode`
-   - this lifted the current normal batch-1 path to `127.9 tok/s`
+1. **Batch-1 default-path fix**
+   - normal `T=1` decode now defaults to the reusable `Batched` path
+   - this lifted the current normal batch-1 path to `133.1 tok/s`
 
 2. **Batched GEMM policy fix**
    - `GemmStrategy::Hybrid` is now real instead of half-implied
@@ -50,7 +50,7 @@ That sweep is why `Hybrid` is the current default when CUTLASS is available.
 
 - `N=1`: still materially behind vLLM
 - `N=32`: basically tied
-- `N=64`: effectively tied
+- `N=64`: effectively tied to slightly ahead
 - `N=128`: still a few percent behind
 
 The remaining issues are no longer “wrong path” bugs in the normal batched stack. The biggest remaining work is:

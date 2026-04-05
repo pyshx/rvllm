@@ -19,7 +19,7 @@ Results land in `bench/combined_results_h100_lifecycle.json`. The instance stays
 **Near parity with vLLM 0.19.0 at batch 32-64, still behind at batch 1 and batch 128.** Measured on the same H100 SXM 80GB, same Qwen2.5-7B snapshot, same decode length (`output-len=128`), same date (`April 4, 2026`).
 
 What rvLLM does well:
-- **`0.99x` vLLM at `N=32` and `1.00x` at `N=64`** on direct engine
+- **`0.99x` vLLM at `N=32` and `1.01x` at `N=64`** on direct engine
 - **~50 MB container image** vs ~15 GB for Python vLLM
 - **35-second build from source**, no pip, no PyTorch, no `torch.compile`
 - **54 CUDA kernels** with no-fallback validation -- silent degradation is treated as a bug
@@ -27,15 +27,15 @@ What rvLLM does well:
 - **Safe-max VRAM control**: `--gpu-memory-reserve-gb` + explicit `--num-gpu-blocks` + `--num-cpu-blocks`
 
 What was wrong before:
-1. **Batch-1 normal decode picked the wrong path.** The default `T=1` path was still taking the slower legacy fused decode path instead of `CublasGemvDecode`.
+1. **Batch-1 normal decode still used the wrong default stack.** The single-token path had already been moved off the old fused default, but it was still staying on the legacy single-token family instead of the reusable batched scratch path.
 2. **Batched GEMM policy was only half-wired.** The runner thought it had a hybrid policy, but batched QKV could still opportunistically take CUTLASS just because the `.so` existed.
 3. **The docs were still describing that older architecture.** This README and the paper now reflect the current dispatch logic and the current benchmark set.
 
 What changed:
-1. **Batch-1 default decode now prefers `CublasGemvDecode`.**
+1. **Batch-1 default decode now prefers the reusable `Batched` path.**
 2. **Batched GEMM has a real `Hybrid` strategy.**
 3. **`Hybrid` now means exactly this**: QKV, O-proj, and down-proj use cuBLAS/cublasLt; GateUp+SiLU uses CUTLASS.
-4. **Explicit batched policy override exists**: `RVLLM_BATCHED_GEMM_STRATEGY={cublas,hybrid,cutlass}`.
+4. **Explicit overrides still exist**: `RVLLM_BATCHED_DECODE_1=0` returns batch-1 to the legacy single-token family, and `RVLLM_BATCHED_GEMM_STRATEGY={cublas,hybrid,cutlass}` controls the batched GEMM policy.
 
 Where the remaining gap comes from:
 1. **Single-stream decode**: `N=1` is still materially behind vLLM.
@@ -50,12 +50,12 @@ Qwen2.5-7B f16 on H100 SXM 80GB, 128 output tokens per request, greedy decode (t
 
 | N | vLLM 0.19.0 tok/s | rvLLM tok/s | rvLLM / vLLM |
 |---:|---:|---:|---:|
-| 1 | 165.5 | 127.9 | 0.77x |
+| 1 | 165.5 | 133.1 | 0.80x |
 | 32 | 4,467.7 | 4,407.5 | 0.99x |
-| 64 | 7,972.1 | 7,964.0 | 1.00x |
-| 128 | 13,903.5 | 13,148.3 | 0.95x |
+| 64 | 7,972.1 | 8,038.0 | 1.01x |
+| 128 | 13,903.5 | 13,110.1 | 0.94x |
 
-This is the current honest comparison set. rvLLM is effectively tied at `N=32` and `N=64`, a few percent behind at `N=128`, and still substantially behind at `N=1`.
+This is the current honest comparison set. rvLLM is effectively tied at `N=32`, slightly ahead at `N=64`, a few percent behind at `N=128`, and still substantially behind at `N=1`.
 
 ### Historical Comparison (vLLM 0.6.3, March 2026)
 
@@ -101,8 +101,9 @@ Six runtime-selectable decode strategies, each with different performance trade-
 
 | Decode Path | N=1 tok/s | Selection | Notes |
 |---|---:|---|---|
-| CublasGemvDecode (default) | 127.9 | `T=1, f16 weights` | Current normal batch-1 decode path |
-| FusedDecode | legacy | `RVLLM_CUBLAS_DECODE=0` | Older fused f16 GEMV path, now opt-in |
+| Batched (default) | 133.1 | `T=1` unless `RVLLM_BATCHED_DECODE_1=0` | Reusable batched scratch path, current normal batch-1 decode path |
+| CublasGemvDecode | legacy | `RVLLM_BATCHED_DECODE_1=0` | Older single-token cuBLAS GEMV path |
+| FusedDecode | legacy | `RVLLM_BATCHED_DECODE_1=0 RVLLM_CUBLAS_DECODE=0` | Older fused f16 GEMV path, now opt-in |
 | MegakernelDecode | ~50 | Internal | All 28 layers in 1 kernel launch (instruction tape interpreter) |
 | PersistentDecode | ~51 | Internal | SM-DAG cooperative kernel per layer |
 | Fp8Decode | auto | `RVLLM_FP8_WEIGHTS=1` | cublasLt FP8 GEMMs (when FP8 weights present) |
@@ -272,13 +273,14 @@ See [crates/rvllm-fusion/README.md](crates/rvllm-fusion/README.md) for the full 
 | 11 | v0.19 upgrade: zero-bubble scheduling, DBO, MLA, Gemma 4, Blackwell, MXFP8, autotune cache | 4,385 (N=32) | Apr 4 |
 | 12 | Batch-1 dispatch fix: default to `CublasGemvDecode` | 127.9 (N=1) | Apr 4 |
 | 13 | Batched GEMM `Hybrid` policy fix | 13,148 (N=128) | Apr 4 |
+| 14 | Batch-1 batched scratch default | 133.1 (N=1) | Apr 4 |
 
 ### What Differs from vLLM
 
 Against vLLM 0.19.0 (April 2026), rvLLM now has two different stories:
 
-- **Batched direct engine is close**: `0.99x` at `N=32`, `1.00x` at `N=64`, `0.95x` at `N=128`
-- **Single-stream decode is not**: `0.77x` at `N=1`
+- **Batched direct engine is close**: `0.99x` at `N=32`, `1.01x` at `N=64`, `0.94x` at `N=128`
+- **Single-stream decode is not**: `0.80x` at `N=1`
 
 The biggest architectural difference is that rvLLM's normal batched path is now an explicit per-op hybrid GEMM stack, while vLLM still has the stronger overall decode stack at `N=1` through FlashAttention 3, `torch.compile`, and fuller decode graph integration.
 

@@ -23,11 +23,11 @@ and a Rust-native PTX compiler that generates fused decode kernels
 microbenchmarks. In the latest honest same-GPU comparison on H100~SXM~80\,GB
 serving Qwen2.5-7B f16 against vLLM~0.19.0 (April 2026), rvLLM reaches
 4{,}407.5~tok/s at $N\!=\!32$ (\textbf{0.99$\times$ vLLM}),
-7{,}964.0~tok/s at $N\!=\!64$ (\textbf{1.00$\times$ vLLM}), and
-13{,}148.3~tok/s at $N\!=\!128$ (\textbf{0.95$\times$ vLLM}), while remaining
-materially behind at $N\!=\!1$ (127.9 vs.\ 165.5~tok/s, \textbf{0.77$\times$}).
+8{,}038.0~tok/s at $N\!=\!64$ (\textbf{1.01$\times$ vLLM}), and
+13{,}110.1~tok/s at $N\!=\!128$ (\textbf{0.94$\times$ vLLM}), while remaining
+materially behind at $N\!=\!1$ (133.1 vs.\ 165.5~tok/s, \textbf{0.80$\times$}).
 The most important changes in this revision are architectural rather than cosmetic:
-batch-1 normal decode now defaults to the correct cuBLAS GEMV path, and batched
+batch-1 normal decode now defaults to the reusable batched scratch path, and batched
 execution now uses an explicit hybrid GEMM policy with QKV/O/down on cuBLAS or
 cublasLt and GateUp+SiLU on CUTLASS. rvLLM is open-source under the Apache-2.0
 license.
@@ -171,8 +171,8 @@ synchronisation or device-to-host transfer occurs. RoPE cosine/sine tables are
 precomputed once at model load time and uploaded as persistent GPU buffers.
 
 As of this revision, the runner uses two distinct normal execution regimes. For
-$T\!=\!1$ batch-1 decode, the standard path now defaults to
-\texttt{CublasGemvDecode}. For $T\!\ge\!2$, the normal path is an explicit hybrid
+$T\!=\!1$ batch-1 decode, the standard path now defaults to the reusable
+\texttt{Batched} path. For $T\!\ge\!2$, the normal path is an explicit hybrid
 GEMM policy: QKV, O-proj, and down-proj use cuBLAS or cublasLt, while GateUp+SiLU
 uses CUTLASS. This replaced an older half-wired configuration in which the runner
 conceptually wanted a hybrid policy but QKV routing could still drift based only
@@ -481,11 +481,11 @@ on the same GPU and model snapshot.
     \toprule
     \thead{$N$} & \thead{vLLM~0.19.0} & \thead{rvLLM} & \thead{rvLLM / vLLM} \\
     \midrule
-    1   & 165.5 & 127.9 & 0.77$\times$ \\
+    1   & 165.5 & 133.1 & 0.80$\times$ \\
     \rowcolor{gray!8}
     32  & 4{,}467.7 & 4{,}407.5 & 0.99$\times$ \\
-    64  & 7{,}972.1 & 7{,}964.0 & 1.00$\times$ \\
-    \textbf{128} & \textbf{13{,}903.5} & \textbf{13{,}148.3} & \textbf{0.95$\times$} \\
+    64  & 7{,}972.1 & 8{,}038.0 & 1.01$\times$ \\
+    \textbf{128} & \textbf{13{,}903.5} & \textbf{13{,}110.1} & \textbf{0.94$\times$} \\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -498,9 +498,9 @@ fundamental deficit.
 
 \begin{enumerate}
   \item \textbf{Batch-1 default path selection was wrong.} Normal $T\!=\!1$ decode
-        still favored the older fused decode path instead of the better
-        \texttt{CublasGemvDecode} path. Fixing that lifted the current normal
-        batch-1 path to 127.9~tok/s.
+        had already left the older fused default, but it was still staying on the
+        legacy single-token family instead of the reusable \texttt{Batched} path.
+        Fixing that lifted the current normal batch-1 path to 133.1~tok/s.
   \item \textbf{The batched GEMM policy was only half-expressed.} The runner wanted
         a hybrid strategy, but the actual dispatch did not encode that cleanly, so
         QKV could still opportunistically route through CUTLASS merely because the
@@ -627,8 +627,8 @@ effect of several reinforcing mechanisms:
         throughout the $N$-layer forward pass. No per-layer DtoH synchronisation.
   \item \textbf{Prefix caching}: shared system prompts reuse computed KV blocks
         across requests, reducing amortised prefill cost.
-  \item \textbf{Correct path selection}: batch-1 normal decode now takes the faster
-        cuBLAS GEMV route instead of the older fused default.
+  \item \textbf{Correct path selection}: batch-1 normal decode now takes the reusable
+        batched scratch route instead of the older single-token default family.
   \item \textbf{Explicit batched hybrid GEMM routing}: the best current policy keeps
         QKV/O/down on cuBLAS while using CUTLASS only where it currently wins
         (GateUp+SiLU).

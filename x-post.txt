@@ -1,40 +1,35 @@
-updated rvLLM and cleaned up the public repo/docs.
+updated rvLLM and synced the public repo/docs/paper/site to the current H100 results.
 
-current public H100 comparison is against:
-- stock vLLM
-- rvllm-lite
-- rvLLM
+current direct-engine comparison against vLLM 0.19.0 on the same H100, same Qwen2.5-7B snapshot, same output len:
 
-the headline is not "we beat vLLM everywhere." not yet.
+- N=1: 133.1 tok/s vs 165.5
+- N=32: 4407.5 tok/s vs 4467.7
+- N=64: 8038.0 tok/s vs 7972.1
+- N=128: 13110.1 tok/s vs 13903.5
 
-the real headline is that the stack is much more unlocked now, while already getting close to stock vLLM where it matters:
+so the honest headline is:
 
-- HTTP serving: rvLLM 2,723.2 tok/s vs stock vLLM 2,861.9
-- direct engine at N=32: rvLLM 3,170.0 tok/s vs stock vLLM 3,197.1
+- rvLLM is basically tied at N=32
+- slightly ahead at N=64
+- still behind at N=1 and N=128
 
-and inside the stack, some parts are already materially faster:
+the important architecture correction was that batch-1 had changed again.
+
+the docs previously said the normal T=1 path was `CublasGemvDecode`. that was already stale.
+the current default batch-1 path is the reusable batched scratch path, and that lifted N=1 from 127.9 to 133.1 tok/s without hurting high batch.
+
+the batched side is still the same explicit hybrid policy:
+
+- QKV / O / down on cuBLAS or cublasLt
+- GateUp + SiLU on CUTLASS
+
+and inside the stack, some parts are still materially faster than our own earlier baselines:
 
 - Rust PTX JIT fused kernels are 2-7.5x faster than our hand-written CUDA in measured decode microbenches
-- FA3 v3 + no-fallback validation is 31-42% faster than the previous rvLLM attention path
+- FA3 v3 + no-fallback validation was a 31-42% jump over the previous rvLLM attention path
 - Zig SIMD sampling / conversion backend is faster on several hot CPU-side ops
 
-the tools / control surface in the repo are the part I care about most right now:
-
-- Rust server, worker, scheduler, and engine
-- reserve-based safe-max VRAM sizing (`--gpu-memory-reserve-gb`, `--num-gpu-blocks`, `--num-cpu-blocks`)
-- 54 CUDA kernels with explicit no-fallback validation
-- multiple decode paths: fused GEMV, cuBLAS GEMV, megakernel, persistent, FP8, INT4 path in progress
-- Rust-native PTX compiler instead of leaving fusion to torch.compile
-
-rvllm-lite ended up being useful too. it stays near stock vLLM on direct engine, then collapses over HTTP. that isolates a lot of the remaining overhead to the serving/runtime layer instead of the base engine.
-
-so the current state is:
-- near-parity on practical serving
-- near-parity by N=32 on direct engine
-- already faster in several custom kernel/tooling paths
-- much more open to tuning end-to-end because the whole stack is exposed
-
-still true: stock vLLM is ahead overall on direct engine, especially at low and mid concurrency. but the repo, benchmarks, paper, and github pages are finally synced to the real state of the project.
+still true: stock vLLM has the stronger low-batch decode stack overall. but rvLLM is now very close in the batched regime, and the public materials finally match the real shipped architecture instead of the previous one-step-old story.
 
 repo: https://github.com/m0at/rvllm
 site: https://m0at.github.io/rvllm/

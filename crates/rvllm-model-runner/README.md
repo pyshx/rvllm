@@ -18,7 +18,8 @@ T == 1? ----yes----> Check explicit experimental env vars first
     v                     no
 Batched path              |
 Hybrid/CUBLAS/CUTLASS     v
-                     CublasGemvDecode (default)
+                     Batched (default)
+                     CublasGemvDecode if RVLLM_BATCHED_DECODE_1=0
                      Legacy FusedDecode only if forced
 ```
 
@@ -26,14 +27,14 @@ Hybrid/CUBLAS/CUTLASS     v
 
 Two things were out of date:
 
-1. Batch-1 normal decode still defaulted to the older fused path.
+1. Batch-1 normal decode still defaulted to the older single-token family.
 2. Batched execution had a conceptual "hybrid" policy, but the actual `GemmStrategy` could not encode it cleanly, so QKV routing was inconsistent.
 
 That meant the docs said one thing, the runner thought another thing, and the real per-op policy could still drift based on whether CUTLASS happened to be loaded.
 
 ## Current Batch-1 Decode
 
-### CublasGemvDecode (default, `T=1`)
+### Batched (default, `T=1`)
 
 This is now the normal batch-1 decode path.
 
@@ -45,17 +46,20 @@ RoPE + KV cache write
 Flash attention decode
 cuBLAS / cublasLt O-proj
 RMSNorm
-cuBLAS / cublasLt gate_up
-SiLU * Mul
+GateUp + SiLU via CUTLASS
 cuBLAS / cublasLt down
 ```
 
 Latest verified number on H100 with Qwen2.5-7B f16:
-- **127.9 tok/s**
+- **133.1 tok/s**
 
-This replaced the older default because it wins end-to-end on the real benchmark.
+This replaced the older single-token default because it wins end-to-end on the real benchmark while reusing scratch buffers across the layer loop.
 
-### FusedDecode (legacy, `RVLLM_CUBLAS_DECODE=0`)
+### CublasGemvDecode (legacy single-token path)
+
+This is still available when `RVLLM_BATCHED_DECODE_1=0`, and it remains better than the older fused path, but it is no longer the current default.
+
+### FusedDecode (legacy, `RVLLM_BATCHED_DECODE_1=0 RVLLM_CUBLAS_DECODE=0`)
 
 The older fused f16 GEMV path is still present, but it is no longer the default batch-1 choice.
 
@@ -94,8 +98,8 @@ This is the best current policy on the measured H100 Qwen2.5-7B run.
 
 Latest verified `output-len=128` numbers:
 - `N=32`: **4407.5 tok/s**
-- `N=64`: **7964.0 tok/s**
-- `N=128`: **13148.3 tok/s**
+- `N=64`: **8038.0 tok/s**
+- `N=128`: **13110.1 tok/s**
 
 ### Explicit batched strategy override
 

@@ -14,23 +14,24 @@ The two important ideas now are:
 Normal batch-1 decode now defaults to:
 
 ```text
-CublasGemvDecode
+Batched
 ```
 
-That was a deliberate fix. The previous default still favored the older fused decode path, which lost on the real H100 end-to-end benchmark.
+That was a deliberate fix. The previous default had already left the older fused path, but it was still staying on the legacy single-token family instead of the reusable batched scratch path that wins end-to-end.
 
 The batch-1 selection order is now:
 
 ```text
 explicit experimental env paths
 -> FP8 decode if FP8 weights are active
--> CublasGemvDecode (default normal path)
+-> Batched (default normal path)
+-> CublasGemvDecode if RVLLM_BATCHED_DECODE_1=0
 -> legacy FusedDecode only if forced
 ```
 
 Current verified number on H100 / Qwen2.5-7B / `output-len=128`:
 
-- `N=1`: `127.9 tok/s`
+- `N=1`: `133.1 tok/s`
 
 ### Batched (`T>=2`)
 
@@ -69,8 +70,7 @@ RoPE + KV cache write
 attention decode
 O-proj via cuBLAS / cublasLt
 RMSNorm
-gate_up via cuBLAS / cublasLt
-SiLU * Mul
+GateUp + SiLU via CUTLASS
 down via cuBLAS / cublasLt
 ```
 
@@ -96,10 +96,10 @@ Same H100, same Qwen2.5-7B snapshot, `output-len=128`, direct engine:
 
 | N | vLLM 0.19.0 | rvLLM | rvLLM / vLLM |
 |---:|---:|---:|---:|
-| 1 | 165.5 | 127.9 | 0.77x |
+| 1 | 165.5 | 133.1 | 0.80x |
 | 32 | 4467.7 | 4407.5 | 0.99x |
-| 64 | 7972.1 | 7964.0 | 1.00x |
-| 128 | 13903.5 | 13148.3 | 0.95x |
+| 64 | 7972.1 | 8038.0 | 1.01x |
+| 128 | 13903.5 | 13110.1 | 0.94x |
 
 ## What Is Still Behind
 
@@ -112,6 +112,7 @@ Same H100, same Qwen2.5-7B snapshot, `output-len=128`, direct engine:
 
 ```bash
 RVLLM_CUBLAS_DECODE=0|1
+RVLLM_BATCHED_DECODE_1=0|1
 RVLLM_BATCHED_GEMM_STRATEGY=cublas|hybrid|cutlass
 RVLLM_PERSISTENT_V3=1
 RVLLM_FP8_WEIGHTS=1
@@ -123,6 +124,6 @@ The current system is no longer “fused decode by default, CUTLASS when availab
 
 It is:
 
-- batch-1 normal decode on `CublasGemvDecode`
+- batch-1 normal decode on the reusable `Batched` path
 - batched execution on an explicit hybrid policy
 - experimental persistent and megakernel paths kept separate from the normal path

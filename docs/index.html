@@ -138,8 +138,8 @@ footer a:hover{color:#999}
 </header>
 
 <div class="hero">
-  <div class="big">13,148 tok/s</div>
-  <div class="sub">Qwen2.5-7B on H100, direct engine, N=128. Current rvLLM is 0.95x vLLM 0.19.0 at N=128, effectively tied at N=64, and still behind at N=1. These are the real April 4, 2026 apples-to-apples numbers after the batch-1 dispatch fix and batched hybrid GEMM fix.</div>
+  <div class="big">13,110 tok/s</div>
+  <div class="sub">Qwen2.5-7B on H100, direct engine, N=128. Current rvLLM is 0.94x vLLM 0.19.0 at N=128, 1.01x at N=64, and still behind at N=1. These are the real April 4, 2026 apples-to-apples numbers after the batch-1 batched-scratch fix and batched hybrid GEMM fix.</div>
   <div class="hero-graphic">
     <div class="hero-graphic-title">Verified H100 Comparison</div>
     <div class="hero-graphic-sub">Current direct-engine comparison up top, older HTTP context kept below for reference.</div>
@@ -165,7 +165,7 @@ footer a:hover{color:#999}
                 <div class="hero-static-track"><div class="hero-static-fill" style="width:0.9%;background:#84E6B7"></div></div>
                 <div class="hero-static-meta">
                   <span class="hero-static-series"><i style="background:#78CFFF"></i>165.5</span>
-                  <span class="hero-static-series"><i style="background:#84E6B7"></i>127.9 (0.77x)</span>
+                  <span class="hero-static-series"><i style="background:#84E6B7"></i>133.1 (0.80x)</span>
                 </div>
               </div>
             </div>
@@ -184,10 +184,10 @@ footer a:hover{color:#999}
               <div class="hero-static-label">N=64</div>
               <div class="hero-static-bars">
                 <div class="hero-static-track"><div class="hero-static-fill" style="width:57.3%;background:#78CFFF"></div></div>
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:57.3%;background:#84E6B7"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:57.8%;background:#84E6B7"></div></div>
                 <div class="hero-static-meta">
                   <span class="hero-static-series"><i style="background:#78CFFF"></i>7972.1</span>
-                  <span class="hero-static-series"><i style="background:#84E6B7"></i>7964.0 (1.00x)</span>
+                  <span class="hero-static-series"><i style="background:#84E6B7"></i>8038.0 (1.01x)</span>
                 </div>
               </div>
             </div>
@@ -195,10 +195,10 @@ footer a:hover{color:#999}
               <div class="hero-static-label">N=128</div>
               <div class="hero-static-bars">
                 <div class="hero-static-track"><div class="hero-static-fill" style="width:100%;background:#78CFFF"></div></div>
-                <div class="hero-static-track"><div class="hero-static-fill" style="width:94.6%;background:#84E6B7"></div></div>
+                <div class="hero-static-track"><div class="hero-static-fill" style="width:94.3%;background:#84E6B7"></div></div>
                 <div class="hero-static-meta">
                   <span class="hero-static-series"><i style="background:#78CFFF"></i>13903.5</span>
-                  <span class="hero-static-series"><i style="background:#84E6B7"></i>13148.3 (0.95x)</span>
+                  <span class="hero-static-series"><i style="background:#84E6B7"></i>13110.1 (0.94x)</span>
                 </div>
               </div>
             </div>
@@ -249,11 +249,11 @@ footer a:hover{color:#999}
       <div class="hero-chart-notes">
         <div class="hero-chart-pill">
           <strong>Near tie at N=32 and N=64</strong>
-          Current committed rvLLM is 0.99x vLLM at N=32 and 1.00x at N=64 on the direct-engine H100 run.
+          Current committed rvLLM is 0.99x vLLM at N=32 and 1.01x at N=64 on the direct-engine H100 run.
         </div>
         <div class="hero-chart-pill">
           <strong>Two real fixes mattered</strong>
-          Batch-1 now defaults to cuBLAS GEMV, and batched execution now has a real hybrid GEMM policy instead of an accidental CUTLASS mix.
+          Batch-1 now defaults to the reusable batched scratch path, and batched execution now has a real hybrid GEMM policy instead of an accidental CUTLASS mix.
         </div>
         <div class="hero-chart-pill">
           <strong>Zero Python overhead</strong>
@@ -279,15 +279,15 @@ footer a:hover{color:#999}
 </p>
 <p>
   In the latest verified apples-to-apples H100 SXM 80GB comparison on Qwen2.5-7B f16,
-  rvLLM reaches <strong>4407.5 tok/s at N=32</strong>, <strong>7964.0 tok/s at N=64</strong>,
-  and <strong>13148.3 tok/s at N=128</strong> on direct engine. Against <code>vLLM 0.19.0</code>,
-  that is <strong>0.99x at N=32</strong>, <strong>1.00x at N=64</strong>, and <strong>0.95x at N=128</strong>.
-  The same run still shows the main remaining weakness clearly: <strong>N=1 is only 127.9 tok/s</strong>
+  rvLLM reaches <strong>4407.5 tok/s at N=32</strong>, <strong>8038.0 tok/s at N=64</strong>,
+  and <strong>13110.1 tok/s at N=128</strong> on direct engine. Against <code>vLLM 0.19.0</code>,
+  that is <strong>0.99x at N=32</strong>, <strong>1.01x at N=64</strong>, and <strong>0.94x at N=128</strong>.
+  The same run still shows the main remaining weakness clearly: <strong>N=1 is only 133.1 tok/s</strong>
   versus <strong>165.5 tok/s</strong> for stock <code>vLLM 0.19.0</code>.
 </p>
 <p>
   The two most important fixes behind the current numbers were architectural, not cosmetic:
-  batch-1 normal decode now defaults to the right path (<code>CublasGemvDecode</code>), and the
+  batch-1 normal decode now defaults to the reusable batched scratch path, and the
   batched path now has a real explicit hybrid GEMM policy instead of a half-wired "CUTLASS if present"
   behavior that could route QKV incorrectly.
 </p>
@@ -335,10 +335,10 @@ footer a:hover{color:#999}
 <table>
 <thead><tr><th class="r">N</th><th class="r">vLLM 0.19.0</th><th class="r">rvLLM</th><th>rvLLM / vLLM</th></tr></thead>
 <tbody>
-<tr><td class="r">1</td><td class="r">165.5</td><td class="r">127.9</td><td>0.77x</td></tr>
+<tr><td class="r">1</td><td class="r">165.5</td><td class="r">133.1</td><td>0.80x</td></tr>
 <tr><td class="r">32</td><td class="r">4467.7</td><td class="r">4407.5</td><td>0.99x</td></tr>
-<tr><td class="r">64</td><td class="r">7972.1</td><td class="r">7964.0</td><td>1.00x</td></tr>
-<tr class="peak"><td class="r">128</td><td class="r">13903.5</td><td class="r">13148.3</td><td>0.95x</td></tr>
+<tr><td class="r">64</td><td class="r">7972.1</td><td class="r">8038.0</td><td>1.01x</td></tr>
+<tr class="peak"><td class="r">128</td><td class="r">13903.5</td><td class="r">13110.1</td><td>0.94x</td></tr>
 </tbody>
 </table>
 </div>
@@ -351,9 +351,9 @@ footer a:hover{color:#999}
 <h2>What Was Wrong Before</h2>
 <p class="section-sub">The April 4 architecture correction</p>
 <ol>
-<li><strong>Batch-1 default decode was wrong.</strong> Normal <code>T=1</code> execution still favored the older fused decode path. The current default is <code>CublasGemvDecode</code>, which moved the real batch-1 baseline to <strong>127.9 tok/s</strong>.</li>
+<li><strong>Batch-1 default decode was wrong.</strong> Normal <code>T=1</code> execution had already moved off the older fused default, but it was still staying on the legacy single-token family. The current default is the reusable batched scratch path, which moved the real batch-1 baseline to <strong>133.1 tok/s</strong>.</li>
 <li><strong>The batched GEMM policy was half-wired.</strong> The runner wanted a hybrid strategy, but the actual dispatch could still let QKV take CUTLASS just because the shared library existed.</li>
-<li><strong>The docs were still describing the old architecture.</strong> Public docs now match the real dispatch: batch-1 on cuBLAS GEMV, batched path on explicit hybrid routing.</li>
+<li><strong>The docs were still describing the old architecture.</strong> Public docs now match the real dispatch: batch-1 on the reusable batched path, batched path on explicit hybrid routing.</li>
 </ol>
 <div class="note">
   Current hybrid policy: <strong>QKV / O / down on cuBLAS or cublasLt</strong>, <strong>GateUp + SiLU on CUTLASS</strong>.
@@ -473,7 +473,8 @@ footer a:hover{color:#999}
 <tr><td>10</td><td>Qwen/Nemotron integrations + GGUF loader + mock smoke path</td><td class="r">--</td><td>Apr 3</td></tr>
 <tr class="peak"><td>11</td><td>v0.19 upgrade: zero-bubble, DBO, MLA, Gemma 4, Blackwell, MXFP8</td><td class="r">4,385 (N=32)</td><td>Apr 4</td></tr>
 <tr><td>12</td><td>Batch-1 dispatch fix: default to cuBLAS GEMV</td><td class="r">127.9 (N=1)</td><td>Apr 4</td></tr>
-<tr class="peak"><td>13</td><td>Batched hybrid GEMM policy fix</td><td class="r">13,148 (N=128)</td><td>Apr 4</td></tr>
+<tr><td>13</td><td>Batched hybrid GEMM policy fix</td><td class="r">13,148 (N=128)</td><td>Apr 4</td></tr>
+<tr class="peak"><td>14</td><td>Batch-1 batched-scratch default</td><td class="r">133.1 (N=1)</td><td>Apr 4</td></tr>
 </tbody>
 </table>
 </div>
@@ -510,12 +511,13 @@ Model architectures:
   SentenceTransformer (embedding models)
 
 Decode paths (N=1):
-  CublasGemvDecode ..... 127.9 tok/s (current default normal path)
+  Batched ............... 133.1 tok/s (current default normal path)
+  CublasGemvDecode ..... legacy      (older single-token cuBLAS path)
   FusedDecode .......... legacy      (older fused path, now opt-in)
   Megakernel ............ 50 tok/s  (28-layer single-launch, instruction tape)
   Persistent ............ 51 tok/s  (SM-DAG cooperative kernel)
   Fp8Decode ............. --        (FP8 E4M3 cublasLt)
-  Batched ............... auto      (Hybrid: QKV/O/down on cuBLAS, GateUp+SiLU on CUTLASS)
+  Hybrid policy ......... auto      (QKV/O/down on cuBLAS, GateUp+SiLU on CUTLASS)
   Theoretical f16 ceiling: 222 tok/s</pre>
 </section>
 
